@@ -1,8 +1,12 @@
 #!/bin/bash
 set -e
 
+export DEBIAN_FRONTEND=noninteractive
+
 echo "==> Updating system packages"
-apt-get update && apt-get upgrade -y
+apt-get update && apt-get upgrade -y \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold"
 
 echo "==> Installing prerequisites"
 apt-get install -y ca-certificates curl gnupg git
@@ -30,4 +34,4 @@ echo "Done. Versions:"
 docker --version
 docker compose version
 echo ""
-echo "Next: log out and back in (or run 'newgrp docker') so group change takes effect."
+echo "Next: run 'newgrp docker' so group change takes effect."
