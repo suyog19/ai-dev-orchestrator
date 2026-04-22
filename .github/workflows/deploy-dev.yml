@@ -1,0 +1,24 @@
+name: Deploy to Dev
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Copy .env from VM
+        run: cp /home/ubuntu/.env.orchestrator .env
+
+      - name: Build and restart stack
+        run: docker compose up -d --build
+
+      - name: Verify health
+        run: |
+          sleep 5
+          curl -sf http://localhost:8000/healthz
