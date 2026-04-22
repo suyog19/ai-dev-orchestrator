@@ -52,6 +52,6 @@ async def jira_webhook(request: Request):
         details=f"{issue_key}: {summary}",
     )
 
-    dispatch(issue_type, new_status, event_id)
+    dispatch(issue_type, new_status, event_id, issue_key=issue_key, summary=summary)
 
     return {"received": True, "processed": True}

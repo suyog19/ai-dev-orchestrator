@@ -22,6 +22,16 @@ services:
       - "5433:5432"
     restart: unless-stopped
 
+  worker:
+    build: .
+    command: python -m app.worker
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     ports:

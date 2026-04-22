@@ -1,5 +1,6 @@
 import logging
 from app.database import get_conn
+from app.queue import enqueue
 
 logger = logging.getLogger("orchestrator")
 
@@ -9,7 +10,7 @@ WORKFLOW_MAP = {
 }
 
 
-def dispatch(issue_type: str, new_status: str, event_id: int) -> str | None:
+def dispatch(issue_type: str, new_status: str, event_id: int, issue_key: str = "", summary: str = "") -> str | None:
     key = (issue_type, new_status.upper())
     workflow_type = WORKFLOW_MAP.get(key)
 
@@ -25,9 +26,10 @@ def dispatch(issue_type: str, new_status: str, event_id: int) -> str | None:
                 VALUES (%s, %s, %s)
                 RETURNING id
                 """,
-                (workflow_type, "RECEIVED", event_id),
+                (workflow_type, "QUEUED", event_id),
             )
             run_id = cur.fetchone()[0]
 
-    logger.info("Workflow dispatched: %s (run_id=%s, event_id=%s)", workflow_type, run_id, event_id)
+    enqueue(run_id, workflow_type, issue_key, summary)
+    logger.info("Workflow queued: %s (run_id=%s, event_id=%s)", workflow_type, run_id, event_id)
     return workflow_type
