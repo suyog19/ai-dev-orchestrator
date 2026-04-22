@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from dotenv import load_dotenv
 
 from app.database import init_db
+from app.telegram import send_message
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
 async def on_startup():
     init_db()
     logger.info("AI Dev Orchestrator started")
+    send_message("startup", "ok", "AI Dev Orchestrator is running")
 
 
 # ---------------------------------------------------------------------------
@@ -40,3 +42,9 @@ async def on_startup():
 def health_check():
     logger.info("Health check called")
     return {"status": "ok"}
+
+
+@app.get("/debug/send-telegram")
+def debug_telegram():
+    send_message("debug", "test", "Manual test from /debug/send-telegram")
+    return {"sent": True}
