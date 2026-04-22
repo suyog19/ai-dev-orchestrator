@@ -3,9 +3,13 @@ import sys
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
+from fastapi import HTTPException
+from pydantic import BaseModel
+
 from app.database import init_db
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
+from app.repo_mapping import get_mapping, get_all_mappings, add_mapping
 
 load_dotenv()
 
@@ -50,3 +54,31 @@ def health_check():
 def debug_telegram():
     send_message("debug", "test", "Manual test from /debug/send-telegram")
     return {"sent": True}
+
+
+# ---------------------------------------------------------------------------
+# Repo mapping endpoints
+# ---------------------------------------------------------------------------
+
+class RepoMappingIn(BaseModel):
+    issue_key: str
+    repo_name: str
+    target_branch: str = "main"
+
+
+@app.get("/debug/repo-mappings")
+def list_repo_mappings():
+    return get_all_mappings()
+
+
+@app.get("/debug/repo-mappings/{issue_key}")
+def inspect_repo_mapping(issue_key: str):
+    mapping = get_mapping(issue_key)
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"No mapping found for '{issue_key}'")
+    return mapping
+
+
+@app.post("/debug/repo-mappings")
+def create_repo_mapping(body: RepoMappingIn):
+    return add_mapping(body.issue_key, body.repo_name, body.target_branch)

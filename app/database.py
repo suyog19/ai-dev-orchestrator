@@ -64,4 +64,14 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repo_mappings (
+                    id            SERIAL PRIMARY KEY,
+                    issue_key     VARCHAR(50)   NOT NULL UNIQUE,
+                    repo_name     VARCHAR(200)  NOT NULL,
+                    target_branch VARCHAR(100)  NOT NULL DEFAULT 'main',
+                    created_at    TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     logger.info("Database initialized — tables ready")
