@@ -1,6 +1,11 @@
 import logging
 import sys
 from fastapi import FastAPI
+from dotenv import load_dotenv
+
+from app.database import init_db
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -23,6 +28,7 @@ app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
 
 @app.on_event("startup")
 async def on_startup():
+    init_db()
     logger.info("AI Dev Orchestrator started")
 
 
