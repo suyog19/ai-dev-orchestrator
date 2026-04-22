@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Request, HTTPException
 
 from app.database import get_conn
+from app.dispatcher import dispatch
 from app.telegram import send_message
 
 logger = logging.getLogger("orchestrator")
@@ -21,17 +22,17 @@ async def jira_webhook(request: Request):
     issue_key = issue.get("key", "unknown")
     fields = issue.get("fields", {})
     issue_type = fields.get("issuetype", {}).get("name", "unknown")
-    status = fields.get("status", {}).get("name", "unknown")
     summary = fields.get("summary", "")
 
     # Only process events that contain an actual status change
     changelog_items = payload.get("changelog", {}).get("items", [])
-    status_changed = any(item.get("field") == "status" for item in changelog_items)
-    if not status_changed:
+    status_item = next((i for i in changelog_items if i.get("field") == "status"), None)
+    if not status_item:
         logger.info("Jira webhook ignored (no status change): %s", issue_key)
         return {"received": True, "processed": False}
 
-    logger.info("Jira webhook received: %s | %s | %s → %s", issue_key, issue_type, event_type, status)
+    new_status = status_item.get("toString", "")
+    logger.info("Jira webhook received: %s | %s → %s", issue_key, issue_type, new_status)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -39,14 +40,18 @@ async def jira_webhook(request: Request):
                 """
                 INSERT INTO workflow_events (source, event_type, payload_json, status)
                 VALUES (%s, %s, %s, %s)
+                RETURNING id
                 """,
                 ("jira", event_type, json.dumps(payload), "received"),
             )
+            event_id = cur.fetchone()[0]
 
     send_message(
-        event=f"{issue_type} {event_type}",
-        status=status,
+        event=f"{issue_type} status change",
+        status=new_status,
         details=f"{issue_key}: {summary}",
     )
 
-    return {"received": True}
+    dispatch(issue_type, new_status, event_id)
+
+    return {"received": True, "processed": True}
