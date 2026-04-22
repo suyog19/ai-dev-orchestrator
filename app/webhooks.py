@@ -24,6 +24,13 @@ async def jira_webhook(request: Request):
     status = fields.get("status", {}).get("name", "unknown")
     summary = fields.get("summary", "")
 
+    # Only process events that contain an actual status change
+    changelog_items = payload.get("changelog", {}).get("items", [])
+    status_changed = any(item.get("field") == "status" for item in changelog_items)
+    if not status_changed:
+        logger.info("Jira webhook ignored (no status change): %s", issue_key)
+        return {"received": True, "processed": False}
+
     logger.info("Jira webhook received: %s | %s | %s → %s", issue_key, issue_type, event_type, status)
 
     with get_conn() as conn:
