@@ -1,8 +1,8 @@
 import os
 import sys
-import time
 import logging
 import threading
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +18,11 @@ logger = logging.getLogger("worker")
 from app.database import init_db, get_conn
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
+from app.workflows import story_implementation
+
+WORKFLOW_HANDLERS = {
+    "story_implementation": story_implementation,
+}
 
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
 _semaphore = threading.Semaphore(MAX_WORKERS)
@@ -38,12 +43,18 @@ def _execute(job: dict):
     issue_key = job["issue_key"]
     summary = job["summary"]
 
+    handler = WORKFLOW_HANDLERS.get(workflow_type)
+    if not handler:
+        logger.warning("No handler for workflow type: %s (run_id=%s)", workflow_type, run_id)
+        _update_run_status(run_id, "COMPLETED")
+        return
+
     with _semaphore:
         logger.info("Workflow started: %s (run_id=%s)", workflow_type, run_id)
         _update_run_status(run_id, "RUNNING")
         send_message("workflow", "RUNNING", f"{issue_key}: {summary}")
 
-        time.sleep(5)  # stub: simulate work
+        handler(issue_key, summary)
 
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)
