@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 
 from app.database import init_db
 from app.telegram import send_message
+from app.webhooks import router as webhooks_router
 
 load_dotenv()
 
@@ -25,6 +26,7 @@ logger = logging.getLogger("orchestrator")
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
+app.include_router(webhooks_router)
 
 
 @app.on_event("startup")
