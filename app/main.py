@@ -18,7 +18,7 @@ logger = logging.getLogger("orchestrator")
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="AI Dev Orchestrator", version="0.1.0")
+app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
 
 
 @app.on_event("startup")
