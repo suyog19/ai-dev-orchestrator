@@ -1372,7 +1372,7 @@ def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
         "scope_key":   scope_key_out,
         "memory_kind": memory_kind_out,
         "source":      source,
-        "content":     summary,
+        "summary":     summary,
         "created_at":  created_at.isoformat(),
         "updated_at":  updated_at.isoformat(),
     }
