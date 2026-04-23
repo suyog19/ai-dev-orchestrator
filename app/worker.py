@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import logging
 import threading
@@ -59,6 +60,7 @@ def _execute(job: dict):
         logger.info("Workflow started: %s (run_id=%s)", workflow_type, run_id)
         _update_run_status(run_id, "RUNNING")
         send_message("workflow", "RUNNING", f"{issue_key}: {summary}")
+        work_dir = f"/tmp/workflows/{run_id}"
 
         try:
             handler(run_id, issue_key, issue_type, summary)
@@ -68,6 +70,13 @@ def _execute(job: dict):
             fail_run(run_id, error_msg)
             send_message("workflow", "FAILED", f"{issue_key}: {error_msg}")
             return
+        finally:
+            if os.path.isdir(work_dir):
+                try:
+                    shutil.rmtree(work_dir)
+                    logger.info("Workspace cleaned up: %s", work_dir)
+                except Exception as cleanup_exc:
+                    logger.warning("Workspace cleanup failed for %s: %s", work_dir, cleanup_exc)
 
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)
