@@ -41,41 +41,57 @@ SYSTEM_PROMPT = (
 
 FIX_PROMPT = (
     "You are a code repair assistant. A previous implementation attempt failed tests. "
-    "You will be given: the original story, the current state of the changed file, and the failing test output. "
-    "Call the apply_code_change tool with a targeted fix to make the failing tests pass. "
+    "You will be given: the original story, the current state of all changed files, and the failing test output. "
+    "Call the apply_code_changes tool with targeted fixes (one or more files) to make the failing tests pass. "
     "Rules:\n"
     "- Change as few lines as possible\n"
     "- Do not break currently passing tests\n"
-    "- Stay within the same file\n"
+    "- Only modify files that were part of the original implementation\n"
     "- Do not import or reference types that do not already exist in the codebase\n"
     "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types"
 )
 
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
-    "Call the apply_code_change tool with ONE concrete code change in ONE file that moves the implementation "
-    "toward what the story describes. Choose the most relevant file. "
+    "Call the apply_code_changes tool with one to three concrete code changes that together fully implement "
+    "what the story describes. Each change must be in a different file. Only include a change in a file "
+    "if that file genuinely needs to change to satisfy the story. "
     "If the story is not directly actionable, suggest the most relevant improvement in any of the files. "
-    "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
-    "fixing a clear bug), and complete (include ALL changes needed in one contiguous block — e.g. if a "
-    "new function needs a new import, include both in the replacement). "
+    "Each change must be: specific (reference exact existing text), safe (no breaking changes unless "
+    "fixing a clear bug), and complete (all lines needed in that file in one contiguous block). "
     "You may add imports for names that genuinely exist in the codebase. "
     "Do not invent new class names or types that are not defined anywhere in the provided files."
 )
 
 # Tool schema used by both suggest_change and fix_change to guarantee structured output
-_CHANGE_TOOL = {
-    "name": "apply_code_change",
-    "description": "Apply a targeted code change to a source file",
+_CHANGES_TOOL = {
+    "name": "apply_code_changes",
+    "description": "Apply one or more targeted code changes across one or more source files.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "file":        {"type": "string", "description": "Relative path to the file to change"},
-            "description": {"type": "string", "description": "One sentence describing what the change does"},
-            "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
-            "replacement": {"type": "string", "description": "The new text that replaces the original"},
+            "changes": {
+                "type": "array",
+                "description": "List of file changes to apply (max 3 files, one change per file)",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file":        {"type": "string", "description": "Relative path to the file to change"},
+                        "description": {"type": "string", "description": "One sentence describing what this change does"},
+                        "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
+                        "replacement": {"type": "string", "description": "The new text that replaces the original"},
+                    },
+                    "required": ["file", "description", "original", "replacement"],
+                },
+            },
+            "summary": {
+                "type": "string",
+                "description": "One sentence summarizing all changes together",
+            },
         },
-        "required": ["file", "description", "original", "replacement"],
+        "required": ["changes", "summary"],
     },
 }
 
@@ -262,11 +278,11 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 
 
 def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "") -> dict:
-    """Ask Claude Sonnet to suggest one targeted code improvement aligned with the Jira story.
+    """Ask Claude Sonnet to suggest up to 3 code changes aligned with the Jira story.
 
     Selects files by keyword overlap with the issue summary rather than a fixed entry-point
     list, giving Claude context most relevant to the story intent.
-    Returns a dict with keys: file, description, original, replacement.
+    Returns a dict with keys: changes (list of {file, description, original, replacement}), summary.
     """
     client = _CLIENT
 
@@ -274,7 +290,10 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     selected = _select_files_for_story(repo_path, primary_language, issue_summary)
 
     if not selected:
-        return {"file": "unknown", "description": "No files found", "original": "", "replacement": ""}
+        return {
+            "changes": [{"file": "unknown", "description": "No files found", "original": "", "replacement": ""}],
+            "summary": "",
+        }
 
     story_context = ""
     if issue_key or issue_summary:
@@ -287,19 +306,19 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     user_content = (
         f"{story_context}"
         f"Available source files (ordered by relevance to story):{file_sections}\n"
-        f"Suggest one improvement to ONE of the files above that best addresses the story."
+        f"Implement the story by changing one to three of the files above."
     )
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=2048,
         system=[{
             "type": "text",
             "text": SUGGEST_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        tools=[_CHANGE_TOOL],
-        tool_choice={"type": "tool", "name": "apply_code_change"},
+        tools=[_CHANGES_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_changes"},
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -315,7 +334,10 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
 
     logger.warning("Claude suggestion: no tool_use block in response")
     fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
-    return {"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}
+    return {
+        "changes": [{"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}],
+        "summary": "",
+    }
 
 
 def fix_change(
@@ -323,43 +345,51 @@ def fix_change(
     analysis: dict,
     issue_key: str,
     issue_summary: str,
-    previous_suggestion: dict,
+    previous_changes: list[dict],
     test_output: str,
 ) -> dict:
     """Ask Claude to fix a failing implementation.
 
-    Sends the original story, the current file content, and the trimmed test failure
-    output. Returns the same shape as suggest_change: {file, original, replacement, description}.
+    Sends the original story, current content of all changed files, and trimmed test failure
+    output. Returns the same shape as suggest_change: {changes: [...], summary: "..."}.
     """
     client = _CLIENT
-
-    changed_file = previous_suggestion.get("file", "")
-    file_abs = os.path.join(repo_path, changed_file)
-    current_content = _read_truncated(file_abs) or "(file not found)"
 
     # Trim test output to the most useful tail (last 60 lines)
     failure_lines = (test_output or "").strip().splitlines()
     trimmed_output = "\n".join(failure_lines[-60:]) if failure_lines else "(no output)"
 
+    file_sections = ""
+    changed_files = []
+    for change in previous_changes:
+        changed_file = change.get("file", "")
+        if not changed_file:
+            continue
+        changed_files.append(changed_file)
+        file_abs = os.path.join(repo_path, changed_file)
+        current_content = _read_truncated(file_abs) or "(file not found)"
+        file_sections += f"\n--- {changed_file} ---\n```\n{current_content}\n```\n"
+
+    files_str = ", ".join(f"`{f}`" for f in changed_files)
     user_content = (
         f"Story: {issue_key} — {issue_summary}\n\n"
-        f"The previous implementation changed `{changed_file}` but tests are failing.\n\n"
-        f"Current file content:\n--- {changed_file} ---\n```\n{current_content}\n```\n\n"
+        f"The previous implementation changed {files_str} but tests are failing.\n\n"
+        f"Current file contents:{file_sections}\n"
         f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
-        f"Call apply_code_change with a minimal fix to `{changed_file}` that makes the failing tests pass "
+        f"Call apply_code_changes with minimal fixes to make the failing tests pass "
         f"without breaking any currently passing tests."
     )
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=2048,
         system=[{
             "type": "text",
             "text": FIX_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        tools=[_CHANGE_TOOL],
-        tool_choice={"type": "tool", "name": "apply_code_change"},
+        tools=[_CHANGES_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_changes"},
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -374,4 +404,8 @@ def fix_change(
         return tool_block.input
 
     logger.warning("Claude fix: no tool_use block in response")
-    return {"file": changed_file, "description": "No tool call returned", "original": "", "replacement": ""}
+    fallback_file = changed_files[0] if changed_files else ""
+    return {
+        "changes": [{"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}],
+        "summary": "",
+    }

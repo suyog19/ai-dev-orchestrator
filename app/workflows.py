@@ -5,7 +5,7 @@ from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change
-from app.file_modifier import apply_suggestion, modify_file
+from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
 from app.database import update_run_step, update_run_field, fail_run, record_attempt, complete_attempt
 from app.test_runner import run_tests
@@ -74,25 +74,26 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     logger.info("story_implementation: Claude summary sent to Telegram")
 
     update_run_step(run_id, "suggesting")
-    suggestion = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
-    suggestion_msg = (
-        f"{issue_key}: Suggested change in {suggestion['file']}\n"
-        f"{suggestion['description']}\n\n"
-        f"--- original ---\n{suggestion.get('original', '')}\n\n"
-        f"+++ replacement +++\n{suggestion.get('replacement', '')}"
-    )
+    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
+    changes = suggestion_result.get("changes", [])
+    suggestion_summary = suggestion_result.get("summary", "")
+    files_str = ", ".join(c.get("file", "") for c in changes)
+    suggestion_msg = f"{issue_key}: {len(changes)} change(s) in {files_str}\n{suggestion_summary}"
     send_message("claude_suggestion", "COMPLETE", suggestion_msg)
-    logger.info("story_implementation: Claude suggestion sent to Telegram — %s", suggestion["file"])
+    logger.info("story_implementation: Claude suggestion sent to Telegram — %s", files_str)
 
     update_run_step(run_id, "applying")
-    applied = apply_suggestion(repo_path, suggestion)
+    applied = apply_changes(repo_path, changes)
     if applied["applied"]:
-        change_detail = f"{applied['file']} — {applied['description']}"
-        logger.info("story_implementation: suggestion applied — %s", applied["file"])
+        change_detail = f"{applied['count']} file(s): {', '.join(applied['files'])}"
+        files_touched_str = ",".join(applied["files"])
+        update_run_field(run_id, files_changed_count=applied["count"])
+        logger.info("story_implementation: changes applied — %s", applied["files"])
     else:
         fallback = modify_file(repo_path)
         change_detail = f"{fallback['file']} — {fallback['change']} (fallback: {applied['reason']})"
-        logger.info("story_implementation: suggestion fallback — %s", applied["reason"])
+        files_touched_str = fallback["file"]
+        logger.info("story_implementation: apply_changes fallback — %s", applied["reason"])
     send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
     # --- Attempt 1: run tests on the implementation ---
@@ -111,12 +112,12 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         attempt_1_id,
         status=test_result["status"],
         test_status=test_result["status"],
-        files_touched=suggestion.get("file"),
+        files_touched=files_touched_str,
     )
 
     # --- Fix loop: one attempt if tests failed ---
     final_test_result = test_result
-    fix_suggestion: dict | None = None
+    fix_result: dict | None = None
 
     if test_result["status"] in ("FAILED", "ERROR"):
         update_run_field(run_id, retry_count=1)
@@ -129,18 +130,20 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         attempt_2_id = record_attempt(run_id, 2, "fix", "claude-sonnet-4-6")
         update_run_step(run_id, "fixing")
 
-        fix_suggestion = fix_change(
+        fix_result = fix_change(
             repo_path, analysis,
             issue_key=issue_key,
             issue_summary=summary,
-            previous_suggestion=suggestion,
+            previous_changes=changes,
             test_output=test_result["output"],
         )
-        fix_applied = apply_suggestion(repo_path, fix_suggestion)
+        fix_applied = apply_changes(repo_path, fix_result.get("changes", []))
         if fix_applied["applied"]:
-            fix_detail = f"{fix_applied['file']} — {fix_applied['description']}"
+            fix_detail = f"{fix_applied['count']} file(s): {', '.join(fix_applied['files'])}"
+            fix_files_str = ",".join(fix_applied["files"])
         else:
             fix_detail = f"fix not applied: {fix_applied.get('reason', 'unknown')}"
+            fix_files_str = files_touched_str
         send_message("fix_apply", "COMPLETE", f"{issue_key}: {fix_detail}")
         logger.info("story_implementation: fix applied — %s", fix_detail)
 
@@ -162,7 +165,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             attempt_2_id,
             status=retest_result["status"],
             test_status=retest_result["status"],
-            files_touched=fix_suggestion.get("file"),
+            files_touched=fix_files_str,
         )
 
         if retest_result["status"] in ("FAILED", "ERROR"):
@@ -171,7 +174,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
                 status="FAILED",
                 failure_summary=f"Tests still failing after fix: {(retest_result.get('output') or '')[-300:]}",
                 test_status=retest_result["status"],
-                files_touched=fix_suggestion.get("file"),
+                files_touched=fix_files_str,
             )
             send_message(
                 "fix_attempt_failed", "FAILED",
@@ -190,7 +193,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         final_test_result = retest_result
 
     # --- Commit and push ---
-    suggestion_description = suggestion.get("description", summary)
+    suggestion_description = suggestion_summary or (changes[0].get("description", "") if changes else "") or summary
     commit_message = f"ai: {issue_key} — {suggestion_description}"
 
     update_run_step(run_id, "pushing")
@@ -204,21 +207,32 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
     logger.info("story_implementation: pushed branch %s", branch)
 
-    # Build unified diff — prefer fix suggestion if a fix was applied
-    diff_source = fix_suggestion if fix_suggestion else suggestion
-    original_lines = diff_source.get("original", "").splitlines(keepends=True)
-    replacement_lines = diff_source.get("replacement", "").splitlines(keepends=True)
-    diff_lines = list(difflib.unified_diff(
-        original_lines, replacement_lines,
-        fromfile="original", tofile="modified", lineterm="",
-    ))
-    diff_block = "".join(diff_lines) if diff_lines else (
-        f"- {diff_source.get('original', '').strip()}\n+ {diff_source.get('replacement', '').strip()}"
-    )
+    # Build per-file unified diffs — prefer fix changes if a fix was applied
+    final_changes = fix_result.get("changes", []) if fix_result else changes
+    diff_parts = []
+    for ch in final_changes:
+        orig = ch.get("original", "").splitlines(keepends=True)
+        repl = ch.get("replacement", "").splitlines(keepends=True)
+        file_diff = list(difflib.unified_diff(
+            orig, repl,
+            fromfile=f"a/{ch.get('file', 'unknown')}",
+            tofile=f"b/{ch.get('file', 'unknown')}",
+            lineterm="",
+        ))
+        if file_diff:
+            diff_parts.append("".join(file_diff))
+        else:
+            diff_parts.append(
+                f"--- a/{ch.get('file', 'unknown')}\n"
+                f"+++ b/{ch.get('file', 'unknown')}\n"
+                f"- {ch.get('original', '').strip()}\n"
+                f"+ {ch.get('replacement', '').strip()}"
+            )
+    diff_block = "\n".join(diff_parts)
 
     # Validation checklist
-    is_py = suggestion.get("file", "").endswith(".py")
-    syntax_line = "- [x] Python syntax check (ast.parse)\n" if is_py else ""
+    py_files = [ch.get("file", "") for ch in final_changes if ch.get("file", "").endswith(".py")]
+    syntax_line = f"- [x] Python syntax check (ast.parse) — {', '.join(py_files)}\n" if py_files else ""
     validation_section = (
         "## Pre-apply validation\n"
         "- [x] Path traversal guard\n"
@@ -228,15 +242,20 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         f"{syntax_line}"
     )
 
-    attempt_number = 2 if fix_suggestion else 1
+    attempt_number = 2 if fix_result else 1
     test_section = _build_test_section(final_test_result, attempt=attempt_number)
 
     retry_note = ""
-    if fix_suggestion:
+    if fix_result:
         retry_note = (
-            f"**Note:** Initial implementation failed tests. "
-            f"One fix attempt was made and tests now pass.\n\n"
+            "**Note:** Initial implementation failed tests. "
+            "One fix attempt was made and tests now pass.\n\n"
         )
+
+    files_list = "\n".join(
+        f"- `{ch.get('file', 'N/A')}`: {ch.get('description', '')}"
+        for ch in final_changes
+    )
 
     pr_body = (
         f"> 🤖 Automated PR — [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator)\n\n"
@@ -245,10 +264,9 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         f"---\n\n"
         f"## Summary\n{claude_summary}\n\n"
         f"---\n\n"
-        f"## Change\n"
+        f"## Changes\n"
         f"{retry_note}"
-        f"**File:** `{diff_source.get('file', 'N/A')}`  \n"
-        f"**Description:** {diff_source.get('description', suggestion_description)}\n\n"
+        f"{files_list}\n\n"
         f"```diff\n{diff_block}\n```\n\n"
         f"---\n\n"
         f"{test_section}\n"

@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("file_modifier")
 
+MAX_CHANGED_FILES = 3
+
 
 def _check_path_safe(repo_path: str, rel_path: str) -> bool:
     """Return True only if rel_path resolves to a location inside repo_path."""
@@ -75,6 +77,74 @@ def apply_suggestion(repo_path: str, suggestion: dict) -> dict:
 
     logger.info("apply_suggestion: applied change to %s — %s", rel_path, description)
     return {"file": rel_path, "applied": True, "description": description}
+
+
+def apply_changes(repo_path: str, changes: list[dict]) -> dict:
+    """Apply a list of Claude's suggested changes atomically.
+
+    Validates ALL changes before writing any. If any validation fails, no files are written.
+    Enforces MAX_CHANGED_FILES limit.
+
+    Returns:
+        {"applied": True, "files": [str, ...], "count": int}
+        {"applied": False, "reason": str, "failed_file": str}
+    """
+    if not changes:
+        return {"applied": False, "reason": "empty changes list", "failed_file": ""}
+
+    if len(changes) > MAX_CHANGED_FILES:
+        logger.warning("apply_changes: truncated %d changes to %d", len(changes), MAX_CHANGED_FILES)
+        changes = changes[:MAX_CHANGED_FILES]
+
+    validated: list[tuple[str, str, str, str]] = []  # (abs_path, new_content, rel_path, description)
+
+    for change in changes:
+        rel_path = change.get("file", "")
+        original = change.get("original", "")
+        replacement = change.get("replacement", "")
+        description = change.get("description", "")
+
+        if not rel_path or not original:
+            return {"applied": False, "reason": "empty file or original", "failed_file": rel_path}
+
+        if not _check_path_safe(repo_path, rel_path):
+            logger.warning("apply_changes: path traversal rejected — %s", rel_path)
+            return {"applied": False, "reason": "path traversal rejected", "failed_file": rel_path}
+
+        abs_path = os.path.join(repo_path, rel_path)
+        if not os.path.isfile(abs_path):
+            logger.warning("apply_changes: file not found — %s", abs_path)
+            return {"applied": False, "reason": "file not found", "failed_file": rel_path}
+
+        with open(abs_path, encoding="utf-8") as f:
+            content = f.read()
+
+        if original not in content:
+            logger.warning("apply_changes: original text not found in %s", rel_path)
+            return {"applied": False, "reason": "original text not found", "failed_file": rel_path}
+
+        if original == replacement:
+            logger.warning("apply_changes: no-op change — %s", rel_path)
+            return {"applied": False, "reason": "no-op: original equals replacement", "failed_file": rel_path}
+
+        new_content = content.replace(original, replacement, 1)
+
+        if rel_path.endswith(".py"):
+            try:
+                ast.parse(new_content)
+            except SyntaxError as exc:
+                logger.warning("apply_changes: syntax error in %s — %s", rel_path, exc)
+                return {"applied": False, "reason": f"syntax error: {exc}", "failed_file": rel_path}
+
+        validated.append((abs_path, new_content, rel_path, description))
+
+    for abs_path, new_content, rel_path, description in validated:
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        logger.info("apply_changes: wrote %s — %s", rel_path, description)
+
+    files = [v[2] for v in validated]
+    return {"applied": True, "files": files, "count": len(files)}
 
 
 def modify_file(repo_path: str, relative_path: str = "README.md") -> dict:
