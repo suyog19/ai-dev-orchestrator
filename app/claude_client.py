@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import json
@@ -132,6 +133,48 @@ def _collect_key_files(repo_path: str, primary_language: str) -> list[tuple[str,
     return files
 
 
+def _extract_python_imports(abs_path: str, repo_path: str) -> list[str]:
+    """Return relative paths (from repo root) of local modules directly imported by abs_path.
+
+    Handles absolute imports (from app.models import ...) and relative imports
+    (from .models import ...). Skips anything that doesn't resolve to a file in the repo.
+    """
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            source = f.read()
+        tree = ast.parse(source)
+    except Exception:
+        return []
+
+    repo_abs = os.path.realpath(repo_path)
+    rel_of_file = os.path.relpath(abs_path, repo_abs).replace("\\", "/")
+    package_parts = rel_of_file.split("/")[:-1]  # e.g. ["app"] for "app/main.py"
+
+    found: list[str] = []
+
+    def _try(parts: list[str]) -> None:
+        for candidate in ["/".join(parts) + ".py", "/".join(parts) + "/__init__.py"]:
+            if os.path.isfile(os.path.join(repo_abs, candidate)):
+                found.append(candidate)
+                break
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                _try(alias.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                # Absolute: from app.models import Item
+                _try(node.module.split("."))
+            elif node.level > 0:
+                # Relative: from .models import Item (level=1), from ..x import y (level=2)
+                base = package_parts[:max(0, len(package_parts) - (node.level - 1))]
+                suffix = node.module.split(".") if node.module else []
+                _try(base + suffix)
+
+    return list(dict.fromkeys(found))  # deduplicate, preserve order
+
+
 def _extract_keywords(text: str) -> list[str]:
     """Lowercase tokens from story text, filtered for meaningful domain words."""
     tokens = re.findall(r"[a-z]+", text.lower())
@@ -142,19 +185,25 @@ def _select_files_for_story(
     repo_path: str,
     primary_language: str,
     issue_summary: str,
-    max_files: int = 4,
+    max_scored: int = 2,
+    max_import_deps: int = 2,
 ) -> list[tuple[str, str, str]]:
     """Score all repo source files by relevance to issue_summary.
 
-    Returns list of (relative_path, content, reason) for the top max_files files,
-    with README prepended if present (it doesn't consume a scored slot).
+    Selection strategy (up to 6 files total):
+    1. README — always prepended if present
+    2. Top max_scored keyword-scored non-test files (anchors)
+    3. Up to max_import_deps direct import dependencies of those anchors (Python only)
+    4. Best-scored test file — always appended if one exists
+
+    Returns list of (relative_path, content, reason).
     """
     keywords = _extract_keywords(issue_summary)
     entry_point_set = set(ENTRY_POINTS.get(primary_language, []))
-    wants_tests = "test" in keywords
 
     readme_entry: tuple[str, str, str] | None = None
-    scored: list[tuple[int, str, str, str]] = []  # (score, rel_path, content, reason)
+    scored: list[tuple[int, str, str, str]] = []       # non-test source files
+    test_scored: list[tuple[int, str, str, str]] = []  # test files
 
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -162,7 +211,6 @@ def _select_files_for_story(
             abs_path = os.path.join(root, fname)
             rel_path = os.path.relpath(abs_path, repo_path).replace("\\", "/")
 
-            # Capture README separately
             if fname.upper().startswith("README"):
                 content = _read_truncated(abs_path)
                 if content and readme_entry is None:
@@ -178,16 +226,15 @@ def _select_files_for_story(
                 continue
 
             path_lower = rel_path.lower()
+            is_test = "test" in path_lower or fname.startswith("test_")
             reasons: list[str] = []
             score = 0
 
-            # Keywords appearing in the file path (strong signal)
             path_matches = [kw for kw in keywords if kw in path_lower]
             if path_matches:
                 score += len(path_matches) * 3
                 reasons.append(f"path:{','.join(path_matches)}")
 
-            # Keywords appearing in file content (capped to avoid weighting huge files)
             content_lower = content.lower()
             content_hits = sum(min(content_lower.count(kw), 2) for kw in keywords)
             content_hits = min(content_hits, 5)
@@ -195,28 +242,57 @@ def _select_files_for_story(
                 score += content_hits
                 reasons.append(f"content:{content_hits}hits")
 
-            # Small bonus for known entry points so they don't disappear entirely
             if rel_path in entry_point_set:
                 score += 2
                 reasons.append("entry-point")
 
-            # Test file bonus when story explicitly targets testing
-            is_test = "test" in path_lower or fname.startswith("test_")
-            if is_test and wants_tests:
-                score += 2
-                reasons.append("test-match")
-
             reason_str = "; ".join(reasons) if reasons else "baseline"
-            scored.append((score, rel_path, content, reason_str))
+
+            if is_test:
+                test_scored.append((score, rel_path, content, reason_str))
+            else:
+                scored.append((score, rel_path, content, reason_str))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    test_scored.sort(key=lambda x: x[0], reverse=True)
 
+    selected_paths: set[str] = set()
     result: list[tuple[str, str, str]] = []
+
+    # 1. README
     if readme_entry:
         result.append(readme_entry)
+        selected_paths.add(readme_entry[0])
 
-    for score, rel_path, content, reason in scored[:max_files]:
+    # 2. Top max_scored non-test files (anchors for import traversal)
+    anchor_paths: list[str] = []
+    for _score, rel_path, content, reason in scored[:max_scored]:
         result.append((rel_path, content, reason))
+        selected_paths.add(rel_path)
+        anchor_paths.append(rel_path)
+
+    # 3. Import dependencies of anchors (Python only)
+    if primary_language == "Python":
+        dep_count = 0
+        for anchor_rel in anchor_paths:
+            if dep_count >= max_import_deps:
+                break
+            for imp_rel in _extract_python_imports(os.path.join(repo_path, anchor_rel), repo_path):
+                if dep_count >= max_import_deps:
+                    break
+                if imp_rel in selected_paths:
+                    continue
+                content = _read_truncated(os.path.join(repo_path, imp_rel))
+                if not content:
+                    continue
+                result.append((imp_rel, content, f"import-dep:{anchor_rel}"))
+                selected_paths.add(imp_rel)
+                dep_count += 1
+
+    # 4. Best test file — always include regardless of story keywords
+    if test_scored and test_scored[0][1] not in selected_paths:
+        _s, rel_path, content, reason = test_scored[0]
+        result.append((rel_path, content, reason + "; test-file"))
 
     if keywords:
         logger.info(
