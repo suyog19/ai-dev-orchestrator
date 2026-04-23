@@ -15,7 +15,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run
+from app.database import init_db, get_conn, fail_run, update_run_step
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation
@@ -29,10 +29,15 @@ _semaphore = threading.Semaphore(MAX_WORKERS)
 
 
 def _update_run_status(run_id: int, status: str):
+    extra = ""
+    if status == "RUNNING":
+        extra = ", started_at=NOW()"
+    elif status == "COMPLETED":
+        extra = ", completed_at=NOW()"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE workflow_runs SET status=%s, updated_at=NOW() WHERE id=%s",
+                f"UPDATE workflow_runs SET status=%s{extra}, updated_at=NOW() WHERE id=%s",
                 (status, run_id),
             )
 

@@ -1,0 +1,9 @@
+[
+  {
+    "jira_project_key": "KAN",
+    "issue_type": "Story",
+    "repo_slug": "suyog19/sandbox-fastapi-app",
+    "base_branch": "main",
+    "notes": "KAN project — Phase 4 Jira integration"
+  }
+]
