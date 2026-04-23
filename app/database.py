@@ -181,6 +181,38 @@ def update_run_step(run_id: int, step: str):
             )
 
 
+def record_attempt(run_id: int, attempt_number: int, attempt_type: str, model_used: str | None = None) -> int:
+    """Insert a new workflow_attempts row and return its id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO workflow_attempts
+                   (run_id, attempt_number, attempt_type, model_used, status)
+                   VALUES (%s, %s, %s, %s, 'RUNNING')
+                   RETURNING id""",
+                (run_id, attempt_number, attempt_type, model_used),
+            )
+            return cur.fetchone()[0]
+
+
+def complete_attempt(
+    attempt_id: int,
+    status: str,
+    failure_summary: str | None = None,
+    test_status: str | None = None,
+    files_touched: str | None = None,
+):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE workflow_attempts
+                   SET status=%s, completed_at=NOW(),
+                       failure_summary=%s, test_status=%s, files_touched=%s
+                   WHERE id=%s""",
+                (status, failure_summary, test_status, files_touched, attempt_id),
+            )
+
+
 def update_run_field(run_id: int, **fields):
     """Update arbitrary columns on a workflow_run row."""
     allowed = {

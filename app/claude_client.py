@@ -39,6 +39,16 @@ SYSTEM_PROMPT = (
     "points or overall architecture. Be specific. Avoid filler phrases."
 )
 
+FIX_PROMPT = (
+    "You are a code repair assistant. A previous implementation attempt failed tests. "
+    "You will be given: the original story, the current state of the changed file, and the failing test output. "
+    "Produce a targeted fix to make the failing tests pass. "
+    "Rules: change as few lines as possible; do not break passing tests; stay within the same file unless unavoidable. "
+    "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
+    '{"file": "<relative path>", "description": "<one sentence>", '
+    '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
+)
+
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
     "Suggest ONE small, concrete code change in ONE file that moves the implementation toward what the "
@@ -292,3 +302,67 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
         logger.warning("Claude returned non-JSON suggestion: %s", raw[:200])
         fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
         return {"file": fallback_file, "description": raw[:200], "original": "", "replacement": ""}
+
+
+def fix_change(
+    repo_path: str,
+    analysis: dict,
+    issue_key: str,
+    issue_summary: str,
+    previous_suggestion: dict,
+    test_output: str,
+) -> dict:
+    """Ask Claude to fix a failing implementation.
+
+    Sends the original story, the current file content, and the trimmed test failure
+    output. Returns the same shape as suggest_change: {file, original, replacement, description}.
+    """
+    client = anthropic.Anthropic()
+
+    changed_file = previous_suggestion.get("file", "")
+    file_abs = os.path.join(repo_path, changed_file)
+    current_content = _read_truncated(file_abs) or "(file not found)"
+
+    # Trim test output to the most useful tail (last 60 lines)
+    failure_lines = (test_output or "").strip().splitlines()
+    trimmed_output = "\n".join(failure_lines[-60:]) if failure_lines else "(no output)"
+
+    user_content = (
+        f"Story: {issue_key} — {issue_summary}\n\n"
+        f"The previous implementation changed `{changed_file}` but tests are failing.\n\n"
+        f"Current file content:\n--- {changed_file} ---\n```\n{current_content}\n```\n\n"
+        f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
+        f"Produce a minimal fix to `{changed_file}` that makes the failing tests pass "
+        f"without breaking any currently passing tests."
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=[{
+            "type": "text",
+            "text": FIX_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    logger.info(
+        "Claude fix done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Claude returned non-JSON fix: %s", raw[:200])
+        return {"file": changed_file, "description": raw[:200], "original": "", "replacement": ""}
