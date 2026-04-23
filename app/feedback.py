@@ -73,7 +73,7 @@ def categorize_execution_failure(
 
     if test_status in ("FAILED", "ERROR"):
         return FailureCategory.TEST_FAILURE
-    if "interrupted by worker restart" in err:
+    if any(p in err for p in ("interrupted by worker restart", "worker restarted mid-run")):
         return FailureCategory.WORKER_INTERRUPTED
     if "syntax error" in err or "syntaxerror" in err:
         return FailureCategory.SYNTAX_FAILURE
@@ -82,7 +82,7 @@ def categorize_execution_failure(
         "file not found", "no-op", "empty changes",
     )):
         return FailureCategory.APPLY_VALIDATION_FAILURE
-    if merge_status == "FAILED" or "merge" in (current_step or "").lower():
+    if merge_status == "FAILED" or "no open pr found" in err or "merge" in (current_step or "").lower():
         return FailureCategory.MERGE_FAILURE
     return FailureCategory.UNKNOWN
 
