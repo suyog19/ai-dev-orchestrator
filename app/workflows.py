@@ -3,7 +3,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo
+from app.claude_client import summarize_repo, suggest_change
 from app.file_modifier import modify_file
 from app.telegram import send_message
 
@@ -34,6 +34,16 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     claude_summary = summarize_repo(repo_path, mapping["repo_name"], analysis)
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
+
+    suggestion = suggest_change(repo_path, analysis)
+    suggestion_msg = (
+        f"{issue_key}: Suggested change in {suggestion['file']}\n"
+        f"{suggestion['description']}\n\n"
+        f"--- original ---\n{suggestion.get('original', '')}\n\n"
+        f"+++ replacement +++\n{suggestion.get('replacement', '')}"
+    )
+    send_message("claude_suggestion", "COMPLETE", suggestion_msg)
+    logger.info("story_implementation: Claude suggestion sent to Telegram — %s", suggestion["file"])
 
     modification = modify_file(repo_path)
     send_message("file_modify", "COMPLETE", f"{issue_key}: {modification['file']} — {modification['change']}")

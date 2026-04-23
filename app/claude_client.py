@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import anthropic
 
@@ -20,6 +21,15 @@ SYSTEM_PROMPT = (
     "a concise 3-5 sentence technical summary covering: what the project does, the "
     "technology stack (languages, frameworks, key dependencies), and the main entry "
     "points or overall architecture. Be specific. Avoid filler phrases."
+)
+
+SUGGEST_PROMPT = (
+    "You are a code improvement assistant. Given a source file, suggest ONE small, concrete "
+    "improvement. It must be: specific (reference exact lines), safe (no behavior change unless "
+    "fixing a clear bug), and minimal (change as few lines as possible). "
+    "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
+    '{"file": "<relative path>", "description": "<one sentence>", '
+    '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
 )
 
 
@@ -102,3 +112,61 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
         response.usage.output_tokens,
     )
     return summary
+
+
+def suggest_change(repo_path: str, analysis: dict) -> dict:
+    """Ask Claude Haiku to suggest one targeted code improvement.
+
+    Picks the first non-README entry-point file, sends it to Claude, and returns
+    a dict with keys: file, description, original, replacement.
+    """
+    client = anthropic.Anthropic()
+
+    primary_language = analysis.get("primary_language", "Python")
+    key_files = _collect_key_files(repo_path, primary_language)
+
+    # Prefer a source file over README for a code suggestion
+    target_file, target_content = None, None
+    for rel_path, content in key_files:
+        if not rel_path.upper().startswith("README"):
+            target_file, target_content = rel_path, content
+            break
+    if target_file is None and key_files:
+        target_file, target_content = key_files[0]
+
+    if target_file is None:
+        return {"file": "unknown", "description": "No files found", "original": "", "replacement": ""}
+
+    user_content = f"File: {target_file}\n\n```\n{target_content}\n```\n\nSuggest one small improvement."
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        system=[{
+            "type": "text",
+            "text": SUGGEST_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    logger.info(
+        "Claude suggestion done — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    # Strip accidental markdown fences
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Claude returned non-JSON suggestion: %s", raw[:200])
+        return {"file": target_file, "description": raw[:200], "original": "", "replacement": ""}
