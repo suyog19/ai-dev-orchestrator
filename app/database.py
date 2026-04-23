@@ -544,13 +544,12 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # --- Resolve project_key from repo_slug ---
+            # --- Resolve all project_keys mapped to this repo ---
             cur.execute(
-                "SELECT jira_project_key FROM repo_mappings WHERE repo_slug=%s AND is_active=TRUE LIMIT 1",
+                "SELECT DISTINCT jira_project_key FROM repo_mappings WHERE repo_slug=%s AND is_active=TRUE",
                 (repo_slug,),
             )
-            mapping_row = cur.fetchone()
-            project_key = mapping_row[0] if mapping_row else None
+            project_keys = [row[0] for row in cur.fetchall()]
 
             # --- Execution stats ---
             cur.execute(
@@ -579,9 +578,11 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             exec_categories = cur.fetchall()
 
-            # --- Planning stats (scoped by project_key prefix on epic_key) ---
+            # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
-            if project_key:
+            if project_keys:
+                # Match epic_key prefixes for all project keys: 'KAN-%', 'SANDBOX-%', etc.
+                like_patterns = [f"{pk}-%" for pk in project_keys]
                 cur.execute(
                     """
                     SELECT
@@ -592,9 +593,10 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                         ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='stories_created_count'), 1) AS avg_created,
                         ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='approval_latency_seconds'), 0) AS avg_latency
                     FROM feedback_events
-                    WHERE source_type='planning_run' AND epic_key LIKE %s
+                    WHERE source_type='planning_run'
+                      AND epic_key LIKE ANY(%s)
                     """,
-                    (f"{project_key}-%",),
+                    (like_patterns,),
                 )
                 plan_row = cur.fetchone()
 
@@ -634,7 +636,7 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             plan_summary = "No planning runs recorded yet."
             plan_evidence: dict = {"repo_slug": repo_slug}
 
-            if plan_row and project_key:
+            if plan_row and project_keys:
                 approved, rejected, regenerated, avg_proposed, avg_created, avg_latency = plan_row
                 total_plan = (approved or 0) + (rejected or 0) + (regenerated or 0)
                 plan_bullets = []
