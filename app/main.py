@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from app.database import (
     init_db, get_conn,
     list_planning_runs, get_planning_run_detail,
-    approve_planning_run, reject_planning_run,
+    approve_planning_run, reject_planning_run, record_planning_feedback,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -200,6 +200,7 @@ def reject_planning_run_endpoint(run_id: int):
             detail=f"No pending planning run for id={run_id} (must be WAITING_FOR_APPROVAL + PENDING)",
         )
     reject_planning_run(run_id)
+    record_planning_feedback(run_id)
     issue_key = run.get("issue_key") or run.get("parent_issue_key", "?")
     send_message(
         "epic_breakdown_rejected", "REJECTED",

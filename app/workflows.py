@@ -13,7 +13,7 @@ from app.database import (
     record_attempt, complete_attempt,
     add_planning_output, get_planning_outputs, update_planning_output_status,
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
-    get_created_children_for_epic, store_planning_metadata,
+    get_created_children_for_epic, store_planning_metadata, record_planning_feedback,
 )
 from app.test_runner import run_tests
 
@@ -515,6 +515,8 @@ def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
             return
 
     complete_planning_run(run_id, len(created_pairs))
+    n_events = record_planning_feedback(run_id)
+    logger.info("create_jira_stories_for_run: recorded %d feedback events (run_id=%s)", n_events, run_id)
     story_lines = "\n".join(f"  {k}: {t}" for k, t in created_pairs)
     send_message(
         "epic_breakdown_complete", "COMPLETE",

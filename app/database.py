@@ -527,6 +527,89 @@ def complete_planning_run(run_id: int, created_count: int):
             )
 
 
+def record_planning_feedback(run_id: int) -> int:
+    """Write feedback_events rows for a finished planning run.
+
+    Reads the run's final state and planning_outputs to produce structured
+    signals. Should be called after every terminal state transition
+    (COMPLETED, REJECTED, REGENERATE_REQUESTED).
+    Returns the number of events written.
+    """
+    from app.feedback import FeedbackSource, FeedbackType, FailureCategory
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT issue_key, approval_status,
+                       approval_requested_at, approval_received_at,
+                       error_detail
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return 0
+            issue_key, approval_status, req_at, recv_at, error_detail = row
+
+            cur.execute(
+                "SELECT COUNT(*) FROM planning_outputs WHERE run_id = %s",
+                (run_id,),
+            )
+            proposed_count = cur.fetchone()[0]
+
+            cur.execute(
+                "SELECT COUNT(*) FROM planning_outputs WHERE run_id = %s AND status = 'CREATED'",
+                (run_id,),
+            )
+            created_count = cur.fetchone()[0]
+
+            events = []
+
+            def _ev(ftype, fvalue, details=None):
+                events.append((
+                    FeedbackSource.PLANNING_RUN, run_id,
+                    issue_key, None, None,
+                    ftype, str(fvalue) if fvalue is not None else None,
+                    json.dumps(details) if details else None,
+                ))
+
+            if proposed_count:
+                _ev(FeedbackType.STORIES_PROPOSED_COUNT, proposed_count)
+
+            if approval_status == "APPROVED":
+                _ev(FeedbackType.PLANNING_APPROVED, "true")
+                _ev(FeedbackType.STORIES_CREATED_COUNT, created_count)
+                if req_at and recv_at:
+                    latency = int((recv_at - req_at).total_seconds())
+                    _ev(FeedbackType.APPROVAL_LATENCY_SECONDS, latency)
+
+            elif approval_status == "REJECTED":
+                _ev(FeedbackType.PLANNING_REJECTED, "true",
+                    {"reason": error_detail} if error_detail else None)
+                _ev(FeedbackType.FAILURE_CATEGORY, FailureCategory.APPROVAL_REJECTED)
+
+            elif approval_status == "REGENERATE_REQUESTED":
+                _ev(FeedbackType.PLANNING_REGENERATED, "true",
+                    {"reason": error_detail} if error_detail else None)
+                _ev(FeedbackType.FAILURE_CATEGORY, FailureCategory.APPROVAL_REGENERATED)
+
+            if not events:
+                return 0
+
+            cur.executemany(
+                """
+                INSERT INTO feedback_events
+                    (source_type, source_run_id, epic_key, story_key, repo_slug,
+                     feedback_type, feedback_value, details_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                events,
+            )
+    return len(events)
+
+
 def store_planning_metadata(run_id: int, assumptions: list, open_questions: list):
     """Persist assumptions and open_questions lists from a Claude planning response."""
     with get_conn() as conn:
