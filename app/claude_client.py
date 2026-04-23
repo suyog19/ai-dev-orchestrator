@@ -580,7 +580,7 @@ def fix_change(
     }
 
 
-def plan_epic_breakdown(issue_key: str, summary: str) -> dict:
+def plan_epic_breakdown(issue_key: str, summary: str, memory_context: str = "") -> dict:
     """Ask Claude Sonnet to decompose an Epic into Stories.
 
     Returns the plan_breakdown tool input dict:
@@ -597,11 +597,10 @@ def plan_epic_breakdown(issue_key: str, summary: str) -> dict:
     }
     Raises RuntimeError if Claude returns no tool call or empty items.
     """
-    user_content = (
-        f"Epic: {issue_key}\n"
-        f"Title: {summary}\n\n"
-        f"Propose up to {MAX_STORIES_PER_EPIC} Stories for this Epic using the plan_breakdown tool."
-    )
+    user_content = f"Epic: {issue_key}\nTitle: {summary}\n"
+    if memory_context:
+        user_content += f"\nPrior lessons from this repository:\n{memory_context}\n"
+    user_content += f"\nPropose up to {MAX_STORIES_PER_EPIC} Stories for this Epic using the plan_breakdown tool."
 
     response = _CLIENT.messages.create(
         model="claude-sonnet-4-6",

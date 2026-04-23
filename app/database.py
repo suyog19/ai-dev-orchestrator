@@ -1214,3 +1214,58 @@ def get_planning_run_for_regeneration(run_id: int) -> dict | None:
     except Exception:
         result["summary"] = ""
     return result
+
+
+def get_planning_memory(repo_slug: str, epic_key: str | None = None) -> str:
+    """Retrieve repo-level and optional epic-level memory formatted for prompt injection.
+
+    Combines:
+      - repo planning_guidance  (approval patterns, avg story counts)
+      - repo execution_guidance (completion rates, failure categories)
+      - epic execution_guidance (if epic_key provided and a snapshot exists)
+
+    Returns a bullet-point block bounded to MEMORY_MAX_BULLETS and
+    MEMORY_MAX_CHARS. Returns empty string when no useful snapshots exist.
+    """
+    from app.feedback import MEMORY_MAX_BULLETS, MEMORY_MAX_CHARS
+
+    _SKIP = frozenset(["no planning runs recorded yet.", "no execution runs recorded yet."])
+    bullets: list[str] = []
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            queries: list[tuple[str, str, str]] = [
+                ("repo", repo_slug, "planning_guidance"),
+                ("repo", repo_slug, "execution_guidance"),
+            ]
+            if epic_key:
+                queries.append(("epic", epic_key, "execution_guidance"))
+
+            for scope_type, scope_key, memory_kind in queries:
+                cur.execute(
+                    """
+                    SELECT summary FROM memory_snapshots
+                    WHERE scope_type = %s AND scope_key = %s AND memory_kind = %s
+                    """,
+                    (scope_type, scope_key, memory_kind),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    continue
+                text = row[0].strip()
+                if text.lower() in _SKIP:
+                    continue
+                for line in text.splitlines():
+                    line = line.strip().lstrip("- ").strip()
+                    if line:
+                        bullets.append(line)
+
+    if not bullets:
+        return ""
+
+    bullets = bullets[:MEMORY_MAX_BULLETS]
+    block = "\n".join(f"- {b}" for b in bullets)
+    if len(block) > MEMORY_MAX_CHARS:
+        block = block[:MEMORY_MAX_CHARS].rsplit("\n", 1)[0]
+
+    return block

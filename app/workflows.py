@@ -15,6 +15,7 @@ from app.database import (
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
     get_created_children_for_epic, store_planning_metadata,
     record_planning_feedback, record_execution_feedback,
+    get_planning_memory,
 )
 from app.test_runner import run_tests
 
@@ -382,10 +383,26 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
         )
         return
 
+    # --- Memory context for planning prompt ---
+    jira_project_key = issue_key.split("-")[0]
+    memory_context = ""
+    try:
+        story_mapping = get_mapping(jira_project_key, "Story")
+        if story_mapping:
+            repo_slug = story_mapping["repo_slug"]
+            memory_context = get_planning_memory(repo_slug, issue_key)
+            if memory_context:
+                logger.info(
+                    "epic_breakdown: injecting %d chars of memory context (run_id=%s)",
+                    len(memory_context), run_id,
+                )
+    except Exception as mem_exc:
+        logger.warning("epic_breakdown: get_planning_memory failed (non-fatal): %s", mem_exc)
+
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")
     try:
-        plan = plan_epic_breakdown(issue_key, summary)
+        plan = plan_epic_breakdown(issue_key, summary, memory_context=memory_context)
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")
