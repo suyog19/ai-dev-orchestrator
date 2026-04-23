@@ -307,6 +307,95 @@ def _select_files_for_story(
     return result
 
 
+MAX_STORIES_PER_EPIC = 8
+
+PLANNING_PROMPT = (
+    "You are a software planning assistant specialising in breaking Epics into implementation-ready Stories. "
+    "Each Story you propose must be:\n"
+    "- Independently deliverable — a developer can implement it without waiting on other Stories\n"
+    "- Testable — it has clear, verifiable acceptance criteria\n"
+    "- Implementation-sized — a developer can complete it in 1-3 days\n\n"
+    "Rules:\n"
+    "- Produce 2-8 Stories — prefer fewer, well-scoped Stories over a long noisy list\n"
+    "- Never use vague titles like 'Improve system' or 'General refactor'\n"
+    "- Title must be imperative verb + object, max 10 words (e.g. 'Add OAuth2 login endpoint')\n"
+    "- Do not invent architecture not implied by the Epic description\n"
+    "- Surface assumptions and open questions explicitly\n"
+    "- Dependency notes must reference other proposed Story titles specifically\n"
+    "- Call the plan_breakdown tool only — do not respond with prose."
+)
+
+_BREAKDOWN_TOOL = {
+    "name": "plan_breakdown",
+    "description": "Propose a structured breakdown of an Epic into implementation-ready Stories.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "1-2 sentences summarising the decomposition approach.",
+            },
+            "assumptions": {
+                "type": "array",
+                "description": "Explicit assumptions made (e.g. 'Auth layer already exists'). Empty list if none.",
+                "items": {"type": "string"},
+            },
+            "open_questions": {
+                "type": "array",
+                "description": "Unresolved questions that could affect scope. Empty list if none.",
+                "items": {"type": "string"},
+            },
+            "items": {
+                "type": "array",
+                "description": f"Proposed Stories (max {MAX_STORIES_PER_EPIC}).",
+                "minItems": 1,
+                "maxItems": MAX_STORIES_PER_EPIC,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Imperative-verb Story title, max 10 words.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "2-3 sentences describing what to implement.",
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "description": "3-5 testable acceptance criteria.",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Why this Story is a separate deliverable unit.",
+                        },
+                        "dependency_notes": {
+                            "type": "string",
+                            "description": "Other Story titles this depends on, or empty string.",
+                        },
+                        "risk_notes": {
+                            "type": "string",
+                            "description": "Known risks specific to this Story, or empty string.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "description": "Confidence in this Story's scope being correctly defined.",
+                        },
+                    },
+                    "required": [
+                        "title", "description", "acceptance_criteria",
+                        "rationale", "confidence",
+                    ],
+                },
+            },
+        },
+        "required": ["summary", "items", "assumptions", "open_questions"],
+    },
+}
+
 _CLIENT = anthropic.Anthropic(timeout=120.0)
 
 
@@ -489,3 +578,64 @@ def fix_change(
         "changes": [{"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}],
         "summary": "",
     }
+
+
+def plan_epic_breakdown(issue_key: str, summary: str) -> dict:
+    """Ask Claude Sonnet to decompose an Epic into Stories.
+
+    Returns the plan_breakdown tool input dict:
+    {
+        "summary": "...",
+        "assumptions": [...],
+        "open_questions": [...],
+        "items": [
+            {"title": "...", "description": "...", "acceptance_criteria": [...],
+             "rationale": "...", "dependency_notes": "...",
+             "risk_notes": "...", "confidence": "high|medium|low"},
+            ...
+        ]
+    }
+    Raises RuntimeError if Claude returns no tool call or empty items.
+    """
+    user_content = (
+        f"Epic: {issue_key}\n"
+        f"Title: {summary}\n\n"
+        f"Propose up to {MAX_STORIES_PER_EPIC} Stories for this Epic using the plan_breakdown tool."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=[{
+            "type": "text",
+            "text": PLANNING_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_BREAKDOWN_TOOL],
+        tool_choice={"type": "tool", "name": "plan_breakdown"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Claude epic breakdown done — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Claude returned no tool_use block for epic breakdown")
+
+    result = tool_block.input
+    items = result.get("items", [])
+    if not items:
+        raise RuntimeError("Claude returned empty items list for epic breakdown")
+
+    if len(items) > MAX_STORIES_PER_EPIC:
+        logger.warning(
+            "Claude returned %d items — truncating to cap of %d",
+            len(items), MAX_STORIES_PER_EPIC,
+        )
+        result["items"] = items[:MAX_STORIES_PER_EPIC]
+
+    return result

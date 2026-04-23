@@ -5,7 +5,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
 from app.database import (
@@ -351,60 +351,71 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
 # Phase 6 — Planning workflows
 # ---------------------------------------------------------------------------
 
-MAX_STORIES_PER_EPIC = 8
-
-
 def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
-    """Epic → Story breakdown workflow — Phase 6.
-
-    Iteration 1: stub proposals stored in planning_outputs; Telegram approval requested.
-    Claude-based decomposition replaces stubs in Iteration 3.
-    """
+    """Epic → Story breakdown workflow — Phase 6."""
     logger.info("epic_breakdown: starting for %s — %s", issue_key, summary)
 
     update_run_step(run_id, "planning")
     update_run_field(run_id, parent_issue_key=issue_key)
     send_message("epic_breakdown_started", "RUNNING", f"{issue_key}: {summary}")
 
-    # Stub proposals — replaced by real Claude output in Iteration 3
-    stub_stories = [
-        {
-            "title": f"[Stub] Implement core functionality for: {summary}",
-            "description": "Placeholder Story — will be replaced by Claude-generated breakdown in Iteration 3.",
-            "acceptance_criteria": "To be defined by Claude decomposition.",
-        },
-        {
-            "title": f"[Stub] Add tests and validation for: {summary}",
-            "description": "Placeholder Story — will be replaced by Claude-generated breakdown in Iteration 3.",
-            "acceptance_criteria": "To be defined by Claude decomposition.",
-        },
-    ]
+    # --- Claude decomposition ---
+    update_run_step(run_id, "decomposing")
+    try:
+        plan = plan_epic_breakdown(issue_key, summary)
+    except Exception as exc:
+        logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
+        fail_run(run_id, f"Epic decomposition failed: {exc}")
+        send_message("epic_breakdown_failed", "FAILED", f"{issue_key}: {exc}")
+        return
 
+    items = plan.get("items", [])
+    logger.info("epic_breakdown: Claude proposed %d Stories for %s", len(items), issue_key)
+
+    # --- Persist proposals ---
     output_ids = []
-    for i, story in enumerate(stub_stories, start=1):
+    for i, item in enumerate(items, start=1):
+        ac_list = item.get("acceptance_criteria", [])
+        ac_text = "\n".join(f"- {c}" for c in ac_list) if ac_list else None
         oid = add_planning_output(
             run_id=run_id,
             parent_issue_key=issue_key,
             parent_issue_type=issue_type,
             proposed_issue_type="Story",
             sequence_number=i,
-            title=story["title"],
-            description=story["description"],
-            acceptance_criteria=story["acceptance_criteria"],
+            title=item.get("title", f"Story {i}"),
+            description=item.get("description"),
+            acceptance_criteria=ac_text,
+            rationale=item.get("rationale"),
+            dependency_notes=item.get("dependency_notes") or None,
+            risk_notes=item.get("risk_notes") or None,
+            confidence=item.get("confidence"),
         )
         output_ids.append(oid)
 
-    logger.info("epic_breakdown: stored %d stub proposals (run_id=%s)", len(output_ids), run_id)
+    logger.info("epic_breakdown: stored %d proposals (run_id=%s)", len(output_ids), run_id)
 
-    # Mark run as awaiting human approval
+    # --- Request approval ---
     request_planning_approval(run_id)
     set_run_waiting_for_approval(run_id)
 
-    story_lines = "\n".join(f"  {i}. {s['title']}" for i, s in enumerate(stub_stories, 1))
+    story_lines = "\n".join(
+        f"  {i}. {item.get('title', '?')} [{item.get('confidence', '?')}]"
+        for i, item in enumerate(items, 1)
+    )
+    assumptions = plan.get("assumptions") or []
+    open_questions = plan.get("open_questions") or []
+    extra = ""
+    if assumptions:
+        extra += "\nAssumptions:\n" + "\n".join(f"  - {a}" for a in assumptions)
+    if open_questions:
+        extra += "\nOpen questions:\n" + "\n".join(f"  - {q}" for q in open_questions)
+
     approval_msg = (
         f"Epic: {issue_key}\n"
         f"Summary: {summary}\n\n"
-        f"Proposed Stories ({len(stub_stories)}):\n{story_lines}\n\n"
+        f"Proposed Stories ({len(items)}):\n{story_lines}"
+        f"{extra}\n\n"
         f"Run ID: {run_id}\n\n"
         f"Reply with:\n"
         f"  APPROVE {run_id}\n"
