@@ -88,7 +88,7 @@ def commit_and_push(repo_path: str, issue_key: str, commit_message: str) -> str:
     _git("commit", "-m", commit_message)
     logger.info("Committed: %s", commit_message)
 
-    _git("push", "origin", working_branch)
+    _git("push", "--force", "origin", working_branch)
     logger.info("Pushed branch %s to origin", working_branch)
 
     return working_branch
