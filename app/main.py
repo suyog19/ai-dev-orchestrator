@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from app.database import init_db
+from app.database import init_db, get_conn
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
@@ -149,3 +149,39 @@ def mapping_health():
         "fingerprint": fingerprint,
         "mappings": active_sorted,
     }
+
+
+# ---------------------------------------------------------------------------
+# Jira event inspector — last N raw payloads for payload format debugging
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/jira-events")
+def recent_jira_events(limit: int = 3):
+    """Return the last N raw Jira webhook payloads as received, newest first.
+
+    Useful for validating that real Jira payloads parse correctly.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, event_type, status, created_at, payload_json
+                FROM workflow_events
+                WHERE source = 'jira'
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (min(limit, 10),),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "event_type": row[1],
+            "status": row[2],
+            "created_at": row[3].isoformat(),
+            "payload": json.loads(row[4]),
+        }
+        for row in rows
+    ]
