@@ -205,6 +205,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         run_id=run_id,
         commit_message=commit_message,
     )
+
+    if not branch:
+        # Fix reverted all changes — working tree identical to base, nothing to push
+        update_run_field(run_id, merge_status="SKIPPED")
+        update_run_step(run_id, "done")
+        send_message("pr_skipped", "COMPLETE", f"{issue_key}: fix reverted all changes — no PR created")
+        logger.info("story_implementation: nothing to push (reverted to base) — skipping PR creation")
+        return
+
     update_run_field(run_id, working_branch=branch)
     send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
     logger.info("story_implementation: pushed branch %s", branch)
