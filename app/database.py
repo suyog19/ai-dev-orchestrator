@@ -1239,13 +1239,13 @@ def get_planning_memory(repo_slug: str, epic_key: str | None = None) -> str:
     with get_conn() as conn:
         with conn.cursor() as cur:
             queries: list[tuple[str, str, str]] = [
+                ("repo", repo_slug, "manual_note"),       # human-authored first — never dropped by cap
                 ("repo", repo_slug, "planning_guidance"),
                 ("repo", repo_slug, "execution_guidance"),
-                ("repo", repo_slug, "manual_note"),
             ]
             if epic_key:
-                queries.append(("epic", epic_key, "execution_guidance"))
                 queries.append(("epic", epic_key, "manual_note"))
+                queries.append(("epic", epic_key, "execution_guidance"))
 
             for scope_type, scope_key, memory_kind in queries:
                 cur.execute(
@@ -1291,7 +1291,7 @@ def get_execution_memory(repo_slug: str) -> str:
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            for memory_kind in ("execution_guidance", "manual_note"):
+            for memory_kind in ("manual_note", "execution_guidance"):
                 cur.execute(
                     """
                     SELECT summary FROM memory_snapshots
