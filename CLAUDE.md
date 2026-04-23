@@ -11,41 +11,103 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Verify with: `curl http://localhost:8000/healthz` → `{"status": "ok"}`
 
-No test suite, linting config, or Makefile exists yet — these are added in later iterations.
+No test suite or linting config exists for this repo itself (the orchestrator). Tests run against the *target* sandbox repo (`suyog19/sandbox-fastapi-app`) as part of `story_implementation`.
 
 ## Architecture
 
-This is a Python/FastAPI orchestration service that receives Jira webhook events, persists them in PostgreSQL, dispatches stub workflows via a Redis-backed queue, and notifies the user via Telegram.
+Python/FastAPI orchestration service. Receives Jira webhook events, persists them in PostgreSQL, dispatches workflows via a Redis-backed queue, executes them in a background worker, and notifies via Telegram.
 
-**Planned components (Phase 1):**
-- `app/main.py` — FastAPI core; logging; all endpoints live here until further modularization
-- PostgreSQL — `workflow_events` and `workflow_runs` tables (not yet integrated)
-- Redis — workflow job queue with configurable concurrency limit (default 2 parallel workflows)
-- Worker process — background executor for stub workflows
-- Telegram bot — notifications on startup, webhook receipt, workflow start/complete
+**Key files:**
+- `app/main.py` — FastAPI app, all HTTP endpoints
+- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2)
+- `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan)
+- `app/database.py` — all DB access; schema migrations in `init_db()`
+- `app/feedback.py` — feedback/memory constants and failure categorisation functions
+- `app/webhooks.py` — Jira and Telegram webhook receivers
+- `app/jira_client.py` — Jira REST API v3 calls
+- `app/github_api.py` — GitHub API calls (PR creation, labels, merge)
+- `app/git_ops.py` — clone, commit, push
+- `app/repo_mapping.py` — CRUD for `repo_mappings` table
+- `app/test_runner.py` — runs `pytest -q` in a cloned workspace
+- `app/queue.py` — Redis queue enqueue/dequeue
 
-**Event flow (target):**
+**Event flow:**
 ```
-Jira Webhook → POST /webhooks/jira → DB → Dispatcher → Redis Queue → Worker → Telegram
+Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
+  → Redis Queue → Worker thread
+
+  story_implementation:
+    clone repo → analyze → summarize → suggest change (+ memory) → apply
+    → run tests → [fix attempt if failed] → commit/push → PR → auto-merge
+
+  epic_breakdown:
+    fetch planning memory → Claude decompose (+ memory) → store proposals
+    → Telegram approval gate (APPROVE / REJECT / REGENERATE)
+    → create Stories in Jira → trigger story_implementation via status change
+
+Telegram Webhook → POST /webhooks/telegram → APPROVE/REJECT/REGENERATE handler
 ```
 
-**Workflow triggers recognized (Phase 1):**
-- Epic/Feature/Story → Final status in Jira
-- Only `story_implementation` workflow is mapped (stub: log, sleep, complete, notify)
+**Workflow triggers:**
+| Jira status | Issue type | Workflow |
+|---|---|---|
+| `Ready for Dev` | Story | `story_implementation` |
+| `Ready for Breakdown` | Epic | `epic_breakdown` |
 
 ## Data Model
 
-**`workflow_events`:** `id`, `source`, `event_type`, `payload_json`, `status`, `created_at`
+All tables are created (and migrated) by `init_db()` in `app/database.py`.
 
-**`workflow_runs`:** `id`, `workflow_type`, `status` (RECEIVED | QUEUED | RUNNING | COMPLETED), `related_event_id`, `created_at`, `updated_at`
+| Table | Purpose |
+|---|---|
+| `workflow_events` | Raw Jira/Telegram webhook payloads |
+| `workflow_runs` | One row per workflow execution; tracks status, branch, PR, test/merge results |
+| `workflow_attempts` | Per-attempt records within a run (implement + optional fix) |
+| `repo_mappings` | Jira project key → repo slug + branch + auto-merge policy |
+| `planning_outputs` | Proposed Stories from epic_breakdown; one row per item per run |
+| `feedback_events` | Atomic signals written after each run completes (append-only) |
+| `memory_snapshots` | Derived and human-authored guidance; one row per (scope_type, scope_key, memory_kind) |
+
+**`workflow_runs` status flow:**
+```
+RECEIVED → QUEUED → RUNNING → COMPLETED
+                            → FAILED
+                            → WAITING_FOR_APPROVAL → COMPLETED (after APPROVE)
+                                                    → FAILED    (after REJECT/REGENERATE)
+```
+
+**`memory_snapshots` kinds:** `planning_guidance`, `execution_guidance`, `manual_note`
+**`memory_snapshots` scopes:** `repo` (scope_key = repo_slug), `epic` (scope_key = epic_key)
 
 ## API Endpoints
 
 | Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/healthz` | Health check (implemented) |
-| GET | `/debug/send-telegram` | Manual Telegram test (planned) |
-| POST | `/webhooks/jira` | Jira event receiver (planned) |
+|---|---|---|
+| GET | `/healthz` | Health check |
+| POST | `/webhooks/jira` | Jira event receiver |
+| POST | `/webhooks/telegram` | Telegram approval command receiver |
+| GET | `/debug/send-telegram` | Manual Telegram test |
+| GET | `/debug/telegram/set-webhook` | Register Telegram bot webhook |
+| GET | `/debug/repo-mappings` | List all repo mappings |
+| GET | `/debug/repo-mappings/{id}` | Inspect one mapping |
+| POST | `/debug/repo-mappings` | Create mapping |
+| PUT | `/debug/repo-mappings/{id}` | Update mapping |
+| DELETE | `/debug/repo-mappings/{id}` | Deactivate mapping |
+| GET | `/debug/mapping-health` | Active mappings + fingerprint for env parity |
+| GET | `/debug/planning-runs` | List recent planning runs |
+| GET | `/debug/planning-runs/{run_id}` | Full planning run detail |
+| POST | `/debug/planning-runs/{run_id}/approve` | HTTP APPROVE (same as Telegram command) |
+| POST | `/debug/planning-runs/{run_id}/reject` | HTTP REJECT |
+| GET | `/debug/workflow-runs` | List recent workflow runs |
+| GET | `/debug/workflow-runs/{run_id}` | Full run detail including attempts |
+| GET | `/debug/jira-events` | Last N raw Jira webhook payloads |
+| POST | `/debug/epic-outcomes/{epic_key}` | Generate/refresh Epic outcome rollup |
+| GET | `/debug/epic-outcomes/{epic_key}` | Return stored Epic outcome |
+| POST | `/debug/memory` | Create/update a human-authored memory note |
+| GET | `/debug/memory` | List memory snapshots (filter: scope_type, scope_key) |
+| GET | `/debug/feedback-events` | List raw feedback events (filter: source_type, repo_slug, feedback_type, source_run_id) |
+| POST | `/debug/memory/recompute` | Force-refresh a derived snapshot (scope_type=repo\|epic) |
 
 ## Telegram Message Format
 
@@ -56,20 +118,17 @@ Status: <status>
 Details: <short summary>
 ```
 
-## Iteration Order (STRICT — do not skip steps)
+## Phase Completion Status
 
-1. Project skeleton + `/healthz` ✅
-2. Docker + Docker Compose
-3. VM setup instructions
-4. GitHub self-hosted runner
-5. Dev auto-deploy workflow (`dev` branch)
-6. PostgreSQL integration
-7. Telegram bot integration
-8. Jira webhook endpoint
-9. Event persistence
-10. Workflow dispatcher (stub)
-11. Redis queue + worker
-12. Stub workflow execution
+| Phase | Description | Status |
+|---|---|---|
+| 1 | Project skeleton, health check, Docker, VM, CI/CD | ✅ Complete |
+| 2 | PostgreSQL, Redis, worker, Telegram, Jira webhook, dispatcher | ✅ Complete |
+| 3 | Dev/prod VM split, branch-based deploy, env model | ✅ Complete |
+| 4 | Real Claude code generation, GitHub PR creation, apply/validate | ✅ Complete |
+| 5 | Tests, fix loop, auto-merge, repo analysis, file selection | ✅ Complete |
+| 6 | Epic breakdown, Claude planning, Telegram approval gate, Jira Story creation | ✅ Complete |
+| 7 | Feedback capture, failure categorisation, memory snapshots, prompt enrichment, manual notes | ✅ Complete |
 
 ## Working Style
 
@@ -85,9 +144,16 @@ OPTIONS:
 RECOMMENDATION: <recommendation + why>
 ```
 
-## Non-Goals (Phase 1)
+## Deferred / Out of Scope
 
-Do not implement: real Claude-driven code generation, GitHub repo modifications, PR creation/review, full Jira automation, Epic/Feature breakdown workflows, retry/failure recovery, UI/dashboard, production security hardening.
+- Feature-level Jira hierarchy (locked: Epic → Story only, no Feature or Task levels)
+- Global-scope memory (deferred — no cross-repo patterns exist yet)
+- Run-scope memory injection (single-run signals not worth feeding back into the same run)
+- Memory pruning / decay (snapshots are recomputed from raw events — no TTL needed)
+- Semantic/vector search for memory retrieval (rule-based aggregation is sufficient)
+- UI or dashboard
+- Production security hardening
+- Multi-agent planning
 
 ## Environment Model (Phase 3+)
 
@@ -140,11 +206,9 @@ This value is prepended to every Telegram message as `[DEV]` or `[PROD]`.
 
 The sandbox repo (`suyog19/sandbox-fastapi-app`) is long-lived. Approved PRs are merged
 between sessions so the codebase gradually improves. Auto-merge is enabled for this repo
-(`auto_merge_enabled: true` in `config/seed_mappings.json`) and will be enforced by code
-logic starting in Phase 5 Iteration 6. Until that iteration, the flag exists in the DB
-but has no runtime effect.
+(`auto_merge_enabled: true` in `config/seed_mappings.json`).
 
-Auto-merge conditions (enforced from Iteration 6 onward):
+Auto-merge conditions:
 - tests passed (`test_status = PASSED`)
 - PR created successfully
 - `auto_merge_enabled = true` on the repo mapping
