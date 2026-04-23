@@ -194,13 +194,16 @@ def _select_files_for_story(
     return result
 
 
+_CLIENT = anthropic.Anthropic(timeout=120.0)
+
+
 def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     """Call Claude Sonnet to produce a 3-5 sentence technical summary of the repo.
 
     Uses prompt caching on the stable system prompt to reduce cost on repeated calls.
     Returns the summary string.
     """
-    client = anthropic.Anthropic()
+    client = _CLIENT
 
     key_files = _collect_key_files(repo_path, analysis.get("primary_language", "Unknown"))
 
@@ -248,7 +251,7 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     list, giving Claude context most relevant to the story intent.
     Returns a dict with keys: file, description, original, replacement.
     """
-    client = anthropic.Anthropic()
+    client = _CLIENT
 
     primary_language = analysis.get("primary_language", "Python")
     selected = _select_files_for_story(repo_path, primary_language, issue_summary)
@@ -317,7 +320,7 @@ def fix_change(
     Sends the original story, the current file content, and the trimmed test failure
     output. Returns the same shape as suggest_change: {file, original, replacement, description}.
     """
-    client = anthropic.Anthropic()
+    client = _CLIENT
 
     changed_file = previous_suggestion.get("file", "")
     file_abs = os.path.join(repo_path, changed_file)
