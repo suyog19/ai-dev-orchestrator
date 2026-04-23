@@ -42,36 +42,42 @@ SYSTEM_PROMPT = (
 FIX_PROMPT = (
     "You are a code repair assistant. A previous implementation attempt failed tests. "
     "You will be given: the original story, the current state of the changed file, and the failing test output. "
-    "Produce a targeted fix to make the failing tests pass. "
+    "Call the apply_code_change tool with a targeted fix to make the failing tests pass. "
     "Rules:\n"
     "- Change as few lines as possible\n"
     "- Do not break currently passing tests\n"
     "- Stay within the same file\n"
     "- Do not import or reference types that do not already exist in the codebase\n"
-    "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types\n\n"
-    "CRITICAL: Your entire response must be a single JSON object. "
-    "Do not include any explanation, reasoning, prose, or markdown. "
-    "Start your response with { and end with }.\n"
-    "Format:\n"
-    '{"file": "<relative path>", "description": "<one sentence>", '
-    '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
+    "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types"
 )
 
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
-    "Suggest ONE small, concrete code change in ONE file that moves the implementation toward what the "
-    "story describes. Choose the most relevant file. "
-    "If the story is not directly actionable (e.g. it describes a test or process), suggest the most "
-    "relevant improvement you can find in any of the files instead. "
+    "Call the apply_code_change tool with ONE concrete code change in ONE file that moves the implementation "
+    "toward what the story describes. Choose the most relevant file. "
+    "If the story is not directly actionable, suggest the most relevant improvement in any of the files. "
     "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and complete (include ALL changes needed in one contiguous block — e.g. if a "
-    "new function needs a new import, put both in the replacement). "
+    "new function needs a new import, include both in the replacement). "
     "You may add imports for names that genuinely exist in the codebase. "
-    "Do not invent new class names or types that are not defined anywhere in the provided files. "
-    "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
-    '{"file": "<relative path>", "description": "<one sentence>", '
-    '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
+    "Do not invent new class names or types that are not defined anywhere in the provided files."
 )
+
+# Tool schema used by both suggest_change and fix_change to guarantee structured output
+_CHANGE_TOOL = {
+    "name": "apply_code_change",
+    "description": "Apply a targeted code change to a source file",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file":        {"type": "string", "description": "Relative path to the file to change"},
+            "description": {"type": "string", "description": "One sentence describing what the change does"},
+            "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
+            "replacement": {"type": "string", "description": "The new text that replaces the original"},
+        },
+        "required": ["file", "description", "original", "replacement"],
+    },
+}
 
 
 def _read_truncated(path: str, max_lines: int = 150) -> str | None:
@@ -281,10 +287,9 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     user_content = (
         f"{story_context}"
         f"Available source files (ordered by relevance to story):{file_sections}\n"
-        f"Suggest one small improvement to ONE of the files above that best addresses the story."
+        f"Suggest one improvement to ONE of the files above that best addresses the story."
     )
 
-    # Prefill the assistant turn with "{" to force JSON-only output
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -293,25 +298,24 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
             "text": SUGGEST_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        messages=[
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": "{"},
-        ],
+        tools=[_CHANGE_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_change"},
+        messages=[{"role": "user", "content": user_content}],
     )
 
-    raw = "{" + next((b.text for b in response.content if b.type == "text"), "}")
     logger.info(
         "Claude suggestion done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Claude returned non-JSON suggestion: %s", raw[:200])
-        fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
-        return {"file": fallback_file, "description": raw[:200], "original": "", "replacement": ""}
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_block:
+        return tool_block.input
+
+    logger.warning("Claude suggestion: no tool_use block in response")
+    fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
+    return {"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}
 
 
 def fix_change(
@@ -342,11 +346,10 @@ def fix_change(
         f"The previous implementation changed `{changed_file}` but tests are failing.\n\n"
         f"Current file content:\n--- {changed_file} ---\n```\n{current_content}\n```\n\n"
         f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
-        f"Produce a minimal fix to `{changed_file}` that makes the failing tests pass "
+        f"Call apply_code_change with a minimal fix to `{changed_file}` that makes the failing tests pass "
         f"without breaking any currently passing tests."
     )
 
-    # Prefill the assistant turn with "{" to force JSON-only output
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -355,22 +358,20 @@ def fix_change(
             "text": FIX_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        messages=[
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": "{"},
-        ],
+        tools=[_CHANGE_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_change"},
+        messages=[{"role": "user", "content": user_content}],
     )
 
-    # Prepend the prefilled "{" that the SDK does not include in the response
-    raw = "{" + next((b.text for b in response.content if b.type == "text"), "}")
     logger.info(
         "Claude fix done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Claude returned non-JSON fix even with prefill: %s", raw[:200])
-        return {"file": changed_file, "description": raw[:200], "original": "", "replacement": ""}
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_block:
+        return tool_block.input
+
+    logger.warning("Claude fix: no tool_use block in response")
+    return {"file": changed_file, "description": "No tool call returned", "original": "", "replacement": ""}
