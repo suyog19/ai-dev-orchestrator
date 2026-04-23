@@ -68,6 +68,7 @@ class RepoMappingIn(BaseModel):
     base_branch: str = "main"
     issue_type: str | None = None
     notes: str | None = None
+    auto_merge_enabled: bool = False
 
 
 class RepoMappingUpdate(BaseModel):
@@ -77,6 +78,7 @@ class RepoMappingUpdate(BaseModel):
     issue_type: str | None = None
     is_active: bool | None = None
     notes: str | None = None
+    auto_merge_enabled: bool | None = None
 
 
 @app.get("/debug/repo-mappings")
@@ -100,6 +102,7 @@ def create_repo_mapping(body: RepoMappingIn):
         base_branch=body.base_branch,
         issue_type=body.issue_type,
         notes=body.notes,
+        auto_merge_enabled=body.auto_merge_enabled,
     )
 
 
@@ -185,3 +188,61 @@ def recent_jira_events(limit: int = 3):
         }
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Workflow run inspection — no SSH required
+# ---------------------------------------------------------------------------
+
+_RUN_COLS_LIST = [
+    "id", "issue_key", "workflow_type", "status", "current_step",
+    "working_branch", "pr_url", "error_detail",
+    "retry_count", "test_status", "merge_status",
+    "started_at", "completed_at", "created_at",
+]
+
+_RUN_COLS_DETAIL = _RUN_COLS_LIST + [
+    "test_command", "test_output", "files_changed_count", "merged_at",
+]
+
+
+def _run_row_to_dict(row, cols: list[str]) -> dict:
+    return {
+        col: (val.isoformat() if hasattr(val, "isoformat") else val)
+        for col, val in zip(cols, row)
+    }
+
+
+@app.get("/debug/workflow-runs")
+def list_workflow_runs(limit: int = 10):
+    """Return most recent workflow runs, newest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {", ".join(_RUN_COLS_LIST)},
+                       left(error_detail, 200) as error_detail_trunc
+                FROM workflow_runs
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (min(limit, 50),),
+            )
+            rows = cur.fetchall()
+    cols = _RUN_COLS_LIST[:-1] + ["error_detail"] + [_RUN_COLS_LIST[-1]]
+    return [_run_row_to_dict(row, _RUN_COLS_LIST) for row in rows]
+
+
+@app.get("/debug/workflow-runs/{run_id}")
+def get_workflow_run(run_id: int):
+    """Return full detail for a single workflow run including test output."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {', '.join(_RUN_COLS_DETAIL)} FROM workflow_runs WHERE id = %s",
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No run found for id={run_id}")
+    return _run_row_to_dict(row, _RUN_COLS_DETAIL)

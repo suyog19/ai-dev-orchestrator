@@ -13,14 +13,15 @@ def _row_to_dict(row) -> dict:
         "base_branch": row[4],
         "is_active": row[5],
         "notes": row[6],
-        "created_at": row[7].isoformat() if row[7] else None,
-        "updated_at": row[8].isoformat() if row[8] else None,
+        "auto_merge_enabled": row[7],
+        "created_at": row[8].isoformat() if row[8] else None,
+        "updated_at": row[9].isoformat() if row[9] else None,
     }
 
 
 _SELECT = """
     SELECT id, jira_project_key, issue_type, repo_slug, base_branch,
-           is_active, notes, created_at, updated_at
+           is_active, notes, auto_merge_enabled, created_at, updated_at
     FROM repo_mappings
 """
 
@@ -71,24 +72,25 @@ def add_mapping(
     base_branch: str = "main",
     issue_type: str | None = None,
     notes: str | None = None,
+    auto_merge_enabled: bool = False,
 ) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO repo_mappings
-                    (jira_project_key, issue_type, repo_slug, base_branch, notes)
-                VALUES (%s, %s, %s, %s, %s)
+                    (jira_project_key, issue_type, repo_slug, base_branch, notes, auto_merge_enabled)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (jira_project_key, issue_type, repo_slug, base_branch, notes),
+                (jira_project_key, issue_type, repo_slug, base_branch, notes, auto_merge_enabled),
             )
             new_id = cur.fetchone()[0]
     return get_mapping_by_id(new_id)
 
 
 def update_mapping(mapping_id: int, **fields) -> dict | None:
-    allowed = {"jira_project_key", "issue_type", "repo_slug", "base_branch", "is_active", "notes"}
+    allowed = {"jira_project_key", "issue_type", "repo_slug", "base_branch", "is_active", "notes", "auto_merge_enabled"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
         return get_mapping_by_id(mapping_id)
@@ -141,8 +143,8 @@ def upsert_seed_mappings(mappings: list[dict]) -> int:
                 cur.execute(
                     """
                     INSERT INTO repo_mappings
-                        (jira_project_key, issue_type, repo_slug, base_branch, notes)
-                    VALUES (%s, %s, %s, %s, %s)
+                        (jira_project_key, issue_type, repo_slug, base_branch, notes, auto_merge_enabled)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (
                         m["jira_project_key"],
@@ -150,6 +152,7 @@ def upsert_seed_mappings(mappings: list[dict]) -> int:
                         m["repo_slug"],
                         m.get("base_branch", "main"),
                         m.get("notes"),
+                        m.get("auto_merge_enabled", False),
                     ),
                 )
                 inserted += 1
