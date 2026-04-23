@@ -4,7 +4,7 @@ from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change
-from app.file_modifier import modify_file
+from app.file_modifier import apply_suggestion, modify_file
 from app.telegram import send_message
 
 logger = logging.getLogger("worker")
@@ -45,9 +45,15 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     send_message("claude_suggestion", "COMPLETE", suggestion_msg)
     logger.info("story_implementation: Claude suggestion sent to Telegram — %s", suggestion["file"])
 
-    modification = modify_file(repo_path)
-    send_message("file_modify", "COMPLETE", f"{issue_key}: {modification['file']} — {modification['change']}")
-    logger.info("story_implementation: file modified — %s", modification)
+    applied = apply_suggestion(repo_path, suggestion)
+    if applied["applied"]:
+        change_detail = f"{applied['file']} — {applied['description']}"
+        logger.info("story_implementation: suggestion applied — %s", applied["file"])
+    else:
+        fallback = modify_file(repo_path)
+        change_detail = f"{fallback['file']} — {fallback['change']} (fallback: {applied['reason']})"
+        logger.info("story_implementation: suggestion fallback — %s", applied["reason"])
+    send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
     branch = commit_and_push(
         repo_path=repo_path,
