@@ -1,7 +1,10 @@
 import os
+import re
 import json
 import logging
 import anthropic
+
+from app.repo_analysis import EXTENSION_TO_LANGUAGE, IGNORED_DIRS
 
 logger = logging.getLogger("claude_client")
 
@@ -16,6 +19,19 @@ ENTRY_POINTS = {
     "Ruby":       ["app.rb", "main.rb", "config.ru"],
 }
 
+# Common words that appear in every story summary but don't identify relevant files
+_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "can", "so", "that", "this", "it", "its",
+    "as", "we", "i", "my", "our", "their", "all", "if", "when", "where",
+    "not", "no", "into", "also", "each", "any", "only",
+    # common story verbs that appear in every summary
+    "add", "use", "using", "implement", "create", "update", "change",
+    "make", "get", "set", "new", "ensure", "allow", "support",
+}
+
 SYSTEM_PROMPT = (
     "You are a code intelligence assistant. Analyze a software repository and write "
     "a concise 3-5 sentence technical summary covering: what the project does, the "
@@ -24,10 +40,11 @@ SYSTEM_PROMPT = (
 )
 
 SUGGEST_PROMPT = (
-    "You are a code improvement assistant. You will be given a Jira story and a source file. "
-    "Suggest ONE small, concrete code change that moves the implementation toward what the story describes. "
+    "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
+    "Suggest ONE small, concrete code change in ONE file that moves the implementation toward what the "
+    "story describes. Choose the most relevant file. "
     "If the story is not directly actionable (e.g. it describes a test or process), suggest the most "
-    "relevant improvement you can find in the file instead. "
+    "relevant improvement you can find in any of the files instead. "
     "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and minimal (change as few lines as possible). "
     "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
@@ -68,6 +85,103 @@ def _collect_key_files(repo_path: str, primary_language: str) -> list[tuple[str,
             files.append((relative, content))
 
     return files
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """Lowercase tokens from story text, filtered for meaningful domain words."""
+    tokens = re.findall(r"[a-z]+", text.lower())
+    return [t for t in tokens if len(t) > 2 and t not in _STOP_WORDS]
+
+
+def _select_files_for_story(
+    repo_path: str,
+    primary_language: str,
+    issue_summary: str,
+    max_files: int = 4,
+) -> list[tuple[str, str, str]]:
+    """Score all repo source files by relevance to issue_summary.
+
+    Returns list of (relative_path, content, reason) for the top max_files files,
+    with README prepended if present (it doesn't consume a scored slot).
+    """
+    keywords = _extract_keywords(issue_summary)
+    entry_point_set = set(ENTRY_POINTS.get(primary_language, []))
+    wants_tests = "test" in keywords
+
+    readme_entry: tuple[str, str, str] | None = None
+    scored: list[tuple[int, str, str, str]] = []  # (score, rel_path, content, reason)
+
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        for fname in files:
+            abs_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(abs_path, repo_path).replace("\\", "/")
+
+            # Capture README separately
+            if fname.upper().startswith("README"):
+                content = _read_truncated(abs_path)
+                if content and readme_entry is None:
+                    readme_entry = (rel_path, content, "readme")
+                continue
+
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in EXTENSION_TO_LANGUAGE:
+                continue
+
+            content = _read_truncated(abs_path)
+            if not content:
+                continue
+
+            path_lower = rel_path.lower()
+            reasons: list[str] = []
+            score = 0
+
+            # Keywords appearing in the file path (strong signal)
+            path_matches = [kw for kw in keywords if kw in path_lower]
+            if path_matches:
+                score += len(path_matches) * 3
+                reasons.append(f"path:{','.join(path_matches)}")
+
+            # Keywords appearing in file content (capped to avoid weighting huge files)
+            content_lower = content.lower()
+            content_hits = sum(min(content_lower.count(kw), 2) for kw in keywords)
+            content_hits = min(content_hits, 5)
+            if content_hits > 0:
+                score += content_hits
+                reasons.append(f"content:{content_hits}hits")
+
+            # Small bonus for known entry points so they don't disappear entirely
+            if rel_path in entry_point_set:
+                score += 2
+                reasons.append("entry-point")
+
+            # Test file bonus when story explicitly targets testing
+            is_test = "test" in path_lower or fname.startswith("test_")
+            if is_test and wants_tests:
+                score += 2
+                reasons.append("test-match")
+
+            reason_str = "; ".join(reasons) if reasons else "baseline"
+            scored.append((score, rel_path, content, reason_str))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    result: list[tuple[str, str, str]] = []
+    if readme_entry:
+        result.append(readme_entry)
+
+    for score, rel_path, content, reason in scored[:max_files]:
+        result.append((rel_path, content, reason))
+
+    if keywords:
+        logger.info(
+            "File selection for '%s': keywords=%s — selected %s",
+            issue_summary[:60],
+            keywords,
+            [(r, rsn) for r, _, rsn in result],
+        )
+
+    return result
 
 
 def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
@@ -120,34 +234,30 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "") -> dict:
     """Ask Claude Sonnet to suggest one targeted code improvement aligned with the Jira story.
 
-    Picks the first non-README entry-point file, sends it to Claude along with the
-    issue context, and returns a dict with keys: file, description, original, replacement.
+    Selects files by keyword overlap with the issue summary rather than a fixed entry-point
+    list, giving Claude context most relevant to the story intent.
+    Returns a dict with keys: file, description, original, replacement.
     """
     client = anthropic.Anthropic()
 
     primary_language = analysis.get("primary_language", "Python")
-    key_files = _collect_key_files(repo_path, primary_language)
+    selected = _select_files_for_story(repo_path, primary_language, issue_summary)
 
-    # Prefer a source file over README for a code suggestion
-    target_file, target_content = None, None
-    for rel_path, content in key_files:
-        if not rel_path.upper().startswith("README"):
-            target_file, target_content = rel_path, content
-            break
-    if target_file is None and key_files:
-        target_file, target_content = key_files[0]
-
-    if target_file is None:
+    if not selected:
         return {"file": "unknown", "description": "No files found", "original": "", "replacement": ""}
 
     story_context = ""
     if issue_key or issue_summary:
         story_context = f"Jira issue: {issue_key}\nStory: {issue_summary}\n\n"
 
+    file_sections = ""
+    for rel_path, content, _reason in selected:
+        file_sections += f"\n--- {rel_path} ---\n```\n{content}\n```\n"
+
     user_content = (
         f"{story_context}"
-        f"File: {target_file}\n\n```\n{target_content}\n```\n\n"
-        f"Suggest one small improvement to this file that is relevant to the story above."
+        f"Available source files (ordered by relevance to story):{file_sections}\n"
+        f"Suggest one small improvement to ONE of the files above that best addresses the story."
     )
 
     response = client.messages.create(
@@ -180,4 +290,5 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
         return json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("Claude returned non-JSON suggestion: %s", raw[:200])
-        return {"file": target_file, "description": raw[:200], "original": "", "replacement": ""}
+        fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
+        return {"file": fallback_file, "description": raw[:200], "original": "", "replacement": ""}
