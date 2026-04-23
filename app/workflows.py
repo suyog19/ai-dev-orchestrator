@@ -11,7 +11,8 @@ from app.telegram import send_message
 from app.database import (
     update_run_step, update_run_field, fail_run,
     record_attempt, complete_attempt,
-    add_planning_output, request_planning_approval, set_run_waiting_for_approval,
+    add_planning_output, get_planning_outputs, update_planning_output_status,
+    request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
 )
 from app.test_runner import run_tests
 
@@ -424,3 +425,76 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     )
     send_message("epic_breakdown_proposed", "PENDING", approval_msg)
     logger.info("epic_breakdown: approval request sent to Telegram (run_id=%s)", run_id)
+
+
+def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
+    """Create Jira Story issues for all PROPOSED planning_outputs of an approved run.
+
+    Called inline from the Telegram APPROVE handler. Creates Stories sequentially,
+    persisting each created key before moving to the next. If any creation fails,
+    marks the run as FAILED with details of what was already created.
+    """
+    from app.jira_client import create_story_under_epic
+
+    project_key = issue_key.split("-")[0]
+    outputs = get_planning_outputs(run_id)
+    proposed = [o for o in outputs if o["status"] == "PROPOSED"]
+
+    if not proposed:
+        logger.warning("create_jira_stories_for_run: no PROPOSED outputs for run %s", run_id)
+        complete_planning_run(run_id, 0)
+        send_message("epic_breakdown_complete", "COMPLETE", f"{issue_key}: 0 Stories to create (none proposed)")
+        return
+
+    update_run_step(run_id, "creating_jira_issues")
+    send_message(
+        "epic_breakdown_approved", "RUNNING",
+        f"{issue_key}: creating {len(proposed)} Stories in Jira (run_id={run_id})",
+    )
+
+    created_keys: list[str] = []
+    for output in proposed:
+        try:
+            jira_key = create_story_under_epic(
+                project_key=project_key,
+                epic_key=issue_key,
+                title=output["title"],
+                run_id=run_id,
+                description=output.get("description"),
+                acceptance_criteria=output.get("acceptance_criteria"),
+            )
+            update_planning_output_status(output["id"], "CREATED", jira_key)
+            created_keys.append(jira_key)
+            logger.info(
+                "create_jira_stories_for_run: created %s — %s",
+                jira_key, output["title"][:60],
+            )
+        except Exception as exc:
+            partial = ", ".join(created_keys) or "none"
+            logger.error(
+                "create_jira_stories_for_run: failed at seq %s — %s",
+                output["sequence_number"], exc,
+            )
+            fail_run(
+                run_id,
+                f"Jira creation failed at Story {output['sequence_number']}: {exc}. "
+                f"Already created: {partial}",
+            )
+            send_message(
+                "epic_breakdown_failed", "FAILED",
+                f"{issue_key}: Jira creation failed at Story {output['sequence_number']}\n"
+                f"Error: {exc}\n"
+                f"Already created: {partial}",
+            )
+            return
+
+    complete_planning_run(run_id, len(created_keys))
+    keys_str = ", ".join(created_keys)
+    send_message(
+        "epic_breakdown_complete", "COMPLETE",
+        f"{issue_key}: {len(created_keys)} Stories created\n{keys_str}",
+    )
+    logger.info(
+        "create_jira_stories_for_run: %d Stories created for %s — %s",
+        len(created_keys), issue_key, keys_str,
+    )

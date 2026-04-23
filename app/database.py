@@ -479,3 +479,18 @@ def create_planning_run(issue_key: str, workflow_type: str, related_event_id: in
                 (workflow_type, related_event_id, issue_key),
             )
             return cur.fetchone()[0]
+
+
+def complete_planning_run(run_id: int, created_count: int):
+    """Transition a planning run to COMPLETED after all Jira children are created."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET status='COMPLETED', completed_at=NOW(), updated_at=NOW(),
+                    created_jira_children_count=%s
+                WHERE id=%s
+                """,
+                (created_count, run_id),
+            )

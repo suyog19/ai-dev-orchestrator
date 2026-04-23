@@ -11,6 +11,7 @@ from app.database import (
 from app.dispatcher import dispatch
 from app.telegram import send_message, parse_approval_command
 from app.queue import enqueue
+from app.workflows import create_jira_stories_for_run
 
 logger = logging.getLogger("orchestrator")
 router = APIRouter()
@@ -109,12 +110,8 @@ async def telegram_webhook(request: Request):
 
     if action == "APPROVE":
         approve_planning_run(run_id)
-        send_message(
-            "epic_breakdown_approved", "APPROVED",
-            f"{issue_key}: proposal approved (run_id={run_id})\n"
-            f"Jira Stories will be created shortly.",
-        )
-        logger.info("Planning run %s APPROVED for %s", run_id, issue_key)
+        logger.info("Planning run %s APPROVED for %s — starting Jira creation", run_id, issue_key)
+        create_jira_stories_for_run(run_id, issue_key)
 
     elif action == "REJECT":
         reject_planning_run(run_id)
