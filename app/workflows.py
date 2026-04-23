@@ -8,11 +8,37 @@ from app.claude_client import summarize_repo, suggest_change
 from app.file_modifier import apply_suggestion, modify_file
 from app.telegram import send_message
 from app.database import update_run_step, update_run_field
+from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
 
 logger = logging.getLogger("worker")
+
+
+def _build_test_section(test_result: dict) -> str:
+    status = test_result["status"]
+    output = (test_result.get("output") or "").strip()
+    tail = "\n".join(output.splitlines()[-20:]) if output else ""
+
+    if status == "PASSED":
+        return (
+            "## Tests\n"
+            f"- [x] `{test_result['command']}` — **PASSED**\n\n"
+            f"<details><summary>Output</summary>\n\n```\n{tail}\n```\n</details>\n"
+        )
+    if status == "FAILED":
+        return (
+            "## Tests\n"
+            f"- [ ] `{test_result['command']}` — **FAILED** — review required\n\n"
+            f"<details><summary>Output</summary>\n\n```\n{tail}\n```\n</details>\n"
+        )
+    if status == "ERROR":
+        return (
+            "## Tests\n"
+            f"- [ ] Test execution error: {output[:200]}\n"
+        )
+    return "## Tests\n- Tests not run (no supported test framework detected)\n"
 
 
 def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
@@ -68,6 +94,18 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.info("story_implementation: suggestion fallback — %s", applied["reason"])
     send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
+    # Run tests against the modified workspace before committing
+    update_run_step(run_id, "testing")
+    test_result = run_tests(repo_path)
+    update_run_field(
+        run_id,
+        test_status=test_result["status"],
+        test_command=test_result["command"],
+        test_output=test_result["output"],
+    )
+    send_message("tests", test_result["status"], f"{issue_key}: {test_result['status']}")
+    logger.info("story_implementation: tests %s", test_result["status"])
+
     suggestion_description = suggestion.get("description", summary)
     commit_message = f"ai: {issue_key} — {suggestion_description}"
 
@@ -91,7 +129,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     ))
     diff_block = "".join(diff_lines) if diff_lines else f"- {suggestion.get('original', '').strip()}\n+ {suggestion.get('replacement', '').strip()}"
 
-    # Validation checklist — all passed if suggestion was applied
+    # Validation checklist
     is_py = suggestion.get("file", "").endswith(".py")
     syntax_line = "- [x] Python syntax check (ast.parse)\n" if is_py else ""
     validation_section = (
@@ -102,6 +140,8 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         "- [x] No-op guard (original ≠ replacement)\n"
         f"{syntax_line}"
     )
+
+    test_section = _build_test_section(test_result)
 
     pr_body = (
         f"> 🤖 Automated PR — [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator)\n\n"
@@ -114,6 +154,8 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         f"**File:** `{suggestion.get('file', 'N/A')}`  \n"
         f"**Description:** {suggestion_description}\n\n"
         f"```diff\n{diff_block}\n```\n\n"
+        f"---\n\n"
+        f"{test_section}\n"
         f"---\n\n"
         f"{validation_section}\n"
         f"---\n\n"
