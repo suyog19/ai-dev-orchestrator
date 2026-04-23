@@ -36,7 +36,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
 
-    suggestion = suggest_change(repo_path, analysis)
+    suggestion = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
     suggestion_msg = (
         f"{issue_key}: Suggested change in {suggestion['file']}\n"
         f"{suggestion['description']}\n\n"
