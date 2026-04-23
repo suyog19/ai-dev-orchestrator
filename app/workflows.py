@@ -55,20 +55,37 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
         logger.info("story_implementation: suggestion fallback — %s", applied["reason"])
     send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
+    suggestion_description = suggestion.get("description", summary)
+    commit_message = f"ai: {issue_key} — {suggestion_description}"
+
     branch = commit_and_push(
         repo_path=repo_path,
         issue_key=issue_key,
-        commit_message=f"ai: {issue_key} — {summary}",
+        commit_message=commit_message,
     )
     send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
     logger.info("story_implementation: pushed branch %s", branch)
+
+    pr_body = (
+        f"Automated PR created by AI Dev Orchestrator.\n\n"
+        f"**Issue:** {issue_key}\n"
+        f"**Jira summary:** {summary}\n\n"
+        f"## Repo analysis\n{claude_summary}\n\n"
+        f"## Change applied\n"
+        f"**File:** `{suggestion.get('file', 'N/A')}`\n"
+        f"**Description:** {suggestion_description}\n\n"
+        f"```diff\n"
+        f"- {suggestion.get('original', '').strip()}\n"
+        f"+ {suggestion.get('replacement', '').strip()}\n"
+        f"```"
+    )
 
     pr = create_pull_request(
         repo_name=mapping["repo_name"],
         head_branch=branch,
         base_branch=mapping["target_branch"],
-        title=f"ai: {issue_key} — {summary}",
-        body=f"Automated PR created by AI Dev Orchestrator.\n\n**Issue:** {issue_key}\n**Summary:** {summary}",
+        title=f"ai: {issue_key} — {suggestion_description}",
+        body=pr_body,
     )
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
