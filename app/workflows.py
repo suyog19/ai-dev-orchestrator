@@ -13,7 +13,8 @@ from app.database import (
     record_attempt, complete_attempt,
     add_planning_output, get_planning_outputs, update_planning_output_status,
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
-    get_created_children_for_epic, store_planning_metadata, record_planning_feedback,
+    get_created_children_for_epic, store_planning_metadata,
+    record_planning_feedback, record_execution_feedback,
 )
 from app.test_runner import run_tests
 
@@ -373,6 +374,7 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
             f"Duplicate breakdown blocked: {issue_key} already has {existing['count']} "
             f"Stories created by run {existing['run_id']}.",
         )
+        record_planning_feedback(run_id)
         send_message(
             "planning_duplicate_blocked", "BLOCKED",
             f"{issue_key}: already has {existing['count']} Stories from run {existing['run_id']}.\n"
@@ -387,6 +389,7 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")
+        record_planning_feedback(run_id)
         send_message("epic_breakdown_failed", "FAILED", f"{issue_key}: {exc}")
         return
 
