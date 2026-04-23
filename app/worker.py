@@ -16,7 +16,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs
+from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation, epic_breakdown
@@ -69,6 +69,8 @@ def _execute(job: dict):
             error_msg = f"{type(exc).__name__}: {exc}"
             logger.error("Workflow FAILED: %s (run_id=%s) — %s", workflow_type, run_id, error_msg)
             fail_run(run_id, error_msg)
+            if workflow_type == "story_implementation":
+                record_execution_feedback(run_id)
             send_message("workflow", "FAILED", f"{issue_key}: {error_msg}")
             return
         finally:
@@ -90,9 +92,13 @@ def _execute(job: dict):
                 "Workflow handler set terminal status %s (run_id=%s) — not overwriting with COMPLETED",
                 row[0], run_id,
             )
+            if row[0] == "FAILED" and workflow_type == "story_implementation":
+                record_execution_feedback(run_id)
             return
 
         _update_run_status(run_id, "COMPLETED")
+        if workflow_type == "story_implementation":
+            record_execution_feedback(run_id)
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)
         send_message("workflow", "COMPLETED", f"{issue_key}: {summary}")
 

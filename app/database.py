@@ -527,6 +527,95 @@ def complete_planning_run(run_id: int, created_count: int):
             )
 
 
+def record_execution_feedback(run_id: int) -> int:
+    """Write feedback_events rows for a finished story_implementation run.
+
+    Auto-resolves repo_slug from repo_mappings using the run's issue_key.
+    Should be called from the worker after the run reaches its final status
+    (COMPLETED or FAILED). Returns the number of events written.
+    """
+    from app.feedback import FeedbackSource, FeedbackType, FailureCategory
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT issue_key, status, test_status, retry_count,
+                       merge_status, files_changed_count, error_detail
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return 0
+            issue_key, status, test_status, retry_count, merge_status, files_changed_count, error_detail = row
+
+            # Resolve repo_slug from active mapping for this project
+            repo_slug = None
+            if issue_key:
+                project_key = issue_key.split("-")[0]
+                cur.execute(
+                    """
+                    SELECT repo_slug FROM repo_mappings
+                    WHERE jira_project_key = %s AND is_active = TRUE
+                    ORDER BY (issue_type = 'Story') DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (project_key,),
+                )
+                rs = cur.fetchone()
+                if rs:
+                    repo_slug = rs[0]
+
+            events = []
+
+            def _ev(ftype, fvalue, details=None):
+                events.append((
+                    FeedbackSource.EXECUTION_RUN, run_id,
+                    None, issue_key, repo_slug,
+                    ftype, str(fvalue) if fvalue is not None else None,
+                    json.dumps(details) if details else None,
+                ))
+
+            if status == "COMPLETED":
+                _ev(FeedbackType.EXECUTION_COMPLETED, "true")
+            else:
+                _ev(FeedbackType.EXECUTION_FAILED, "true")
+                # Basic categorisation — refined further in Iteration 3
+                err = (error_detail or "").lower()
+                if test_status in ("FAILED", "ERROR"):
+                    category = FailureCategory.TEST_FAILURE
+                elif "interrupted by worker restart" in err:
+                    category = FailureCategory.WORKER_INTERRUPTED
+                else:
+                    category = FailureCategory.UNKNOWN
+                _ev(FeedbackType.FAILURE_CATEGORY, category)
+
+            if test_status:
+                _ev(FeedbackType.TEST_STATUS, test_status)
+            if retry_count is not None:
+                _ev(FeedbackType.RETRY_COUNT, retry_count)
+            if merge_status:
+                _ev(FeedbackType.MERGE_STATUS, merge_status)
+            if files_changed_count is not None:
+                _ev(FeedbackType.FILES_CHANGED_COUNT, files_changed_count)
+
+            if not events:
+                return 0
+
+            cur.executemany(
+                """
+                INSERT INTO feedback_events
+                    (source_type, source_run_id, epic_key, story_key, repo_slug,
+                     feedback_type, feedback_value, details_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                events,
+            )
+    return len(events)
+
+
 def record_planning_feedback(run_id: int) -> int:
     """Write feedback_events rows for a finished planning run.
 
