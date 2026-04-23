@@ -16,7 +16,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run, update_run_step
+from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation
@@ -86,6 +86,13 @@ def _execute(job: dict):
 def main():
     logger.info("Worker started (MAX_WORKERS=%s)", MAX_WORKERS)
     init_db()
+
+    recovered = recover_stale_runs()
+    if recovered:
+        logger.warning("Startup recovery: marked %d stale RUNNING run(s) as FAILED", recovered)
+        send_message("startup", "RECOVERY", f"{recovered} stale run(s) recovered — were left RUNNING before restart")
+    else:
+        logger.info("Startup recovery: no stale runs found")
 
     while True:
         try:

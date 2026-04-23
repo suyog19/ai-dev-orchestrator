@@ -120,6 +120,28 @@ def fail_run(run_id: int, error_detail: str):
             )
 
 
+def recover_stale_runs() -> int:
+    """Mark any RUNNING rows as FAILED on worker startup.
+
+    Returns the count of rows recovered.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET status = 'FAILED',
+                    error_detail = 'Interrupted by worker restart before completion',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE status = 'RUNNING'
+                RETURNING id
+                """
+            )
+            recovered = cur.rowcount
+    return recovered
+
+
 def update_run_step(run_id: int, step: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
