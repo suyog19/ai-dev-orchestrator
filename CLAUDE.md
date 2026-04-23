@@ -88,3 +88,37 @@ RECOMMENDATION: <recommendation + why>
 ## Non-Goals (Phase 1)
 
 Do not implement: real Claude-driven code generation, GitHub repo modifications, PR creation/review, full Jira automation, Epic/Feature breakdown workflows, retry/failure recovery, UI/dashboard, production security hardening.
+
+## Environment Model (Phase 3+)
+
+Two separate VMs. Never share a VM between dev and prod.
+
+| Environment | VM IP | Branch | Runner label | Domain |
+|---|---|---|---|---|
+| Dev | `65.2.140.4` | `dev` | `self-hosted-dev` | `dev.orchestrator.suyogjoshi.com` |
+| Prod | `13.234.33.241` | `main` | `self-hosted-prod` | `orchestrator.suyogjoshi.com` |
+
+## Two-File `.env` Rule — CRITICAL
+
+There are two `.env` files on each VM. They serve different purposes and must both be kept in sync.
+
+**`/home/ubuntu/.env.orchestrator`** — persistent secrets file on the VM. This is the source of truth. It survives deploys and is never overwritten by GitHub Actions.
+
+**`<project_dir>/.env`** — the file Docker containers actually read via `env_file:` in `docker-compose.yml`. This is overwritten on every deploy by the step: `cp /home/ubuntu/.env.orchestrator .env`.
+
+### Rules
+
+1. To update a secret permanently: edit `/home/ubuntu/.env.orchestrator`, then redeploy (push to branch or run manually).
+2. If you update `.env.orchestrator` manually mid-iteration and need containers to pick it up immediately — do NOT just run `docker compose up -d`. You must run:
+
+```bash
+cp /home/ubuntu/.env.orchestrator .env
+docker compose up -d --force-recreate
+```
+
+3. `docker compose up -d` without `--force-recreate` does NOT reload environment variables into already-running containers.
+4. Always verify the key landed in the container after a change:
+
+```bash
+docker exec <container-name> env | grep <VAR_NAME>
+```
