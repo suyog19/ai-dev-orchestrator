@@ -12,6 +12,7 @@ from app.database import (
     init_db, get_conn,
     list_planning_runs, get_planning_run_detail,
     approve_planning_run, reject_planning_run, record_planning_feedback,
+    generate_epic_outcome_rollup,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -359,3 +360,52 @@ def get_workflow_run(run_id: int):
         for r in attempt_rows
     ]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Epic outcome rollup — generate and inspect
+# ---------------------------------------------------------------------------
+
+@app.post("/debug/epic-outcomes/{epic_key}", status_code=200)
+def generate_epic_outcome(epic_key: str):
+    """Generate (or refresh) the Epic-level execution outcome rollup.
+
+    Aggregates all Stories ever created from this Epic and their execution
+    results. Upserts a memory_snapshot with scope_type='epic'.
+    """
+    result = generate_epic_outcome_rollup(epic_key)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No Stories found for Epic {epic_key} (no planning_outputs with created_issue_key)",
+        )
+    return result
+
+
+@app.get("/debug/epic-outcomes/{epic_key}", status_code=200)
+def get_epic_outcome(epic_key: str):
+    """Return the stored Epic-level outcome rollup snapshot."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, summary, evidence_json, created_at, updated_at
+                FROM memory_snapshots
+                WHERE scope_type = 'epic' AND scope_key = %s AND memory_kind = 'execution_guidance'
+                """,
+                (epic_key,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No outcome rollup found for Epic {epic_key}. POST to generate one.",
+        )
+    return {
+        "epic_key":      epic_key,
+        "snapshot_id":   row[0],
+        "summary":       row[1],
+        "evidence":      json.loads(row[2]) if row[2] else None,
+        "created_at":    row[3].isoformat(),
+        "updated_at":    row[4].isoformat(),
+    }

@@ -531,6 +531,126 @@ def complete_planning_run(run_id: int, created_count: int):
             )
 
 
+def generate_epic_outcome_rollup(epic_key: str) -> dict | None:
+    """Compute and upsert an Epic-level execution outcome rollup into memory_snapshots.
+
+    Aggregates all Stories ever created for this Epic (via planning_outputs with
+    created_issue_key set) and their most-recent execution run outcomes.
+    Returns None if no stories were ever created for this Epic.
+    Called on_write after execution feedback when the story has an Epic parent.
+    """
+    from app.feedback import MemoryScope, MemoryKind
+    from app.telegram import send_message
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Stories actually created in Jira for this Epic (across all planning runs)
+            # Use DISTINCT ON to deduplicate if the same story_key appears in multiple runs.
+            cur.execute(
+                """
+                SELECT DISTINCT ON (po.created_issue_key)
+                    po.created_issue_key                             AS story_key,
+                    wr.status                                        AS run_status,
+                    wr.retry_count,
+                    wr.test_status,
+                    wr.merge_status,
+                    wr.id                                            AS run_id
+                FROM planning_outputs po
+                LEFT JOIN LATERAL (
+                    SELECT status, retry_count, test_status, merge_status, id
+                    FROM workflow_runs
+                    WHERE issue_key = po.created_issue_key
+                      AND workflow_type = 'story_implementation'
+                    ORDER BY id DESC
+                    LIMIT 1
+                ) wr ON TRUE
+                WHERE po.parent_issue_key = %s
+                  AND po.created_issue_key IS NOT NULL
+                ORDER BY po.created_issue_key
+                """,
+                (epic_key,),
+            )
+            story_rows = cur.fetchall()
+
+    if not story_rows:
+        return None
+
+    stories_created  = len(story_rows)
+    stories_executed = sum(1 for _, rs, *_ in story_rows if rs is not None)
+    stories_completed = sum(1 for _, rs, *_ in story_rows if rs == "COMPLETED")
+    stories_failed   = sum(1 for _, rs, *_ in story_rows if rs == "FAILED")
+    retry_heavy      = sum(1 for _, rs, rc, *_ in story_rows if (rc or 0) >= 1 and rs == "COMPLETED")
+    merged           = sum(1 for _, _rs, _rc, _ts, ms, *_ in story_rows if ms == "MERGED")
+
+    bullets = [f"Epic {epic_key}: {stories_created} Stories created from planning"]
+    if stories_executed > 0:
+        bullets.append(
+            f"{stories_executed} executed: {stories_completed} completed, {stories_failed} failed"
+        )
+    if merged > 0:
+        bullets.append(f"{merged} merged to main branch")
+    if retry_heavy > 0:
+        bullets.append(f"{retry_heavy} required a fix attempt before passing")
+    if stories_executed < stories_created:
+        pending = stories_created - stories_executed
+        bullets.append(f"{pending} not yet executed")
+
+    summary = "\n".join(f"- {b}" for b in bullets)
+
+    story_details = [
+        {
+            "story_key":   sk,
+            "run_status":  rs,
+            "retry_count": rc,
+            "test_status": ts,
+            "merge_status": ms,
+            "run_id":      rid,
+        }
+        for sk, rs, rc, ts, ms, rid in story_rows
+    ]
+    evidence = {
+        "epic_key":          epic_key,
+        "stories_created":   stories_created,
+        "stories_executed":  stories_executed,
+        "stories_completed": stories_completed,
+        "stories_failed":    stories_failed,
+        "retry_heavy":       retry_heavy,
+        "merged":            merged,
+        "stories":           story_details,
+    }
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO memory_snapshots
+                    (scope_type, scope_key, memory_kind, summary, evidence_json)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (scope_type, scope_key, memory_kind) DO UPDATE
+                    SET summary       = EXCLUDED.summary,
+                        evidence_json = EXCLUDED.evidence_json,
+                        updated_at    = NOW()
+                RETURNING id, (xmax = 0) AS is_insert
+                """,
+                (
+                    MemoryScope.EPIC, epic_key, MemoryKind.EXECUTION_GUIDANCE,
+                    summary, json.dumps(evidence),
+                ),
+            )
+            snap_id, is_insert = cur.fetchone()
+
+    logger.info(
+        "generate_epic_outcome_rollup: upserted snapshot for %s (id=%s, new=%s)",
+        epic_key, snap_id, is_insert,
+    )
+    if is_insert:
+        send_message(
+            "epic_outcome_ready", "READY",
+            f"{epic_key}: Epic outcome rollup created (snapshot_id={snap_id})\n{summary}",
+        )
+    return {"id": snap_id, "is_new": bool(is_insert), "summary": summary}
+
+
 def generate_repo_memory_snapshot(repo_slug: str) -> dict:
     """Compute and upsert repo-level planning + execution memory snapshots.
 
@@ -715,7 +835,8 @@ def record_execution_feedback(run_id: int) -> int:
     """
     from app.feedback import FeedbackSource, FeedbackType, categorize_execution_failure
 
-    repo_slug_out = None  # captured for on_write snapshot refresh
+    repo_slug_out = None   # captured for on_write repo snapshot refresh
+    issue_key_out = None   # captured for on_write epic rollup
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -732,6 +853,7 @@ def record_execution_feedback(run_id: int) -> int:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
                 files_changed_count, error_detail, current_step = row
+            issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
             repo_slug = None
@@ -793,11 +915,32 @@ def record_execution_feedback(run_id: int) -> int:
                 events,
             )
     n = len(events)
-    if n > 0 and repo_slug_out:
-        try:
-            generate_repo_memory_snapshot(repo_slug_out)
-        except Exception as exc:
-            logger.warning("record_execution_feedback: snapshot refresh failed — %s", exc)
+    if n > 0:
+        if repo_slug_out:
+            try:
+                generate_repo_memory_snapshot(repo_slug_out)
+            except Exception as exc:
+                logger.warning("record_execution_feedback: repo snapshot refresh failed — %s", exc)
+        if issue_key_out:
+            try:
+                # Look up parent Epic via planning_outputs and refresh Epic rollup
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT DISTINCT parent_issue_key
+                            FROM planning_outputs
+                            WHERE created_issue_key = %s
+                              AND parent_issue_key IS NOT NULL
+                            LIMIT 1
+                            """,
+                            (issue_key_out,),
+                        )
+                        epic_row = cur.fetchone()
+                if epic_row:
+                    generate_epic_outcome_rollup(epic_row[0])
+            except Exception as exc:
+                logger.warning("record_execution_feedback: epic rollup refresh failed — %s", exc)
     return n
 
 
