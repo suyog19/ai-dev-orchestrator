@@ -74,6 +74,7 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS current_step   VARCHAR(100)  NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS working_branch VARCHAR(200)  NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS pr_url         VARCHAR(500)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS issue_key      VARCHAR(100)  NULL",
             ]:
                 cur.execute(col_sql)
 
