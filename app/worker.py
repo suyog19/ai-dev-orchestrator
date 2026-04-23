@@ -78,6 +78,16 @@ def _execute(job: dict):
                 except Exception as cleanup_exc:
                     logger.warning("Workspace cleanup failed for %s: %s", work_dir, cleanup_exc)
 
+        # Guard: fail_run() may have been called inside the handler (e.g. hard test failure).
+        # If so, the status is already FAILED — don't overwrite it with COMPLETED.
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM workflow_runs WHERE id=%s", (run_id,))
+                row = cur.fetchone()
+        if row and row[0] == "FAILED":
+            logger.info("Workflow hard-failed inside handler (run_id=%s) — keeping FAILED status", run_id)
+            return
+
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)
         send_message("workflow", "COMPLETED", f"{issue_key}: {summary}")

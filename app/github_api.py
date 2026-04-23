@@ -105,3 +105,25 @@ def add_label_to_pr(repo_name: str, pr_number: int, label_name: str) -> None:
     )
     response.raise_for_status()
     logger.info("Label '%s' applied to PR #%s", label_name, pr_number)
+
+
+def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:
+    """Squash-merge a PR. Returns {"sha": str, "merged": bool, "message": str}.
+
+    Raises RuntimeError on non-mergeable (405) or conflict (409).
+    """
+    slug = _normalize_slug(repo_name)
+    response = requests.put(
+        f"{GITHUB_API}/repos/{slug}/pulls/{pr_number}/merge",
+        json={"commit_title": commit_title, "merge_method": "squash"},
+        headers=_headers(),
+        timeout=15,
+    )
+    if response.status_code == 405:
+        raise RuntimeError(f"PR #{pr_number} is not mergeable: {response.json().get('message', '')}")
+    if response.status_code == 409:
+        raise RuntimeError(f"PR #{pr_number} has a merge conflict: {response.json().get('message', '')}")
+    response.raise_for_status()
+    data = response.json()
+    logger.info("PR #%s merged (squash) — sha %s", pr_number, data.get("sha", "")[:8])
+    return data

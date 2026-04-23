@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import json
@@ -41,41 +42,61 @@ SYSTEM_PROMPT = (
 
 FIX_PROMPT = (
     "You are a code repair assistant. A previous implementation attempt failed tests. "
-    "You will be given: the original story, the current state of the changed file, and the failing test output. "
-    "Call the apply_code_change tool with a targeted fix to make the failing tests pass. "
+    "You will be given: the original story, the current state of all changed files, and the failing test output. "
+    "Call the apply_code_changes tool with targeted fixes (one or more files) to make the failing tests pass. "
     "Rules:\n"
     "- Change as few lines as possible\n"
     "- Do not break currently passing tests\n"
-    "- Stay within the same file\n"
+    "- Only modify files that were part of the original implementation\n"
     "- Do not import or reference types that do not already exist in the codebase\n"
     "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types"
 )
 
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
-    "Call the apply_code_change tool with ONE concrete code change in ONE file that moves the implementation "
-    "toward what the story describes. Choose the most relevant file. "
+    "Call the apply_code_changes tool with one to three concrete code changes that together fully implement "
+    "what the story describes. Each entry in the changes array must target a DIFFERENT file — never repeat "
+    "the same file path twice. If a file needs multiple edits (e.g. a new import plus a new function), "
+    "combine them into one contiguous original/replacement block for that file. "
+    "Only include a file if it genuinely needs to change to satisfy the story. "
     "If the story is not directly actionable, suggest the most relevant improvement in any of the files. "
-    "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
-    "fixing a clear bug), and complete (include ALL changes needed in one contiguous block — e.g. if a "
-    "new function needs a new import, include both in the replacement). "
+    "Each change must be: specific (reference exact existing text), safe (no breaking changes unless "
+    "fixing a clear bug), and complete (all lines needed in that file in one contiguous block). "
     "You may add imports for names that genuinely exist in the codebase. "
-    "Do not invent new class names or types that are not defined anywhere in the provided files."
+    "Do not invent new class names or types that are not defined anywhere in the provided files. "
+    "Do NOT modify test files (any file under tests/ or named test_*.py). "
+    "Tests define expected behaviour — if your implementation breaks a test, the fix loop will handle it."
 )
 
 # Tool schema used by both suggest_change and fix_change to guarantee structured output
-_CHANGE_TOOL = {
-    "name": "apply_code_change",
-    "description": "Apply a targeted code change to a source file",
+_CHANGES_TOOL = {
+    "name": "apply_code_changes",
+    "description": "Apply one or more targeted code changes across one or more source files.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "file":        {"type": "string", "description": "Relative path to the file to change"},
-            "description": {"type": "string", "description": "One sentence describing what the change does"},
-            "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
-            "replacement": {"type": "string", "description": "The new text that replaces the original"},
+            "changes": {
+                "type": "array",
+                "description": "List of file changes to apply (max 3 files, one change per file)",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file":        {"type": "string", "description": "Relative path to the file to change"},
+                        "description": {"type": "string", "description": "One sentence describing what this change does"},
+                        "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
+                        "replacement": {"type": "string", "description": "The new text that replaces the original"},
+                    },
+                    "required": ["file", "description", "original", "replacement"],
+                },
+            },
+            "summary": {
+                "type": "string",
+                "description": "One sentence summarizing all changes together",
+            },
         },
-        "required": ["file", "description", "original", "replacement"],
+        "required": ["changes", "summary"],
     },
 }
 
@@ -114,6 +135,48 @@ def _collect_key_files(repo_path: str, primary_language: str) -> list[tuple[str,
     return files
 
 
+def _extract_python_imports(abs_path: str, repo_path: str) -> list[str]:
+    """Return relative paths (from repo root) of local modules directly imported by abs_path.
+
+    Handles absolute imports (from app.models import ...) and relative imports
+    (from .models import ...). Skips anything that doesn't resolve to a file in the repo.
+    """
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            source = f.read()
+        tree = ast.parse(source)
+    except Exception:
+        return []
+
+    repo_abs = os.path.realpath(repo_path)
+    rel_of_file = os.path.relpath(abs_path, repo_abs).replace("\\", "/")
+    package_parts = rel_of_file.split("/")[:-1]  # e.g. ["app"] for "app/main.py"
+
+    found: list[str] = []
+
+    def _try(parts: list[str]) -> None:
+        for candidate in ["/".join(parts) + ".py", "/".join(parts) + "/__init__.py"]:
+            if os.path.isfile(os.path.join(repo_abs, candidate)):
+                found.append(candidate)
+                break
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                _try(alias.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                # Absolute: from app.models import Item
+                _try(node.module.split("."))
+            elif node.level > 0:
+                # Relative: from .models import Item (level=1), from ..x import y (level=2)
+                base = package_parts[:max(0, len(package_parts) - (node.level - 1))]
+                suffix = node.module.split(".") if node.module else []
+                _try(base + suffix)
+
+    return list(dict.fromkeys(found))  # deduplicate, preserve order
+
+
 def _extract_keywords(text: str) -> list[str]:
     """Lowercase tokens from story text, filtered for meaningful domain words."""
     tokens = re.findall(r"[a-z]+", text.lower())
@@ -124,19 +187,25 @@ def _select_files_for_story(
     repo_path: str,
     primary_language: str,
     issue_summary: str,
-    max_files: int = 4,
+    max_scored: int = 2,
+    max_import_deps: int = 2,
 ) -> list[tuple[str, str, str]]:
     """Score all repo source files by relevance to issue_summary.
 
-    Returns list of (relative_path, content, reason) for the top max_files files,
-    with README prepended if present (it doesn't consume a scored slot).
+    Selection strategy (up to 6 files total):
+    1. README — always prepended if present
+    2. Top max_scored keyword-scored non-test files (anchors)
+    3. Up to max_import_deps direct import dependencies of those anchors (Python only)
+    4. Best-scored test file — always appended if one exists
+
+    Returns list of (relative_path, content, reason).
     """
     keywords = _extract_keywords(issue_summary)
     entry_point_set = set(ENTRY_POINTS.get(primary_language, []))
-    wants_tests = "test" in keywords
 
     readme_entry: tuple[str, str, str] | None = None
-    scored: list[tuple[int, str, str, str]] = []  # (score, rel_path, content, reason)
+    scored: list[tuple[int, str, str, str]] = []       # non-test source files
+    test_scored: list[tuple[int, str, str, str]] = []  # test files
 
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
@@ -144,7 +213,6 @@ def _select_files_for_story(
             abs_path = os.path.join(root, fname)
             rel_path = os.path.relpath(abs_path, repo_path).replace("\\", "/")
 
-            # Capture README separately
             if fname.upper().startswith("README"):
                 content = _read_truncated(abs_path)
                 if content and readme_entry is None:
@@ -160,16 +228,15 @@ def _select_files_for_story(
                 continue
 
             path_lower = rel_path.lower()
+            is_test = "test" in path_lower or fname.startswith("test_")
             reasons: list[str] = []
             score = 0
 
-            # Keywords appearing in the file path (strong signal)
             path_matches = [kw for kw in keywords if kw in path_lower]
             if path_matches:
                 score += len(path_matches) * 3
                 reasons.append(f"path:{','.join(path_matches)}")
 
-            # Keywords appearing in file content (capped to avoid weighting huge files)
             content_lower = content.lower()
             content_hits = sum(min(content_lower.count(kw), 2) for kw in keywords)
             content_hits = min(content_hits, 5)
@@ -177,28 +244,57 @@ def _select_files_for_story(
                 score += content_hits
                 reasons.append(f"content:{content_hits}hits")
 
-            # Small bonus for known entry points so they don't disappear entirely
             if rel_path in entry_point_set:
                 score += 2
                 reasons.append("entry-point")
 
-            # Test file bonus when story explicitly targets testing
-            is_test = "test" in path_lower or fname.startswith("test_")
-            if is_test and wants_tests:
-                score += 2
-                reasons.append("test-match")
-
             reason_str = "; ".join(reasons) if reasons else "baseline"
-            scored.append((score, rel_path, content, reason_str))
+
+            if is_test:
+                test_scored.append((score, rel_path, content, reason_str))
+            else:
+                scored.append((score, rel_path, content, reason_str))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    test_scored.sort(key=lambda x: x[0], reverse=True)
 
+    selected_paths: set[str] = set()
     result: list[tuple[str, str, str]] = []
+
+    # 1. README
     if readme_entry:
         result.append(readme_entry)
+        selected_paths.add(readme_entry[0])
 
-    for score, rel_path, content, reason in scored[:max_files]:
+    # 2. Top max_scored non-test files (anchors for import traversal)
+    anchor_paths: list[str] = []
+    for _score, rel_path, content, reason in scored[:max_scored]:
         result.append((rel_path, content, reason))
+        selected_paths.add(rel_path)
+        anchor_paths.append(rel_path)
+
+    # 3. Import dependencies of anchors (Python only)
+    if primary_language == "Python":
+        dep_count = 0
+        for anchor_rel in anchor_paths:
+            if dep_count >= max_import_deps:
+                break
+            for imp_rel in _extract_python_imports(os.path.join(repo_path, anchor_rel), repo_path):
+                if dep_count >= max_import_deps:
+                    break
+                if imp_rel in selected_paths:
+                    continue
+                content = _read_truncated(os.path.join(repo_path, imp_rel))
+                if not content:
+                    continue
+                result.append((imp_rel, content, f"import-dep:{anchor_rel}"))
+                selected_paths.add(imp_rel)
+                dep_count += 1
+
+    # 4. Best test file — always include regardless of story keywords
+    if test_scored and test_scored[0][1] not in selected_paths:
+        _s, rel_path, content, reason = test_scored[0]
+        result.append((rel_path, content, reason + "; test-file"))
 
     if keywords:
         logger.info(
@@ -262,11 +358,11 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 
 
 def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "") -> dict:
-    """Ask Claude Sonnet to suggest one targeted code improvement aligned with the Jira story.
+    """Ask Claude Sonnet to suggest up to 3 code changes aligned with the Jira story.
 
     Selects files by keyword overlap with the issue summary rather than a fixed entry-point
     list, giving Claude context most relevant to the story intent.
-    Returns a dict with keys: file, description, original, replacement.
+    Returns a dict with keys: changes (list of {file, description, original, replacement}), summary.
     """
     client = _CLIENT
 
@@ -274,7 +370,10 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     selected = _select_files_for_story(repo_path, primary_language, issue_summary)
 
     if not selected:
-        return {"file": "unknown", "description": "No files found", "original": "", "replacement": ""}
+        return {
+            "changes": [{"file": "unknown", "description": "No files found", "original": "", "replacement": ""}],
+            "summary": "",
+        }
 
     story_context = ""
     if issue_key or issue_summary:
@@ -287,19 +386,19 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     user_content = (
         f"{story_context}"
         f"Available source files (ordered by relevance to story):{file_sections}\n"
-        f"Suggest one improvement to ONE of the files above that best addresses the story."
+        f"Implement the story by changing one to three of the files above."
     )
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=2048,
         system=[{
             "type": "text",
             "text": SUGGEST_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        tools=[_CHANGE_TOOL],
-        tool_choice={"type": "tool", "name": "apply_code_change"},
+        tools=[_CHANGES_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_changes"},
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -315,7 +414,10 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
 
     logger.warning("Claude suggestion: no tool_use block in response")
     fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
-    return {"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}
+    return {
+        "changes": [{"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}],
+        "summary": "",
+    }
 
 
 def fix_change(
@@ -323,43 +425,51 @@ def fix_change(
     analysis: dict,
     issue_key: str,
     issue_summary: str,
-    previous_suggestion: dict,
+    previous_changes: list[dict],
     test_output: str,
 ) -> dict:
     """Ask Claude to fix a failing implementation.
 
-    Sends the original story, the current file content, and the trimmed test failure
-    output. Returns the same shape as suggest_change: {file, original, replacement, description}.
+    Sends the original story, current content of all changed files, and trimmed test failure
+    output. Returns the same shape as suggest_change: {changes: [...], summary: "..."}.
     """
     client = _CLIENT
-
-    changed_file = previous_suggestion.get("file", "")
-    file_abs = os.path.join(repo_path, changed_file)
-    current_content = _read_truncated(file_abs) or "(file not found)"
 
     # Trim test output to the most useful tail (last 60 lines)
     failure_lines = (test_output or "").strip().splitlines()
     trimmed_output = "\n".join(failure_lines[-60:]) if failure_lines else "(no output)"
 
+    file_sections = ""
+    changed_files = []
+    for change in previous_changes:
+        changed_file = change.get("file", "")
+        if not changed_file:
+            continue
+        changed_files.append(changed_file)
+        file_abs = os.path.join(repo_path, changed_file)
+        current_content = _read_truncated(file_abs) or "(file not found)"
+        file_sections += f"\n--- {changed_file} ---\n```\n{current_content}\n```\n"
+
+    files_str = ", ".join(f"`{f}`" for f in changed_files)
     user_content = (
         f"Story: {issue_key} — {issue_summary}\n\n"
-        f"The previous implementation changed `{changed_file}` but tests are failing.\n\n"
-        f"Current file content:\n--- {changed_file} ---\n```\n{current_content}\n```\n\n"
+        f"The previous implementation changed {files_str} but tests are failing.\n\n"
+        f"Current file contents:{file_sections}\n"
         f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
-        f"Call apply_code_change with a minimal fix to `{changed_file}` that makes the failing tests pass "
+        f"Call apply_code_changes with minimal fixes to make the failing tests pass "
         f"without breaking any currently passing tests."
     )
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1024,
+        max_tokens=2048,
         system=[{
             "type": "text",
             "text": FIX_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        tools=[_CHANGE_TOOL],
-        tool_choice={"type": "tool", "name": "apply_code_change"},
+        tools=[_CHANGES_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_changes"},
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -374,4 +484,8 @@ def fix_change(
         return tool_block.input
 
     logger.warning("Claude fix: no tool_use block in response")
-    return {"file": changed_file, "description": "No tool call returned", "original": "", "replacement": ""}
+    fallback_file = changed_files[0] if changed_files else ""
+    return {
+        "changes": [{"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}],
+        "summary": "",
+    }

@@ -82,8 +82,8 @@ def commit_and_push(repo_path: str, issue_key: str, run_id: int, commit_message:
     # Check there is actually something to commit
     status = _git("status", "--porcelain")
     if not status:
-        logger.info("Nothing to commit in %s", repo_path)
-        return working_branch
+        logger.info("Nothing to commit in %s — changes reverted to base state", repo_path)
+        return None
 
     _git("commit", "-m", commit_message)
     logger.info("Committed: %s", commit_message)
