@@ -24,8 +24,11 @@ SYSTEM_PROMPT = (
 )
 
 SUGGEST_PROMPT = (
-    "You are a code improvement assistant. Given a source file, suggest ONE small, concrete "
-    "improvement. It must be: specific (reference exact lines), safe (no behavior change unless "
+    "You are a code improvement assistant. You will be given a Jira story and a source file. "
+    "Suggest ONE small, concrete code change that moves the implementation toward what the story describes. "
+    "If the story is not directly actionable (e.g. it describes a test or process), suggest the most "
+    "relevant improvement you can find in the file instead. "
+    "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and minimal (change as few lines as possible). "
     "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
     '{"file": "<relative path>", "description": "<one sentence>", '
@@ -68,7 +71,7 @@ def _collect_key_files(repo_path: str, primary_language: str) -> list[tuple[str,
 
 
 def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
-    """Call Claude Haiku to produce a 3-5 sentence technical summary of the repo.
+    """Call Claude Sonnet to produce a 3-5 sentence technical summary of the repo.
 
     Uses prompt caching on the stable system prompt to reduce cost on repeated calls.
     Returns the summary string.
@@ -94,7 +97,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     )
 
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=512,
         system=[{
             "type": "text",
@@ -106,7 +109,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 
     summary = next((b.text for b in response.content if b.type == "text"), "")
     logger.info(
-        "Claude summary done — cache_read=%s input=%s output=%s",
+        "Claude summary done (sonnet) — cache_read=%s input=%s output=%s",
         response.usage.cache_read_input_tokens,
         response.usage.input_tokens,
         response.usage.output_tokens,
@@ -114,11 +117,11 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     return summary
 
 
-def suggest_change(repo_path: str, analysis: dict) -> dict:
-    """Ask Claude Haiku to suggest one targeted code improvement.
+def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "") -> dict:
+    """Ask Claude Sonnet to suggest one targeted code improvement aligned with the Jira story.
 
-    Picks the first non-README entry-point file, sends it to Claude, and returns
-    a dict with keys: file, description, original, replacement.
+    Picks the first non-README entry-point file, sends it to Claude along with the
+    issue context, and returns a dict with keys: file, description, original, replacement.
     """
     client = anthropic.Anthropic()
 
@@ -137,11 +140,19 @@ def suggest_change(repo_path: str, analysis: dict) -> dict:
     if target_file is None:
         return {"file": "unknown", "description": "No files found", "original": "", "replacement": ""}
 
-    user_content = f"File: {target_file}\n\n```\n{target_content}\n```\n\nSuggest one small improvement."
+    story_context = ""
+    if issue_key or issue_summary:
+        story_context = f"Jira issue: {issue_key}\nStory: {issue_summary}\n\n"
+
+    user_content = (
+        f"{story_context}"
+        f"File: {target_file}\n\n```\n{target_content}\n```\n\n"
+        f"Suggest one small improvement to this file that is relevant to the story above."
+    )
 
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
         system=[{
             "type": "text",
             "text": SUGGEST_PROMPT,
@@ -152,7 +163,7 @@ def suggest_change(repo_path: str, analysis: dict) -> dict:
 
     raw = next((b.text for b in response.content if b.type == "text"), "{}")
     logger.info(
-        "Claude suggestion done — input=%s output=%s",
+        "Claude suggestion done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )

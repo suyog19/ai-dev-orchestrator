@@ -29,7 +29,7 @@ def clone_repo(run_id: int, issue_key: str, repo_name: str, target_branch: str) 
 
     repo_path = os.path.join(work_dir, "repo")
     clone_url = f"https://{github_token}@github.com/{repo_slug}.git"
-    working_branch = f"ai/issue-{issue_key}"
+    working_branch = f"ai/{issue_key}/{run_id}"
 
     logger.info("Cloning %s (branch: %s) into %s", repo_slug, target_branch, repo_path)
     result = subprocess.run(
@@ -54,13 +54,13 @@ def clone_repo(run_id: int, issue_key: str, repo_name: str, target_branch: str) 
     return repo_path
 
 
-def commit_and_push(repo_path: str, issue_key: str, commit_message: str) -> str:
+def commit_and_push(repo_path: str, issue_key: str, run_id: int, commit_message: str) -> str:
     """Stage all changes, commit, and push the working branch to origin.
 
     Returns the working branch name.
     Raises RuntimeError if any git command fails.
     """
-    working_branch = f"ai/issue-{issue_key}"
+    working_branch = f"ai/{issue_key}/{run_id}"
 
     def _git(*args):
         result = subprocess.run(

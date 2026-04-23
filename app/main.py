@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from app.database import init_db
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
-from app.repo_mapping import get_mapping, get_all_mappings, add_mapping
+from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 
 load_dotenv()
 
@@ -61,9 +61,20 @@ def debug_telegram():
 # ---------------------------------------------------------------------------
 
 class RepoMappingIn(BaseModel):
-    issue_key: str
-    repo_name: str
-    target_branch: str = "main"
+    jira_project_key: str
+    repo_slug: str
+    base_branch: str = "main"
+    issue_type: str | None = None
+    notes: str | None = None
+
+
+class RepoMappingUpdate(BaseModel):
+    jira_project_key: str | None = None
+    repo_slug: str | None = None
+    base_branch: str | None = None
+    issue_type: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
 
 
 @app.get("/debug/repo-mappings")
@@ -71,14 +82,34 @@ def list_repo_mappings():
     return get_all_mappings()
 
 
-@app.get("/debug/repo-mappings/{issue_key}")
-def inspect_repo_mapping(issue_key: str):
-    mapping = get_mapping(issue_key)
+@app.get("/debug/repo-mappings/{mapping_id}")
+def inspect_repo_mapping(mapping_id: int):
+    mapping = get_mapping_by_id(mapping_id)
     if not mapping:
-        raise HTTPException(status_code=404, detail=f"No mapping found for '{issue_key}'")
+        raise HTTPException(status_code=404, detail=f"No mapping found for id={mapping_id}")
     return mapping
 
 
-@app.post("/debug/repo-mappings")
+@app.post("/debug/repo-mappings", status_code=201)
 def create_repo_mapping(body: RepoMappingIn):
-    return add_mapping(body.issue_key, body.repo_name, body.target_branch)
+    return add_mapping(
+        jira_project_key=body.jira_project_key,
+        repo_slug=body.repo_slug,
+        base_branch=body.base_branch,
+        issue_type=body.issue_type,
+        notes=body.notes,
+    )
+
+
+@app.put("/debug/repo-mappings/{mapping_id}")
+def modify_repo_mapping(mapping_id: int, body: RepoMappingUpdate):
+    mapping = update_mapping(mapping_id, **body.model_dump(exclude_none=True))
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"No mapping found for id={mapping_id}")
+    return mapping
+
+
+@app.delete("/debug/repo-mappings/{mapping_id}", status_code=204)
+def deactivate_repo_mapping(mapping_id: int):
+    if not disable_mapping(mapping_id):
+        raise HTTPException(status_code=404, detail=f"No mapping found for id={mapping_id}")

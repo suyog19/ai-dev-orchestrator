@@ -16,11 +16,12 @@ def get_redis():
     return _redis
 
 
-def enqueue(run_id: int, workflow_type: str, issue_key: str, summary: str):
+def enqueue(run_id: int, workflow_type: str, issue_key: str, issue_type: str, summary: str):
     job = json.dumps({
         "run_id": run_id,
         "workflow_type": workflow_type,
         "issue_key": issue_key,
+        "issue_type": issue_type,
         "summary": summary,
     })
     get_redis().lpush(QUEUE_NAME, job)

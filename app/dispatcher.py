@@ -30,6 +30,6 @@ def dispatch(issue_type: str, new_status: str, event_id: int, issue_key: str = "
             )
             run_id = cur.fetchone()[0]
 
-    enqueue(run_id, workflow_type, issue_key, summary)
+    enqueue(run_id, workflow_type, issue_key, issue_type, summary)
     logger.info("Workflow queued: %s (run_id=%s, event_id=%s)", workflow_type, run_id, event_id)
     return workflow_type
