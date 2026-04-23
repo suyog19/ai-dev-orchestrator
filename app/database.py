@@ -84,6 +84,12 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS files_changed_count INTEGER       NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS merge_status        VARCHAR(30)   NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS merged_at           TIMESTAMP     NULL",
+                # Phase 6 columns
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS parent_issue_key             VARCHAR(100) NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS approval_status              VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS approval_requested_at        TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS approval_received_at         TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS created_jira_children_count  INTEGER      NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -112,6 +118,28 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE repo_mappings ADD COLUMN IF NOT EXISTS "
                 "auto_merge_enabled BOOLEAN NOT NULL DEFAULT FALSE"
             )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS planning_outputs (
+                    id                  SERIAL PRIMARY KEY,
+                    run_id              INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    parent_issue_key    VARCHAR(100)  NOT NULL,
+                    parent_issue_type   VARCHAR(50)   NOT NULL,
+                    proposed_issue_type VARCHAR(50)   NOT NULL,
+                    sequence_number     INTEGER       NOT NULL,
+                    title               TEXT          NOT NULL,
+                    description         TEXT          NULL,
+                    acceptance_criteria TEXT          NULL,
+                    rationale           TEXT          NULL,
+                    dependency_notes    TEXT          NULL,
+                    risk_notes          TEXT          NULL,
+                    confidence          VARCHAR(20)   NULL,
+                    status              VARCHAR(30)   NOT NULL DEFAULT 'PROPOSED',
+                    created_issue_key   VARCHAR(100)  NULL,
+                    created_at          TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at          TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS workflow_attempts (
@@ -219,6 +247,10 @@ def update_run_field(run_id: int, **fields):
         "working_branch", "pr_url",
         "test_status", "test_command", "test_output",
         "retry_count", "files_changed_count", "merge_status", "merged_at",
+        # Phase 6
+        "parent_issue_key", "approval_status",
+        "approval_requested_at", "approval_received_at",
+        "created_jira_children_count",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -230,3 +262,100 @@ def update_run_field(run_id: int, **fields):
                 f"UPDATE workflow_runs SET {set_clause}, updated_at=NOW() WHERE id=%s",
                 (*updates.values(), run_id),
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — planning helpers
+# ---------------------------------------------------------------------------
+
+def add_planning_output(
+    run_id: int,
+    parent_issue_key: str,
+    parent_issue_type: str,
+    proposed_issue_type: str,
+    sequence_number: int,
+    title: str,
+    description: str | None = None,
+    acceptance_criteria: str | None = None,
+    rationale: str | None = None,
+    dependency_notes: str | None = None,
+    risk_notes: str | None = None,
+    confidence: str | None = None,
+) -> int:
+    """Insert one proposed child item into planning_outputs. Returns the new row id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO planning_outputs
+                    (run_id, parent_issue_key, parent_issue_type, proposed_issue_type,
+                     sequence_number, title, description, acceptance_criteria,
+                     rationale, dependency_notes, risk_notes, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (run_id, parent_issue_key, parent_issue_type, proposed_issue_type,
+                 sequence_number, title, description, acceptance_criteria,
+                 rationale, dependency_notes, risk_notes, confidence),
+            )
+            return cur.fetchone()[0]
+
+
+def get_planning_outputs(run_id: int) -> list[dict]:
+    """Return all planning_outputs rows for a run, ordered by sequence_number."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, parent_issue_key, parent_issue_type, proposed_issue_type,
+                       sequence_number, title, description, acceptance_criteria,
+                       rationale, dependency_notes, risk_notes, confidence,
+                       status, created_issue_key, created_at, updated_at
+                FROM planning_outputs
+                WHERE run_id = %s
+                ORDER BY sequence_number
+                """,
+                (run_id,),
+            )
+            cols = [
+                "id", "run_id", "parent_issue_key", "parent_issue_type", "proposed_issue_type",
+                "sequence_number", "title", "description", "acceptance_criteria",
+                "rationale", "dependency_notes", "risk_notes", "confidence",
+                "status", "created_issue_key", "created_at", "updated_at",
+            ]
+            return [
+                {c: (v.isoformat() if hasattr(v, "isoformat") else v) for c, v in zip(cols, row)}
+                for row in cur.fetchall()
+            ]
+
+
+def update_planning_output_status(output_id: int, status: str, created_issue_key: str | None = None):
+    """Update status (and optionally created_issue_key) on a planning_outputs row."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE planning_outputs
+                SET status=%s, created_issue_key=%s, updated_at=NOW()
+                WHERE id=%s
+                """,
+                (status, created_issue_key, output_id),
+            )
+
+
+def request_planning_approval(run_id: int):
+    """Mark a planning run as awaiting approval."""
+    update_run_field(
+        run_id,
+        approval_status="PENDING",
+        approval_requested_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+
+def set_planning_approval(run_id: int, approval_status: str):
+    """Record the approval decision (APPROVED | REJECTED | REGENERATE_REQUESTED)."""
+    update_run_field(
+        run_id,
+        approval_status=approval_status,
+        approval_received_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )

@@ -163,3 +163,45 @@ Auto-merge conditions (enforced from Iteration 6 onward):
 | Auto-merge enabled | `suyog19/sandbox-fastapi-app` only |
 | Max fix attempts | 1 (max 2 total coding passes per workflow) |
 | Max changed files | 3 |
+
+## Phase 6 Configuration
+
+### Jira hierarchy (Phase 6+)
+
+**Locked decision: Epic → Story (2 levels, no Feature, no Task)**
+
+This uses the default Jira hierarchy. Tasks are not used — Stories are the atomic unit of implementation. Features and Tasks are skipped entirely.
+
+### Planning workflow trigger (Phase 6+)
+
+| Field | Value |
+|---|---|
+| Jira trigger status | `Ready for Breakdown` (case-insensitive) |
+| Supported issue type | `Epic` |
+| Workflow type | `epic_breakdown` |
+| Max Stories per Epic | 8 |
+| Output issue type | `Story` |
+
+### Approval gate (Phase 6+)
+
+The orchestrator proposes a Story breakdown and sends it to Telegram awaiting approval before creating Jira children. Approval commands are sent via Telegram message to the bot:
+
+| Command | Effect |
+|---|---|
+| `APPROVE <run_id>` | Accept proposed Stories and create them in Jira |
+| `REJECT <run_id>` | Discard the proposal; run marked FAILED |
+| `REGENERATE <run_id>` | Discard the proposal; re-run planning with a new Claude call |
+
+The run's `approval_status` field tracks the gate: `PENDING` → `APPROVED` / `REJECTED` / `REGENERATE_REQUESTED`.
+
+### Planning Telegram event types (Phase 6+)
+
+| Event type | When sent |
+|---|---|
+| `epic_breakdown_started` | Planning workflow begins |
+| `epic_breakdown_proposed` | Stories proposed, awaiting approval |
+| `epic_breakdown_approved` | User approved; Jira creation begins |
+| `epic_breakdown_rejected` | User rejected the proposal |
+| `epic_breakdown_regenerate` | User requested regeneration |
+| `epic_breakdown_complete` | All Jira Stories created successfully |
+| `epic_breakdown_failed` | Unrecoverable error |
