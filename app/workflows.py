@@ -1,6 +1,6 @@
 import logging
 from app.repo_mapping import get_mapping
-from app.git_ops import clone_repo
+from app.git_ops import clone_repo, commit_and_push
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.file_modifier import modify_file
 from app.telegram import send_message
@@ -32,3 +32,11 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     modification = modify_file(repo_path)
     send_message("file_modify", "COMPLETE", f"{issue_key}: {modification['file']} — {modification['change']}")
     logger.info("story_implementation: file modified — %s", modification)
+
+    branch = commit_and_push(
+        repo_path=repo_path,
+        issue_key=issue_key,
+        commit_message=f"ai: {issue_key} — {summary}",
+    )
+    send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
+    logger.info("story_implementation: pushed branch %s", branch)
