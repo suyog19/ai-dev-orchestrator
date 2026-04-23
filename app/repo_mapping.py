@@ -113,3 +113,48 @@ def disable_mapping(mapping_id: int) -> bool:
                 (mapping_id,),
             )
             return cur.fetchone() is not None
+
+
+def upsert_seed_mappings(mappings: list[dict]) -> int:
+    """Insert seed mappings that do not already exist as active entries.
+
+    Matches on (jira_project_key, issue_type, repo_slug). Skips rows where
+    an active match already exists. Returns the count of rows inserted.
+    """
+    inserted = 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for m in mappings:
+                cur.execute(
+                    """
+                    SELECT id FROM repo_mappings
+                    WHERE jira_project_key = %s
+                      AND (issue_type = %s OR (issue_type IS NULL AND %s IS NULL))
+                      AND repo_slug = %s
+                      AND is_active = TRUE
+                    LIMIT 1
+                    """,
+                    (m["jira_project_key"], m.get("issue_type"), m.get("issue_type"), m["repo_slug"]),
+                )
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO repo_mappings
+                        (jira_project_key, issue_type, repo_slug, base_branch, notes)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        m["jira_project_key"],
+                        m.get("issue_type"),
+                        m["repo_slug"],
+                        m.get("base_branch", "main"),
+                        m.get("notes"),
+                    ),
+                )
+                inserted += 1
+    if inserted:
+        logger.info("Seed mappings: inserted %d new mapping(s)", inserted)
+    else:
+        logger.info("Seed mappings: all entries already present — nothing inserted")
+    return inserted

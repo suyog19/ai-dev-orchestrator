@@ -7,6 +7,7 @@ from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change
 from app.file_modifier import apply_suggestion, modify_file
 from app.telegram import send_message
+from app.database import update_run_step, update_run_field
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -18,11 +19,14 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     logger.info("story_implementation: starting %s (%s) — %s", issue_key, issue_type, summary)
 
     jira_project_key = issue_key.split("-")[0]
+
+    update_run_step(run_id, "mapping_lookup")
     mapping = get_mapping(jira_project_key, issue_type)
     if not mapping:
         logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
 
+    update_run_step(run_id, "cloning")
     repo_path = clone_repo(
         run_id=run_id,
         issue_key=issue_key,
@@ -31,15 +35,18 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     )
     logger.info("story_implementation: repo cloned to %s", repo_path)
 
+    update_run_step(run_id, "analyzing")
     analysis = analyze_repo(repo_path)
     telegram_summary = format_telegram_summary(issue_key, mapping["repo_slug"], analysis)
     send_message("repo_analysis", "COMPLETE", telegram_summary)
     logger.info("story_implementation: analysis sent to Telegram")
 
+    update_run_step(run_id, "summarizing")
     claude_summary = summarize_repo(repo_path, mapping["repo_slug"], analysis)
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
 
+    update_run_step(run_id, "suggesting")
     suggestion = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
     suggestion_msg = (
         f"{issue_key}: Suggested change in {suggestion['file']}\n"
@@ -50,6 +57,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("claude_suggestion", "COMPLETE", suggestion_msg)
     logger.info("story_implementation: Claude suggestion sent to Telegram — %s", suggestion["file"])
 
+    update_run_step(run_id, "applying")
     applied = apply_suggestion(repo_path, suggestion)
     if applied["applied"]:
         change_detail = f"{applied['file']} — {applied['description']}"
@@ -63,12 +71,14 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     suggestion_description = suggestion.get("description", summary)
     commit_message = f"ai: {issue_key} — {suggestion_description}"
 
+    update_run_step(run_id, "pushing")
     branch = commit_and_push(
         repo_path=repo_path,
         issue_key=issue_key,
         run_id=run_id,
         commit_message=commit_message,
     )
+    update_run_field(run_id, working_branch=branch)
     send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
     logger.info("story_implementation: pushed branch %s", branch)
 
@@ -114,6 +124,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         f"- [ ] Ready to merge\n"
     )
 
+    update_run_step(run_id, "creating_pr")
     ensure_label(mapping["repo_slug"], AI_LABEL, color=AI_LABEL_COLOR, description="Opened by AI Dev Orchestrator")
     pr = create_pull_request(
         repo_name=mapping["repo_slug"],
@@ -123,5 +134,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         body=pr_body,
     )
     add_label_to_pr(mapping["repo_slug"], pr["number"], AI_LABEL)
+    update_run_field(run_id, pr_url=pr["url"])
+    update_run_step(run_id, "done")
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
