@@ -6,7 +6,8 @@ logger = logging.getLogger("orchestrator")
 
 # Maps (issue_type, status) → workflow_type
 WORKFLOW_MAP = {
-    ("Story", "READY FOR DEV"): "story_implementation",
+    ("Story", "READY FOR DEV"):       "story_implementation",
+    ("Epic",  "READY FOR BREAKDOWN"): "epic_breakdown",
 }
 
 
@@ -19,7 +20,7 @@ def _active_run_exists(issue_key: str, workflow_type: str) -> int | None:
                 SELECT id FROM workflow_runs
                 WHERE issue_key = %s
                   AND workflow_type = %s
-                  AND status IN ('QUEUED', 'RUNNING')
+                  AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_APPROVAL')
                 ORDER BY id DESC
                 LIMIT 1
                 """,

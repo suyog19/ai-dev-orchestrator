@@ -19,10 +19,11 @@ logger = logging.getLogger("worker")
 from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
-from app.workflows import story_implementation
+from app.workflows import story_implementation, epic_breakdown
 
 WORKFLOW_HANDLERS = {
     "story_implementation": story_implementation,
+    "epic_breakdown":       epic_breakdown,
 }
 
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
@@ -84,8 +85,11 @@ def _execute(job: dict):
             with conn.cursor() as cur:
                 cur.execute("SELECT status FROM workflow_runs WHERE id=%s", (run_id,))
                 row = cur.fetchone()
-        if row and row[0] == "FAILED":
-            logger.info("Workflow hard-failed inside handler (run_id=%s) — keeping FAILED status", run_id)
+        if row and row[0] in ("FAILED", "WAITING_FOR_APPROVAL"):
+            logger.info(
+                "Workflow handler set terminal status %s (run_id=%s) — not overwriting with COMPLETED",
+                row[0], run_id,
+            )
             return
 
         _update_run_status(run_id, "COMPLETED")

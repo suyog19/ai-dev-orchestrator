@@ -359,3 +359,13 @@ def set_planning_approval(run_id: int, approval_status: str):
         approval_status=approval_status,
         approval_received_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
     )
+
+
+def set_run_waiting_for_approval(run_id: int):
+    """Transition a planning run to WAITING_FOR_APPROVAL — persists across worker restarts."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE workflow_runs SET status='WAITING_FOR_APPROVAL', updated_at=NOW() WHERE id=%s",
+                (run_id,),
+            )

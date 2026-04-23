@@ -8,7 +8,11 @@ from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
-from app.database import update_run_step, update_run_field, fail_run, record_attempt, complete_attempt
+from app.database import (
+    update_run_step, update_run_field, fail_run,
+    record_attempt, complete_attempt,
+    add_planning_output, request_planning_approval, set_run_waiting_for_approval,
+)
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -341,3 +345,71 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.info("story_implementation: auto-merge skipped — %s", reason_str)
 
     update_run_step(run_id, "done")
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Planning workflows
+# ---------------------------------------------------------------------------
+
+MAX_STORIES_PER_EPIC = 8
+
+
+def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
+    """Epic → Story breakdown workflow — Phase 6.
+
+    Iteration 1: stub proposals stored in planning_outputs; Telegram approval requested.
+    Claude-based decomposition replaces stubs in Iteration 3.
+    """
+    logger.info("epic_breakdown: starting for %s — %s", issue_key, summary)
+
+    update_run_step(run_id, "planning")
+    update_run_field(run_id, parent_issue_key=issue_key)
+    send_message("epic_breakdown_started", "RUNNING", f"{issue_key}: {summary}")
+
+    # Stub proposals — replaced by real Claude output in Iteration 3
+    stub_stories = [
+        {
+            "title": f"[Stub] Implement core functionality for: {summary}",
+            "description": "Placeholder Story — will be replaced by Claude-generated breakdown in Iteration 3.",
+            "acceptance_criteria": "To be defined by Claude decomposition.",
+        },
+        {
+            "title": f"[Stub] Add tests and validation for: {summary}",
+            "description": "Placeholder Story — will be replaced by Claude-generated breakdown in Iteration 3.",
+            "acceptance_criteria": "To be defined by Claude decomposition.",
+        },
+    ]
+
+    output_ids = []
+    for i, story in enumerate(stub_stories, start=1):
+        oid = add_planning_output(
+            run_id=run_id,
+            parent_issue_key=issue_key,
+            parent_issue_type=issue_type,
+            proposed_issue_type="Story",
+            sequence_number=i,
+            title=story["title"],
+            description=story["description"],
+            acceptance_criteria=story["acceptance_criteria"],
+        )
+        output_ids.append(oid)
+
+    logger.info("epic_breakdown: stored %d stub proposals (run_id=%s)", len(output_ids), run_id)
+
+    # Mark run as awaiting human approval
+    request_planning_approval(run_id)
+    set_run_waiting_for_approval(run_id)
+
+    story_lines = "\n".join(f"  {i}. {s['title']}" for i, s in enumerate(stub_stories, 1))
+    approval_msg = (
+        f"Epic: {issue_key}\n"
+        f"Summary: {summary}\n\n"
+        f"Proposed Stories ({len(stub_stories)}):\n{story_lines}\n\n"
+        f"Run ID: {run_id}\n\n"
+        f"Reply with:\n"
+        f"  APPROVE {run_id}\n"
+        f"  REJECT {run_id}\n"
+        f"  REGENERATE {run_id}"
+    )
+    send_message("epic_breakdown_proposed", "PENDING", approval_msg)
+    logger.info("epic_breakdown: approval request sent to Telegram (run_id=%s)", run_id)
