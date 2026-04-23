@@ -52,6 +52,7 @@ class MemoryScope:
 class MemoryKind:
     PLANNING_GUIDANCE   = "planning_guidance"
     EXECUTION_GUIDANCE  = "execution_guidance"
+    MANUAL_NOTE         = "manual_note"
 
 
 # Prompt injection limits

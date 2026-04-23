@@ -17,6 +17,7 @@ from app.database import (
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
+from app.database import add_manual_memory
 
 load_dotenv()
 
@@ -409,3 +410,78 @@ def get_epic_outcome(epic_key: str):
         "created_at":    row[3].isoformat(),
         "updated_at":    row[4].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Manual memory — human-authored guidance notes
+# ---------------------------------------------------------------------------
+
+class ManualMemoryIn(BaseModel):
+    scope_type: str   # e.g. "repo" or "epic"
+    scope_key: str    # e.g. "suyog19/sandbox-fastapi-app" or "KAN-1"
+    content: str
+
+
+@app.post("/debug/memory", status_code=201)
+def create_manual_memory(body: ManualMemoryIn):
+    """Store a human-authored guidance note for a given scope.
+
+    Uses memory_kind='manual_note' (source='human'). The note is included
+    in future planning and execution prompt enrichment alongside derived snapshots.
+    Calling this endpoint again with the same scope_type/scope_key replaces the note.
+
+    Example body:
+        {"scope_type": "repo", "scope_key": "suyog19/sandbox-fastapi-app",
+         "content": "Stories in this repo should stay small and avoid test edits unless explicitly requested"}
+    """
+    if not body.content.strip():
+        raise HTTPException(status_code=400, detail="content must not be empty")
+    return add_manual_memory(body.scope_type, body.scope_key, body.content.strip())
+
+
+@app.get("/debug/memory")
+def list_memory_snapshots(scope_type: str | None = None, scope_key: str | None = None):
+    """Return memory snapshots, optionally filtered by scope_type and/or scope_key.
+
+    Includes both derived (auto-generated) and human snapshots.
+    Query params are ANDed when both are provided.
+    """
+    conditions = []
+    params = []
+    if scope_type:
+        conditions.append("scope_type = %s")
+        params.append(scope_type)
+    if scope_key:
+        conditions.append("scope_key = %s")
+        params.append(scope_key)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, scope_type, scope_key, memory_kind, source,
+                       summary, evidence_json, created_at, updated_at
+                FROM memory_snapshots
+                {where}
+                ORDER BY scope_type, scope_key, memory_kind
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":          r[0],
+            "scope_type":  r[1],
+            "scope_key":   r[2],
+            "memory_kind": r[3],
+            "source":      r[4],
+            "summary":     r[5],
+            "evidence":    json.loads(r[6]) if r[6] else None,
+            "created_at":  r[7].isoformat(),
+            "updated_at":  r[8].isoformat(),
+        }
+        for r in rows
+    ]

@@ -191,6 +191,10 @@ def init_db(retries: int = 5, delay: int = 3):
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_snapshots_scope_kind
                 ON memory_snapshots (scope_type, scope_key, memory_kind)
             """)
+            cur.execute(
+                "ALTER TABLE memory_snapshots ADD COLUMN IF NOT EXISTS "
+                "source VARCHAR(20) NOT NULL DEFAULT 'derived'"
+            )
 
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
@@ -1237,9 +1241,11 @@ def get_planning_memory(repo_slug: str, epic_key: str | None = None) -> str:
             queries: list[tuple[str, str, str]] = [
                 ("repo", repo_slug, "planning_guidance"),
                 ("repo", repo_slug, "execution_guidance"),
+                ("repo", repo_slug, "manual_note"),
             ]
             if epic_key:
                 queries.append(("epic", epic_key, "execution_guidance"))
+                queries.append(("epic", epic_key, "manual_note"))
 
             for scope_type, scope_key, memory_kind in queries:
                 cur.execute(
@@ -1280,28 +1286,30 @@ def get_execution_memory(repo_slug: str) -> str:
     """
     from app.feedback import MEMORY_MAX_BULLETS, MEMORY_MAX_CHARS
 
+    _SKIP = frozenset(["no execution runs recorded yet."])
+    bullets: list[str] = []
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT summary FROM memory_snapshots
-                WHERE scope_type = 'repo' AND scope_key = %s AND memory_kind = 'execution_guidance'
-                """,
-                (repo_slug,),
-            )
-            row = cur.fetchone()
+            for memory_kind in ("execution_guidance", "manual_note"):
+                cur.execute(
+                    """
+                    SELECT summary FROM memory_snapshots
+                    WHERE scope_type = 'repo' AND scope_key = %s AND memory_kind = %s
+                    """,
+                    (repo_slug, memory_kind),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    continue
+                text = row[0].strip()
+                if text.lower() in _SKIP:
+                    continue
+                for line in text.splitlines():
+                    line = line.strip().lstrip("- ").strip()
+                    if line:
+                        bullets.append(line)
 
-    if not row or not row[0]:
-        return ""
-    text = row[0].strip()
-    if text.lower() == "no execution runs recorded yet.":
-        return ""
-
-    bullets = [
-        line.strip().lstrip("- ").strip()
-        for line in text.splitlines()
-        if line.strip().lstrip("- ").strip()
-    ]
     if not bullets:
         return ""
 
@@ -1311,3 +1319,60 @@ def get_execution_memory(repo_slug: str) -> str:
         block = block[:MEMORY_MAX_CHARS].rsplit("\n", 1)[0]
 
     return block
+
+
+def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
+    """Upsert a human-authored memory note for the given scope.
+
+    Uses memory_kind='manual_note' and source='human' so it is distinguishable
+    from derived (auto-generated) snapshots. The content is stored verbatim as
+    the summary; evidence_json is null for manual notes.
+
+    Returns the snapshot row dict. Sends a Telegram notification on first creation.
+    """
+    from app.feedback import MemoryKind
+    from app.telegram import send_message
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO memory_snapshots
+                    (scope_type, scope_key, memory_kind, summary, evidence_json, source)
+                VALUES (%s, %s, %s, %s, NULL, 'human')
+                ON CONFLICT (scope_type, scope_key, memory_kind) DO UPDATE
+                    SET summary    = EXCLUDED.summary,
+                        source     = 'human',
+                        updated_at = NOW()
+                RETURNING id, scope_type, scope_key, memory_kind, summary,
+                          source, created_at, updated_at,
+                          (xmax = 0) AS is_insert
+                """,
+                (scope_type, scope_key, MemoryKind.MANUAL_NOTE, content),
+            )
+            row = cur.fetchone()
+
+    snap_id, scope_type_out, scope_key_out, memory_kind_out, summary, \
+        source, created_at, updated_at, is_insert = row
+
+    if is_insert:
+        send_message(
+            "manual_memory_added", "ADDED",
+            f"{scope_type_out}/{scope_key_out}: manual note stored",
+        )
+
+    logger.info(
+        "add_manual_memory: %s for %s/%s (id=%s, new=%s)",
+        MemoryKind.MANUAL_NOTE, scope_type_out, scope_key_out, snap_id, bool(is_insert),
+    )
+
+    return {
+        "id":          snap_id,
+        "scope_type":  scope_type_out,
+        "scope_key":   scope_key_out,
+        "memory_kind": memory_kind_out,
+        "source":      source,
+        "content":     summary,
+        "created_at":  created_at.isoformat(),
+        "updated_at":  updated_at.isoformat(),
+    }
