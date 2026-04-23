@@ -43,8 +43,16 @@ FIX_PROMPT = (
     "You are a code repair assistant. A previous implementation attempt failed tests. "
     "You will be given: the original story, the current state of the changed file, and the failing test output. "
     "Produce a targeted fix to make the failing tests pass. "
-    "Rules: change as few lines as possible; do not break passing tests; stay within the same file unless unavoidable. "
-    "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
+    "Rules:\n"
+    "- Change as few lines as possible\n"
+    "- Do not break currently passing tests\n"
+    "- Stay within the same file\n"
+    "- Do not import or reference types that do not already exist in the codebase\n"
+    "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types\n\n"
+    "CRITICAL: Your entire response must be a single JSON object. "
+    "Do not include any explanation, reasoning, prose, or markdown. "
+    "Start your response with { and end with }.\n"
+    "Format:\n"
     '{"file": "<relative path>", "description": "<one sentence>", '
     '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
 )
@@ -57,6 +65,8 @@ SUGGEST_PROMPT = (
     "relevant improvement you can find in any of the files instead. "
     "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and minimal (change as few lines as possible). "
+    "IMPORTANT: Only use types, functions, and imports that already exist in the file you are modifying. "
+    "Do not reference classes or modules that are not already present in the codebase. "
     "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
     '{"file": "<relative path>", "description": "<one sentence>", '
     '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
@@ -367,5 +377,14 @@ def fix_change(
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        # Claude returned prose — try to extract the JSON object from it
+        match = re.search(r'\{[^{}]*"file"[^{}]*"original"[^{}]*"replacement"[^{}]*\}', raw, re.DOTALL)
+        if match:
+            try:
+                extracted = json.loads(match.group(0))
+                logger.info("Extracted JSON from prose fix response")
+                return extracted
+            except json.JSONDecodeError:
+                pass
         logger.warning("Claude returned non-JSON fix: %s", raw[:200])
         return {"file": changed_file, "description": raw[:200], "original": "", "replacement": ""}
