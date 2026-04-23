@@ -1269,3 +1269,45 @@ def get_planning_memory(repo_slug: str, epic_key: str | None = None) -> str:
         block = block[:MEMORY_MAX_CHARS].rsplit("\n", 1)[0]
 
     return block
+
+
+def get_execution_memory(repo_slug: str) -> str:
+    """Retrieve repo-level execution guidance formatted for prompt injection.
+
+    Fetches only the execution_guidance snapshot for this repo (not planning).
+    Returns a bullet-point block bounded to MEMORY_MAX_BULLETS and
+    MEMORY_MAX_CHARS. Returns empty string when no snapshot exists yet.
+    """
+    from app.feedback import MEMORY_MAX_BULLETS, MEMORY_MAX_CHARS
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT summary FROM memory_snapshots
+                WHERE scope_type = 'repo' AND scope_key = %s AND memory_kind = 'execution_guidance'
+                """,
+                (repo_slug,),
+            )
+            row = cur.fetchone()
+
+    if not row or not row[0]:
+        return ""
+    text = row[0].strip()
+    if text.lower() == "no execution runs recorded yet.":
+        return ""
+
+    bullets = [
+        line.strip().lstrip("- ").strip()
+        for line in text.splitlines()
+        if line.strip().lstrip("- ").strip()
+    ]
+    if not bullets:
+        return ""
+
+    bullets = bullets[:MEMORY_MAX_BULLETS]
+    block = "\n".join(f"- {b}" for b in bullets)
+    if len(block) > MEMORY_MAX_CHARS:
+        block = block[:MEMORY_MAX_CHARS].rsplit("\n", 1)[0]
+
+    return block

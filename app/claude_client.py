@@ -446,7 +446,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     return summary
 
 
-def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "") -> dict:
+def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "", memory_context: str = "") -> dict:
     """Ask Claude Sonnet to suggest up to 3 code changes aligned with the Jira story.
 
     Selects files by keyword overlap with the issue summary rather than a fixed entry-point
@@ -472,9 +472,11 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     for rel_path, content, _reason in selected:
         file_sections += f"\n--- {rel_path} ---\n```\n{content}\n```\n"
 
+    memory_block = f"Prior lessons from this repository:\n{memory_context}\n\n" if memory_context else ""
     user_content = (
         f"{story_context}"
         f"Available source files (ordered by relevance to story):{file_sections}\n"
+        f"{memory_block}"
         f"Implement the story by changing one to three of the files above."
     )
 
@@ -516,6 +518,7 @@ def fix_change(
     issue_summary: str,
     previous_changes: list[dict],
     test_output: str,
+    memory_context: str = "",
 ) -> dict:
     """Ask Claude to fix a failing implementation.
 
@@ -540,11 +543,13 @@ def fix_change(
         file_sections += f"\n--- {changed_file} ---\n```\n{current_content}\n```\n"
 
     files_str = ", ".join(f"`{f}`" for f in changed_files)
+    memory_block = f"Prior lessons from this repository:\n{memory_context}\n\n" if memory_context else ""
     user_content = (
         f"Story: {issue_key} — {issue_summary}\n\n"
         f"The previous implementation changed {files_str} but tests are failing.\n\n"
         f"Current file contents:{file_sections}\n"
         f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
+        f"{memory_block}"
         f"Call apply_code_changes with minimal fixes to make the failing tests pass "
         f"without breaking any currently passing tests."
     )

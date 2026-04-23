@@ -15,7 +15,7 @@ from app.database import (
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
     get_created_children_for_epic, store_planning_metadata,
     record_planning_feedback, record_execution_feedback,
-    get_planning_memory,
+    get_planning_memory, get_execution_memory,
 )
 from app.test_runner import run_tests
 
@@ -63,6 +63,18 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
 
+    # --- Memory context for execution prompts ---
+    execution_memory = ""
+    try:
+        execution_memory = get_execution_memory(mapping["repo_slug"])
+        if execution_memory:
+            logger.info(
+                "story_implementation: injecting %d chars of execution memory (run_id=%s)",
+                len(execution_memory), run_id,
+            )
+    except Exception as mem_exc:
+        logger.warning("story_implementation: get_execution_memory failed (non-fatal): %s", mem_exc)
+
     update_run_step(run_id, "cloning")
     repo_path = clone_repo(
         run_id=run_id,
@@ -84,7 +96,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     logger.info("story_implementation: Claude summary sent to Telegram")
 
     update_run_step(run_id, "suggesting")
-    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
+    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=execution_memory)
     changes = suggestion_result.get("changes", [])
     suggestion_summary = suggestion_result.get("summary", "")
     files_str = ", ".join(c.get("file", "") for c in changes)
@@ -146,6 +158,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             issue_summary=summary,
             previous_changes=changes,
             test_output=test_result["output"],
+            memory_context=execution_memory,
         )
         fix_applied = apply_changes(repo_path, fix_result.get("changes", []))
         if fix_applied["applied"]:
