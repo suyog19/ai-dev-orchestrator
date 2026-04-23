@@ -41,6 +41,7 @@ def _execute(job: dict):
     run_id = job["run_id"]
     workflow_type = job["workflow_type"]
     issue_key = job["issue_key"]
+    issue_type = job.get("issue_type", "Story")
     summary = job["summary"]
 
     handler = WORKFLOW_HANDLERS.get(workflow_type)
@@ -54,7 +55,7 @@ def _execute(job: dict):
         _update_run_status(run_id, "RUNNING")
         send_message("workflow", "RUNNING", f"{issue_key}: {summary}")
 
-        handler(run_id, issue_key, summary)
+        handler(run_id, issue_key, issue_type, summary)
 
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)

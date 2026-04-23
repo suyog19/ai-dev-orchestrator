@@ -10,28 +10,29 @@ from app.telegram import send_message
 logger = logging.getLogger("worker")
 
 
-def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
-    logger.info("story_implementation: starting %s — %s", issue_key, summary)
+def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
+    logger.info("story_implementation: starting %s (%s) — %s", issue_key, issue_type, summary)
 
-    mapping = get_mapping(issue_key)
+    jira_project_key = issue_key.split("-")[0]
+    mapping = get_mapping(jira_project_key, issue_type)
     if not mapping:
-        logger.warning("No repo mapping found for %s — skipping clone", issue_key)
+        logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
 
     repo_path = clone_repo(
         run_id=run_id,
         issue_key=issue_key,
-        repo_name=mapping["repo_name"],
-        target_branch=mapping["target_branch"],
+        repo_name=mapping["repo_slug"],
+        target_branch=mapping["base_branch"],
     )
     logger.info("story_implementation: repo cloned to %s", repo_path)
 
     analysis = analyze_repo(repo_path)
-    telegram_summary = format_telegram_summary(issue_key, mapping["repo_name"], analysis)
+    telegram_summary = format_telegram_summary(issue_key, mapping["repo_slug"], analysis)
     send_message("repo_analysis", "COMPLETE", telegram_summary)
     logger.info("story_implementation: analysis sent to Telegram")
 
-    claude_summary = summarize_repo(repo_path, mapping["repo_name"], analysis)
+    claude_summary = summarize_repo(repo_path, mapping["repo_slug"], analysis)
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
 
@@ -81,9 +82,9 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     )
 
     pr = create_pull_request(
-        repo_name=mapping["repo_name"],
+        repo_name=mapping["repo_slug"],
         head_branch=branch,
-        base_branch=mapping["target_branch"],
+        base_branch=mapping["base_branch"],
         title=f"ai: {issue_key} — {suggestion_description}",
         body=pr_body,
     )

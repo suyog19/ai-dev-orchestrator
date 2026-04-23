@@ -64,13 +64,25 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            # Migrate old schema (issue_key-based) to new project-key-based schema
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'repo_mappings' AND column_name = 'issue_key'
+            """)
+            if cur.fetchone():
+                cur.execute("DROP TABLE repo_mappings")
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS repo_mappings (
-                    id            SERIAL PRIMARY KEY,
-                    issue_key     VARCHAR(50)   NOT NULL UNIQUE,
-                    repo_name     VARCHAR(200)  NOT NULL,
-                    target_branch VARCHAR(100)  NOT NULL DEFAULT 'main',
-                    created_at    TIMESTAMP     NOT NULL DEFAULT NOW()
+                    id                SERIAL PRIMARY KEY,
+                    jira_project_key  VARCHAR(50)   NOT NULL,
+                    issue_type        VARCHAR(50)   NULL,
+                    repo_slug         VARCHAR(200)  NOT NULL,
+                    base_branch       VARCHAR(100)  NOT NULL DEFAULT 'main',
+                    is_active         BOOLEAN       NOT NULL DEFAULT TRUE,
+                    notes             TEXT          NULL,
+                    created_at        TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at        TIMESTAMP     NOT NULL DEFAULT NOW()
                 )
             """)
 
