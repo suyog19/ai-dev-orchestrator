@@ -63,7 +63,9 @@ SUGGEST_PROMPT = (
     "Each change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and complete (all lines needed in that file in one contiguous block). "
     "You may add imports for names that genuinely exist in the codebase. "
-    "Do not invent new class names or types that are not defined anywhere in the provided files."
+    "Do not invent new class names or types that are not defined anywhere in the provided files. "
+    "Do NOT modify test files (any file under tests/ or named test_*.py). "
+    "Tests define expected behaviour — if your implementation breaks a test, the fix loop will handle it."
 )
 
 # Tool schema used by both suggest_change and fix_change to guarantee structured output
