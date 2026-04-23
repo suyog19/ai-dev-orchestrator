@@ -15,7 +15,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn
+from app.database import init_db, get_conn, fail_run
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation
@@ -55,7 +55,14 @@ def _execute(job: dict):
         _update_run_status(run_id, "RUNNING")
         send_message("workflow", "RUNNING", f"{issue_key}: {summary}")
 
-        handler(run_id, issue_key, issue_type, summary)
+        try:
+            handler(run_id, issue_key, issue_type, summary)
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+            logger.error("Workflow FAILED: %s (run_id=%s) — %s", workflow_type, run_id, error_msg)
+            fail_run(run_id, error_msg)
+            send_message("workflow", "FAILED", f"{issue_key}: {error_msg}")
+            return
 
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)

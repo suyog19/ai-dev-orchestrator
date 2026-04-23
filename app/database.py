@@ -59,9 +59,15 @@ def init_db(retries: int = 5, delay: int = 3):
                     workflow_type    VARCHAR(100) NOT NULL,
                     status           VARCHAR(50)  NOT NULL DEFAULT 'RECEIVED',
                     related_event_id INTEGER      REFERENCES workflow_events(id),
+                    error_detail     TEXT         NULL,
                     created_at       TIMESTAMP    NOT NULL DEFAULT NOW(),
                     updated_at       TIMESTAMP    NOT NULL DEFAULT NOW()
                 )
+            """)
+            # Add error_detail to existing tables that predate this column
+            cur.execute("""
+                ALTER TABLE workflow_runs
+                ADD COLUMN IF NOT EXISTS error_detail TEXT NULL
             """)
 
             # Migrate old schema (issue_key-based) to new project-key-based schema
@@ -87,3 +93,12 @@ def init_db(retries: int = 5, delay: int = 3):
             """)
 
     logger.info("Database initialized — tables ready")
+
+
+def fail_run(run_id: int, error_detail: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE workflow_runs SET status='FAILED', error_detail=%s, updated_at=NOW() WHERE id=%s",
+                (error_detail[:2000], run_id),
+            )
