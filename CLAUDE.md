@@ -205,3 +205,52 @@ The run's `approval_status` field tracks the gate: `PENDING` → `APPROVED` / `R
 | `epic_breakdown_regenerate` | User requested regeneration |
 | `epic_breakdown_complete` | All Jira Stories created successfully |
 | `epic_breakdown_failed` | Unrecoverable error |
+
+## Phase 7 Configuration
+
+### Jira hierarchy — LOCKED CONSTRAINT (Phase 7+)
+
+**Epic → Story is the only planning hierarchy in this project. This must not change unless explicitly instructed.**
+
+- Feature level does NOT exist and must not be added
+- Task level is not used
+- No code path should reference or route to a `feature_breakdown` workflow
+- No planning prompt should treat Feature as an intermediate decomposition level
+- Stories are the atomic unit of implementation
+
+### Memory and feedback (Phase 7+)
+
+| Setting | Value |
+|---|---|
+| Memory enabled | `true` |
+| Max memory bullets injected into prompts | `5` |
+| Max memory chars injected into prompts | `1000` |
+| Memory scopes | `run`, `epic`, `repo` |
+| Memory refresh mode | `on_write` |
+
+### Failure categories (Phase 7+)
+
+All failure categories are defined in `app/feedback.py` (`FailureCategory` class).
+
+| Category | When applied |
+|---|---|
+| `test_failure` | Tests ran and failed |
+| `syntax_failure` | Python syntax/parse error in generated code |
+| `apply_validation_failure` | File apply guard rejected the change |
+| `jira_creation_failure` | Jira API returned an error during child creation |
+| `merge_failure` | PR creation or auto-merge failed |
+| `duplicate_blocked` | Breakdown run blocked by idempotency guard |
+| `approval_rejected` | User rejected a planning proposal |
+| `approval_regenerated` | User requested regeneration of a proposal |
+| `worker_interrupted` | Run was RUNNING when worker restarted |
+| `unknown` | Error does not match any known pattern |
+
+### Phase 7 Telegram event types
+
+| Event type | When sent |
+|---|---|
+| `planning_feedback_recorded` | Feedback events written for a planning run |
+| `execution_feedback_recorded` | Feedback events written for an execution run |
+| `memory_snapshot_updated` | A memory snapshot was created or refreshed |
+| `epic_outcome_ready` | Epic-level outcome rollup generated |
+| `manual_memory_added` | A human-authored memory note was added |

@@ -160,6 +160,34 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            # Phase 7 — feedback and memory tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feedback_events (
+                    id              SERIAL PRIMARY KEY,
+                    source_type     VARCHAR(50)   NOT NULL,
+                    source_run_id   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    epic_key        VARCHAR(100)  NULL,
+                    story_key       VARCHAR(100)  NULL,
+                    repo_slug       VARCHAR(200)  NULL,
+                    feedback_type   VARCHAR(100)  NOT NULL,
+                    feedback_value  VARCHAR(500)  NULL,
+                    details_json    TEXT          NULL,
+                    created_at      TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS memory_snapshots (
+                    id              SERIAL PRIMARY KEY,
+                    scope_type      VARCHAR(50)   NOT NULL,
+                    scope_key       VARCHAR(200)  NOT NULL,
+                    memory_kind     VARCHAR(50)   NOT NULL,
+                    summary         TEXT          NOT NULL,
+                    evidence_json   TEXT          NULL,
+                    created_at      TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at      TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
     if seed_file.exists():
