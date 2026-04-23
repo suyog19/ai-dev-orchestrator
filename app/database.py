@@ -187,6 +187,10 @@ def init_db(retries: int = 5, delay: int = 3):
                     updated_at      TIMESTAMP     NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_snapshots_scope_kind
+                ON memory_snapshots (scope_type, scope_key, memory_kind)
+            """)
 
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
@@ -527,6 +531,179 @@ def complete_planning_run(run_id: int, created_count: int):
             )
 
 
+def generate_repo_memory_snapshot(repo_slug: str) -> dict:
+    """Compute and upsert repo-level planning + execution memory snapshots.
+
+    Derives structured guidance from feedback_events for the given repo.
+    Called on_write after feedback capture (memory_refresh_mode = 'on_write').
+    Returns dict with snapshot IDs for execution_guidance and planning_guidance.
+    """
+    from app.feedback import MemoryScope, MemoryKind
+    from app.telegram import send_message
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+
+            # --- Resolve project_key from repo_slug ---
+            cur.execute(
+                "SELECT jira_project_key FROM repo_mappings WHERE repo_slug=%s AND is_active=TRUE LIMIT 1",
+                (repo_slug,),
+            )
+            mapping_row = cur.fetchone()
+            project_key = mapping_row[0] if mapping_row else None
+
+            # --- Execution stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='execution_completed') AS completed,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='execution_failed') AS failed,
+                    ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='retry_count'), 2) AS avg_retry,
+                    ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='files_changed_count'), 1) AS avg_files
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            exec_row = cur.fetchone()
+            completed, failed, avg_retry, avg_files = exec_row if exec_row else (0, 0, None, None)
+
+            cur.execute(
+                """
+                SELECT feedback_value, COUNT(*) AS cnt
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s AND feedback_type='failure_category'
+                GROUP BY feedback_value ORDER BY cnt DESC
+                """,
+                (repo_slug,),
+            )
+            exec_categories = cur.fetchall()
+
+            # --- Planning stats (scoped by project_key prefix on epic_key) ---
+            plan_row = None
+            if project_key:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='planning_approved')    AS approved,
+                        COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='planning_rejected')    AS rejected,
+                        COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='planning_regenerated') AS regenerated,
+                        ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='stories_proposed_count'), 1) AS avg_proposed,
+                        ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='stories_created_count'), 1) AS avg_created,
+                        ROUND(AVG(feedback_value::numeric) FILTER (WHERE feedback_type='approval_latency_seconds'), 0) AS avg_latency
+                    FROM feedback_events
+                    WHERE source_type='planning_run' AND epic_key LIKE %s
+                    """,
+                    (f"{project_key}-%",),
+                )
+                plan_row = cur.fetchone()
+
+            # --- Build execution guidance ---
+            total_exec = (completed or 0) + (failed or 0)
+            exec_bullets = []
+            exec_evidence: dict = {"repo_slug": repo_slug, "total_runs": total_exec}
+
+            if total_exec > 0:
+                pct = round(100 * (completed or 0) / total_exec)
+                exec_bullets.append(
+                    f"{completed or 0} of {total_exec} execution run(s) completed ({pct}%)"
+                )
+                exec_evidence.update({
+                    "completed": int(completed or 0),
+                    "failed": int(failed or 0),
+                })
+            if avg_retry is not None:
+                exec_bullets.append(f"Average retry count: {avg_retry}")
+                exec_evidence["avg_retry_count"] = float(avg_retry)
+            if avg_files is not None:
+                exec_bullets.append(f"Average files changed per run: {avg_files}")
+                exec_evidence["avg_files_changed"] = float(avg_files)
+            if exec_categories:
+                top_cat, top_cnt = exec_categories[0]
+                exec_bullets.append(f"Most common failure: {top_cat} ({top_cnt} run(s))")
+                exec_evidence["failure_categories"] = {
+                    cat: int(cnt) for cat, cnt in exec_categories
+                }
+
+            exec_summary = (
+                "\n".join(f"- {b}" for b in exec_bullets)
+                if exec_bullets else "No execution runs recorded yet."
+            )
+
+            # --- Build planning guidance ---
+            plan_summary = "No planning runs recorded yet."
+            plan_evidence: dict = {"repo_slug": repo_slug}
+
+            if plan_row and project_key:
+                approved, rejected, regenerated, avg_proposed, avg_created, avg_latency = plan_row
+                total_plan = (approved or 0) + (rejected or 0) + (regenerated or 0)
+                plan_bullets = []
+
+                if total_plan > 0:
+                    plan_bullets.append(
+                        f"{total_plan} planning run(s): {approved or 0} approved, "
+                        f"{rejected or 0} rejected, {regenerated or 0} regenerated"
+                    )
+                    plan_evidence.update({
+                        "total_planning_runs": total_plan,
+                        "approved": int(approved or 0),
+                        "rejected": int(rejected or 0),
+                        "regenerated": int(regenerated or 0),
+                    })
+                if avg_proposed is not None:
+                    plan_bullets.append(f"Average stories proposed per Epic: {avg_proposed}")
+                    plan_evidence["avg_stories_proposed"] = float(avg_proposed)
+                if avg_created is not None:
+                    plan_bullets.append(f"Average stories created per Epic: {avg_created}")
+                    plan_evidence["avg_stories_created"] = float(avg_created)
+                if avg_latency is not None:
+                    latency_i = int(float(avg_latency))
+                    plan_bullets.append(f"Average approval latency: {latency_i}s")
+                    plan_evidence["avg_approval_latency_seconds"] = latency_i
+
+                if plan_bullets:
+                    plan_summary = "\n".join(f"- {b}" for b in plan_bullets)
+
+            # --- Upsert both snapshots ---
+            result: dict = {}
+            new_snapshots = []
+
+            for memory_kind, summary, evidence in [
+                (MemoryKind.EXECUTION_GUIDANCE, exec_summary, exec_evidence),
+                (MemoryKind.PLANNING_GUIDANCE,  plan_summary,  plan_evidence),
+            ]:
+                cur.execute(
+                    """
+                    INSERT INTO memory_snapshots
+                        (scope_type, scope_key, memory_kind, summary, evidence_json)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (scope_type, scope_key, memory_kind) DO UPDATE
+                        SET summary       = EXCLUDED.summary,
+                            evidence_json = EXCLUDED.evidence_json,
+                            updated_at    = NOW()
+                    RETURNING id, (xmax = 0) AS is_insert
+                    """,
+                    (MemoryScope.REPO, repo_slug, memory_kind, summary, json.dumps(evidence)),
+                )
+                snap_id, is_insert = cur.fetchone()
+                result[memory_kind] = {"id": snap_id, "is_new": bool(is_insert)}
+                if is_insert:
+                    new_snapshots.append(memory_kind)
+
+    logger.info(
+        "generate_repo_memory_snapshot: upserted for %s — exec_id=%s plan_id=%s",
+        repo_slug,
+        result.get(MemoryKind.EXECUTION_GUIDANCE, {}).get("id"),
+        result.get(MemoryKind.PLANNING_GUIDANCE, {}).get("id"),
+    )
+    if new_snapshots:
+        send_message(
+            "memory_snapshot_updated", "UPDATED",
+            f"{repo_slug}: new memory snapshot(s) created — {', '.join(new_snapshots)}",
+        )
+    return result
+
+
 def record_execution_feedback(run_id: int) -> int:
     """Write feedback_events rows for a finished story_implementation run.
 
@@ -535,6 +712,8 @@ def record_execution_feedback(run_id: int) -> int:
     (COMPLETED or FAILED). Returns the number of events written.
     """
     from app.feedback import FeedbackSource, FeedbackType, categorize_execution_failure
+
+    repo_slug_out = None  # captured for on_write snapshot refresh
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -554,6 +733,7 @@ def record_execution_feedback(run_id: int) -> int:
 
             # Resolve repo_slug from active mapping for this project
             repo_slug = None
+            repo_slug_out = None
             if issue_key:
                 project_key = issue_key.split("-")[0]
                 cur.execute(
@@ -568,6 +748,7 @@ def record_execution_feedback(run_id: int) -> int:
                 rs = cur.fetchone()
                 if rs:
                     repo_slug = rs[0]
+                    repo_slug_out = repo_slug
 
             events = []
 
@@ -609,7 +790,13 @@ def record_execution_feedback(run_id: int) -> int:
                 """,
                 events,
             )
-    return len(events)
+    n = len(events)
+    if n > 0 and repo_slug_out:
+        try:
+            generate_repo_memory_snapshot(repo_slug_out)
+        except Exception as exc:
+            logger.warning("record_execution_feedback: snapshot refresh failed — %s", exc)
+    return n
 
 
 def record_planning_feedback(run_id: int) -> int:
@@ -621,6 +808,8 @@ def record_planning_feedback(run_id: int) -> int:
     Returns the number of events written.
     """
     from app.feedback import FeedbackSource, FeedbackType, FailureCategory, categorize_planning_failure
+
+    repo_slug_out = None  # captured for on_write snapshot refresh
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -637,6 +826,20 @@ def record_planning_feedback(run_id: int) -> int:
             if not row:
                 return 0
             issue_key, approval_status, req_at, recv_at, error_detail, run_status, current_step = row
+
+            # Resolve repo_slug for on_write snapshot refresh
+            if issue_key:
+                project_key = issue_key.split("-")[0]
+                cur.execute(
+                    """
+                    SELECT repo_slug FROM repo_mappings
+                    WHERE jira_project_key = %s AND is_active = TRUE LIMIT 1
+                    """,
+                    (project_key,),
+                )
+                rs = cur.fetchone()
+                if rs:
+                    repo_slug_out = rs[0]
 
             cur.execute(
                 "SELECT COUNT(*) FROM planning_outputs WHERE run_id = %s",
@@ -698,7 +901,13 @@ def record_planning_feedback(run_id: int) -> int:
                 """,
                 events,
             )
-    return len(events)
+    n = len(events)
+    if n > 0 and repo_slug_out:
+        try:
+            generate_repo_memory_snapshot(repo_slug_out)
+        except Exception as exc:
+            logger.warning("record_planning_feedback: snapshot refresh failed — %s", exc)
+    return n
 
 
 def store_planning_metadata(run_id: int, assumptions: list, open_questions: list):
