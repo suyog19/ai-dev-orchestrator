@@ -1,6 +1,8 @@
 import logging
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo
+from app.repo_analysis import analyze_repo, format_telegram_summary
+from app.telegram import send_message
 
 logger = logging.getLogger("worker")
 
@@ -19,4 +21,9 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
         repo_name=mapping["repo_name"],
         target_branch=mapping["target_branch"],
     )
-    logger.info("story_implementation: repo ready at %s", repo_path)
+    logger.info("story_implementation: repo cloned to %s", repo_path)
+
+    analysis = analyze_repo(repo_path)
+    telegram_summary = format_telegram_summary(issue_key, mapping["repo_name"], analysis)
+    send_message("repo_analysis", "COMPLETE", telegram_summary)
+    logger.info("story_implementation: analysis sent to Telegram")
