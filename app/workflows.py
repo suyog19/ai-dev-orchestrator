@@ -2,6 +2,7 @@ import logging
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo
 from app.repo_analysis import analyze_repo, format_telegram_summary
+from app.file_modifier import modify_file
 from app.telegram import send_message
 
 logger = logging.getLogger("worker")
@@ -27,3 +28,7 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     telegram_summary = format_telegram_summary(issue_key, mapping["repo_name"], analysis)
     send_message("repo_analysis", "COMPLETE", telegram_summary)
     logger.info("story_implementation: analysis sent to Telegram")
+
+    modification = modify_file(repo_path)
+    send_message("file_modify", "COMPLETE", f"{issue_key}: {modification['file']} — {modification['change']}")
+    logger.info("story_implementation: file modified — %s", modification)
