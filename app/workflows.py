@@ -472,7 +472,7 @@ def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
         f"{issue_key}: creating {len(proposed)} Stories in Jira (run_id={run_id})",
     )
 
-    created_keys: list[str] = []
+    created_pairs: list[tuple[str, str]] = []  # (jira_key, title)
     for output in proposed:
         try:
             jira_key = create_story_under_epic(
@@ -482,15 +482,18 @@ def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
                 run_id=run_id,
                 description=output.get("description"),
                 acceptance_criteria=output.get("acceptance_criteria"),
+                rationale=output.get("rationale"),
+                dependency_notes=output.get("dependency_notes"),
+                risk_notes=output.get("risk_notes"),
             )
             update_planning_output_status(output["id"], "CREATED", jira_key)
-            created_keys.append(jira_key)
+            created_pairs.append((jira_key, output["title"]))
             logger.info(
                 "create_jira_stories_for_run: created %s — %s",
                 jira_key, output["title"][:60],
             )
         except Exception as exc:
-            partial = ", ".join(created_keys) or "none"
+            partial = ", ".join(k for k, _ in created_pairs) or "none"
             logger.error(
                 "create_jira_stories_for_run: failed at seq %s — %s",
                 output["sequence_number"], exc,
@@ -508,13 +511,13 @@ def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
             )
             return
 
-    complete_planning_run(run_id, len(created_keys))
-    keys_str = ", ".join(created_keys)
+    complete_planning_run(run_id, len(created_pairs))
+    story_lines = "\n".join(f"  {k}: {t}" for k, t in created_pairs)
     send_message(
         "epic_breakdown_complete", "COMPLETE",
-        f"{issue_key}: {len(created_keys)} Stories created\n{keys_str}",
+        f"{issue_key}: {len(created_pairs)} Stories created (run_id={run_id})\n{story_lines}",
     )
     logger.info(
         "create_jira_stories_for_run: %d Stories created for %s — %s",
-        len(created_keys), issue_key, keys_str,
+        len(created_pairs), issue_key, ", ".join(k for k, _ in created_pairs),
     )

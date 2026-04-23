@@ -19,7 +19,22 @@ def _api_url(path: str) -> str:
     return f"{base}/rest/api/3{path}"
 
 
-def _adf_body(description: str | None, acceptance_criteria: str | None, run_id: int, parent_key: str) -> dict:
+def _adf_section_header(text: str) -> dict:
+    return {
+        "type": "paragraph",
+        "content": [{"type": "text", "text": text, "marks": [{"type": "strong"}]}],
+    }
+
+
+def _adf_body(
+    description: str | None,
+    acceptance_criteria: str | None,
+    run_id: int,
+    parent_key: str,
+    rationale: str | None = None,
+    dependency_notes: str | None = None,
+    risk_notes: str | None = None,
+) -> dict:
     """Build an Atlassian Document Format body for a Jira Cloud Story description."""
     content = []
 
@@ -30,10 +45,7 @@ def _adf_body(description: str | None, acceptance_criteria: str | None, run_id: 
         })
 
     if acceptance_criteria:
-        content.append({
-            "type": "paragraph",
-            "content": [{"type": "text", "text": "Acceptance Criteria:", "marks": [{"type": "strong"}]}],
-        })
+        content.append(_adf_section_header("Acceptance Criteria:"))
         for line in acceptance_criteria.splitlines():
             line = line.strip().lstrip("- ").strip()
             if line:
@@ -47,6 +59,27 @@ def _adf_body(description: str | None, acceptance_criteria: str | None, run_id: 
                         }],
                     }],
                 })
+
+    if rationale:
+        content.append(_adf_section_header("Rationale:"))
+        content.append({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": rationale}],
+        })
+
+    if dependency_notes:
+        content.append(_adf_section_header("Dependencies:"))
+        content.append({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": dependency_notes}],
+        })
+
+    if risk_notes:
+        content.append(_adf_section_header("Risks:"))
+        content.append({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": risk_notes}],
+        })
 
     # Traceability footer
     content.append({
@@ -68,6 +101,9 @@ def create_story_under_epic(
     run_id: int,
     description: str | None = None,
     acceptance_criteria: str | None = None,
+    rationale: str | None = None,
+    dependency_notes: str | None = None,
+    risk_notes: str | None = None,
 ) -> str:
     """Create a Jira Story as a child of the given Epic. Returns the created issue key.
 
@@ -84,7 +120,12 @@ def create_story_under_epic(
         "issuetype": {"name": "Story"},
         "summary":   title,
         "parent":    {"key": epic_key},
-        "description": _adf_body(description, acceptance_criteria, run_id, epic_key),
+        "description": _adf_body(
+            description, acceptance_criteria, run_id, epic_key,
+            rationale=rationale,
+            dependency_notes=dependency_notes,
+            risk_notes=risk_notes,
+        ),
         "labels": ["ai-generated"],
     }
 
