@@ -68,7 +68,7 @@ def _collect_key_files(repo_path: str, primary_language: str) -> list[tuple[str,
 
 
 def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
-    """Call Claude Haiku to produce a 3-5 sentence technical summary of the repo.
+    """Call Claude Sonnet to produce a 3-5 sentence technical summary of the repo.
 
     Uses prompt caching on the stable system prompt to reduce cost on repeated calls.
     Returns the summary string.
@@ -94,7 +94,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     )
 
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-sonnet-4-6",
         max_tokens=512,
         system=[{
             "type": "text",
@@ -106,7 +106,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 
     summary = next((b.text for b in response.content if b.type == "text"), "")
     logger.info(
-        "Claude summary done — cache_read=%s input=%s output=%s",
+        "Claude summary done (sonnet) — cache_read=%s input=%s output=%s",
         response.usage.cache_read_input_tokens,
         response.usage.input_tokens,
         response.usage.output_tokens,
@@ -115,7 +115,7 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
 
 
 def suggest_change(repo_path: str, analysis: dict) -> dict:
-    """Ask Claude Haiku to suggest one targeted code improvement.
+    """Ask Claude Sonnet to suggest one targeted code improvement.
 
     Picks the first non-README entry-point file, sends it to Claude, and returns
     a dict with keys: file, description, original, replacement.
@@ -140,8 +140,8 @@ def suggest_change(repo_path: str, analysis: dict) -> dict:
     user_content = f"File: {target_file}\n\n```\n{target_content}\n```\n\nSuggest one small improvement."
 
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
         system=[{
             "type": "text",
             "text": SUGGEST_PROMPT,
@@ -152,7 +152,7 @@ def suggest_change(repo_path: str, analysis: dict) -> dict:
 
     raw = next((b.text for b in response.content if b.type == "text"), "{}")
     logger.info(
-        "Claude suggestion done — input=%s output=%s",
+        "Claude suggestion done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
