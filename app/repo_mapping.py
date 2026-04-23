@@ -118,10 +118,12 @@ def disable_mapping(mapping_id: int) -> bool:
 
 
 def upsert_seed_mappings(mappings: list[dict]) -> int:
-    """Insert seed mappings that do not already exist as active entries.
+    """Insert or update seed mappings.
 
-    Matches on (jira_project_key, issue_type, repo_slug). Skips rows where
-    an active match already exists. Returns the count of rows inserted.
+    Matches on (jira_project_key, issue_type, repo_slug). Inserts new rows;
+    updates base_branch, notes, and auto_merge_enabled on existing ones so
+    config changes in seed_mappings.json propagate on worker restart.
+    Returns the count of rows inserted (updates are not counted).
     """
     inserted = 0
     with get_conn() as conn:
@@ -138,24 +140,41 @@ def upsert_seed_mappings(mappings: list[dict]) -> int:
                     """,
                     (m["jira_project_key"], m.get("issue_type"), m.get("issue_type"), m["repo_slug"]),
                 )
-                if cur.fetchone():
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO repo_mappings
-                        (jira_project_key, issue_type, repo_slug, base_branch, notes, auto_merge_enabled)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        m["jira_project_key"],
-                        m.get("issue_type"),
-                        m["repo_slug"],
-                        m.get("base_branch", "main"),
-                        m.get("notes"),
-                        m.get("auto_merge_enabled", False),
-                    ),
-                )
-                inserted += 1
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        """
+                        UPDATE repo_mappings
+                           SET base_branch = %s,
+                               notes = %s,
+                               auto_merge_enabled = %s,
+                               updated_at = NOW()
+                         WHERE id = %s
+                        """,
+                        (
+                            m.get("base_branch", "main"),
+                            m.get("notes"),
+                            m.get("auto_merge_enabled", False),
+                            row[0],
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO repo_mappings
+                            (jira_project_key, issue_type, repo_slug, base_branch, notes, auto_merge_enabled)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            m["jira_project_key"],
+                            m.get("issue_type"),
+                            m["repo_slug"],
+                            m.get("base_branch", "main"),
+                            m.get("notes"),
+                            m.get("auto_merge_enabled", False),
+                        ),
+                    )
+                    inserted += 1
     if inserted:
         logger.info("Seed mappings: inserted %d new mapping(s)", inserted)
     else:
