@@ -14,6 +14,8 @@ from app.database import (
     add_planning_output, get_planning_outputs, update_planning_output_status,
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
     get_created_children_for_epic, store_planning_metadata,
+    record_planning_feedback, record_execution_feedback,
+    get_planning_memory, get_execution_memory,
 )
 from app.test_runner import run_tests
 
@@ -61,6 +63,18 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
 
+    # --- Memory context for execution prompts ---
+    execution_memory = ""
+    try:
+        execution_memory = get_execution_memory(mapping["repo_slug"])
+        if execution_memory:
+            logger.info(
+                "story_implementation: injecting %d chars of execution memory (run_id=%s)",
+                len(execution_memory), run_id,
+            )
+    except Exception as mem_exc:
+        logger.warning("story_implementation: get_execution_memory failed (non-fatal): %s", mem_exc)
+
     update_run_step(run_id, "cloning")
     repo_path = clone_repo(
         run_id=run_id,
@@ -82,7 +96,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     logger.info("story_implementation: Claude summary sent to Telegram")
 
     update_run_step(run_id, "suggesting")
-    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary)
+    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=execution_memory)
     changes = suggestion_result.get("changes", [])
     suggestion_summary = suggestion_result.get("summary", "")
     files_str = ", ".join(c.get("file", "") for c in changes)
@@ -144,6 +158,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             issue_summary=summary,
             previous_changes=changes,
             test_output=test_result["output"],
+            memory_context=execution_memory,
         )
         fix_applied = apply_changes(repo_path, fix_result.get("changes", []))
         if fix_applied["applied"]:
@@ -373,6 +388,7 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
             f"Duplicate breakdown blocked: {issue_key} already has {existing['count']} "
             f"Stories created by run {existing['run_id']}.",
         )
+        record_planning_feedback(run_id)
         send_message(
             "planning_duplicate_blocked", "BLOCKED",
             f"{issue_key}: already has {existing['count']} Stories from run {existing['run_id']}.\n"
@@ -380,13 +396,30 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
         )
         return
 
+    # --- Memory context for planning prompt ---
+    jira_project_key = issue_key.split("-")[0]
+    memory_context = ""
+    try:
+        story_mapping = get_mapping(jira_project_key, "Story")
+        if story_mapping:
+            repo_slug = story_mapping["repo_slug"]
+            memory_context = get_planning_memory(repo_slug, issue_key)
+            if memory_context:
+                logger.info(
+                    "epic_breakdown: injecting %d chars of memory context (run_id=%s)",
+                    len(memory_context), run_id,
+                )
+    except Exception as mem_exc:
+        logger.warning("epic_breakdown: get_planning_memory failed (non-fatal): %s", mem_exc)
+
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")
     try:
-        plan = plan_epic_breakdown(issue_key, summary)
+        plan = plan_epic_breakdown(issue_key, summary, memory_context=memory_context)
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")
+        record_planning_feedback(run_id)
         send_message("epic_breakdown_failed", "FAILED", f"{issue_key}: {exc}")
         return
 
@@ -515,6 +548,8 @@ def create_jira_stories_for_run(run_id: int, issue_key: str) -> None:
             return
 
     complete_planning_run(run_id, len(created_pairs))
+    n_events = record_planning_feedback(run_id)
+    logger.info("create_jira_stories_for_run: recorded %d feedback events (run_id=%s)", n_events, run_id)
     story_lines = "\n".join(f"  {k}: {t}" for k, t in created_pairs)
     send_message(
         "epic_breakdown_complete", "COMPLETE",

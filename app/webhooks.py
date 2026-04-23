@@ -7,7 +7,7 @@ from app.database import (
     get_conn,
     get_pending_planning_run, approve_planning_run, reject_planning_run,
     request_regeneration, create_planning_run,
-    get_planning_run_for_regeneration,
+    get_planning_run_for_regeneration, record_planning_feedback,
 )
 from app.dispatcher import dispatch
 from app.telegram import send_message, parse_approval_command
@@ -126,15 +126,18 @@ async def telegram_webhook(request: Request):
 
     elif action == "REJECT":
         reject_planning_run(run_id)
+        n_events = record_planning_feedback(run_id)
+        logger.info("Planning run %s REJECTED for %s — %d feedback events recorded", run_id, issue_key, n_events)
         send_message(
             "epic_breakdown_rejected", "REJECTED",
             f"{issue_key}: proposal rejected (run_id={run_id})\n"
             f"No Jira Stories will be created.",
         )
-        logger.info("Planning run %s REJECTED for %s", run_id, issue_key)
 
     elif action == "REGENERATE":
         request_regeneration(run_id)
+        n_events = record_planning_feedback(run_id)
+        logger.info("Planning run %s REGENERATE_REQUESTED for %s — %d feedback events recorded", run_id, issue_key, n_events)
         new_run_id = create_planning_run(
             issue_key=issue_key,
             workflow_type=run["workflow_type"],
