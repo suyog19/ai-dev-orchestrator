@@ -20,5 +20,5 @@ jobs:
 
       - name: Verify health
         run: |
-          sleep 5
+          sleep 15
           curl -sf http://localhost:8000/healthz
