@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import sys
 from fastapi import FastAPI
@@ -113,3 +115,37 @@ def modify_repo_mapping(mapping_id: int, body: RepoMappingUpdate):
 def deactivate_repo_mapping(mapping_id: int):
     if not disable_mapping(mapping_id):
         raise HTTPException(status_code=404, detail=f"No mapping found for id={mapping_id}")
+
+
+# ---------------------------------------------------------------------------
+# Mapping health / parity endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/mapping-health")
+def mapping_health():
+    """Return active mappings and a fingerprint for quick cross-environment parity checks.
+
+    Compare fingerprint values from dev and prod to detect drift instantly.
+    """
+    all_mappings = get_all_mappings()
+    active = [
+        {
+            "jira_project_key": m["jira_project_key"],
+            "issue_type": m["issue_type"],
+            "repo_slug": m["repo_slug"],
+            "base_branch": m["base_branch"],
+        }
+        for m in all_mappings
+        if m["is_active"]
+    ]
+    # Sort for deterministic fingerprint regardless of insertion order
+    active_sorted = sorted(active, key=lambda m: (m["jira_project_key"], m["issue_type"] or ""))
+    fingerprint = hashlib.sha256(
+        json.dumps(active_sorted, sort_keys=True).encode()
+    ).hexdigest()[:10]
+
+    return {
+        "active_count": len(active_sorted),
+        "fingerprint": fingerprint,
+        "mappings": active_sorted,
+    }

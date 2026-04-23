@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import logging
 import threading
@@ -15,7 +16,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run, update_run_step
+from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation
@@ -59,6 +60,7 @@ def _execute(job: dict):
         logger.info("Workflow started: %s (run_id=%s)", workflow_type, run_id)
         _update_run_status(run_id, "RUNNING")
         send_message("workflow", "RUNNING", f"{issue_key}: {summary}")
+        work_dir = f"/tmp/workflows/{run_id}"
 
         try:
             handler(run_id, issue_key, issue_type, summary)
@@ -68,6 +70,13 @@ def _execute(job: dict):
             fail_run(run_id, error_msg)
             send_message("workflow", "FAILED", f"{issue_key}: {error_msg}")
             return
+        finally:
+            if os.path.isdir(work_dir):
+                try:
+                    shutil.rmtree(work_dir)
+                    logger.info("Workspace cleaned up: %s", work_dir)
+                except Exception as cleanup_exc:
+                    logger.warning("Workspace cleanup failed for %s: %s", work_dir, cleanup_exc)
 
         _update_run_status(run_id, "COMPLETED")
         logger.info("Workflow completed: %s (run_id=%s)", workflow_type, run_id)
@@ -77,6 +86,13 @@ def _execute(job: dict):
 def main():
     logger.info("Worker started (MAX_WORKERS=%s)", MAX_WORKERS)
     init_db()
+
+    recovered = recover_stale_runs()
+    if recovered:
+        logger.warning("Startup recovery: marked %d stale RUNNING run(s) as FAILED", recovered)
+        send_message("startup", "RECOVERY", f"{recovered} stale run(s) recovered — were left RUNNING before restart")
+    else:
+        logger.info("Startup recovery: no stale runs found")
 
     while True:
         try:
