@@ -215,27 +215,24 @@ def _run_row_to_dict(row, cols: list[str]) -> dict:
 
 @app.get("/debug/workflow-runs")
 def list_workflow_runs(limit: int = 10):
-    """Return most recent workflow runs, newest first."""
+    """Return most recent workflow runs, newest first. error_detail truncated to 300 chars."""
+    select_cols = [
+        "left(error_detail, 300) AS error_detail" if c == "error_detail" else c
+        for c in _RUN_COLS_LIST
+    ]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"""
-                SELECT {", ".join(_RUN_COLS_LIST)},
-                       left(error_detail, 200) as error_detail_trunc
-                FROM workflow_runs
-                ORDER BY id DESC
-                LIMIT %s
-                """,
+                f"SELECT {', '.join(select_cols)} FROM workflow_runs ORDER BY id DESC LIMIT %s",
                 (min(limit, 50),),
             )
             rows = cur.fetchall()
-    cols = _RUN_COLS_LIST[:-1] + ["error_detail"] + [_RUN_COLS_LIST[-1]]
     return [_run_row_to_dict(row, _RUN_COLS_LIST) for row in rows]
 
 
 @app.get("/debug/workflow-runs/{run_id}")
 def get_workflow_run(run_id: int):
-    """Return full detail for a single workflow run including test output."""
+    """Return full detail for a single workflow run including attempts and full test output."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -243,6 +240,33 @@ def get_workflow_run(run_id: int):
                 (run_id,),
             )
             row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"No run found for id={run_id}")
-    return _run_row_to_dict(row, _RUN_COLS_DETAIL)
+            if not row:
+                raise HTTPException(status_code=404, detail=f"No run found for id={run_id}")
+            cur.execute(
+                """
+                SELECT attempt_number, attempt_type, model_used, status,
+                       started_at, completed_at, test_status, files_touched, failure_summary
+                FROM workflow_attempts
+                WHERE run_id = %s
+                ORDER BY attempt_number
+                """,
+                (run_id,),
+            )
+            attempt_rows = cur.fetchall()
+
+    result = _run_row_to_dict(row, _RUN_COLS_DETAIL)
+    result["attempts"] = [
+        {
+            "attempt_number": r[0],
+            "attempt_type": r[1],
+            "model_used": r[2],
+            "status": r[3],
+            "started_at": r[4].isoformat() if r[4] else None,
+            "completed_at": r[5].isoformat() if r[5] else None,
+            "test_status": r[6],
+            "files_touched": r[7],
+            "failure_summary": r[8],
+        }
+        for r in attempt_rows
+    ]
+    return result
