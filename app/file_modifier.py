@@ -82,8 +82,10 @@ def apply_suggestion(repo_path: str, suggestion: dict) -> dict:
 def apply_changes(repo_path: str, changes: list[dict]) -> dict:
     """Apply a list of Claude's suggested changes atomically.
 
-    Validates ALL changes before writing any. If any validation fails, no files are written.
-    Enforces MAX_CHANGED_FILES limit.
+    Multiple changes to the same file are applied sequentially in memory before
+    any file is written, so they compose correctly and don't overwrite each other.
+    Validates all changes first; if any fail, no files are written.
+    Enforces MAX_CHANGED_FILES unique-file limit.
 
     Returns:
         {"applied": True, "files": [str, ...], "count": int}
@@ -92,20 +94,26 @@ def apply_changes(repo_path: str, changes: list[dict]) -> dict:
     if not changes:
         return {"applied": False, "reason": "empty changes list", "failed_file": ""}
 
-    if len(changes) > MAX_CHANGED_FILES:
-        logger.warning("apply_changes: truncated %d changes to %d", len(changes), MAX_CHANGED_FILES)
-        changes = changes[:MAX_CHANGED_FILES]
-
-    validated: list[tuple[str, str, str, str]] = []  # (abs_path, new_content, rel_path, description)
-
+    # Group changes by file, preserving first-seen order
+    file_order: list[str] = []
+    by_file: dict[str, list[dict]] = {}
     for change in changes:
         rel_path = change.get("file", "")
-        original = change.get("original", "")
-        replacement = change.get("replacement", "")
-        description = change.get("description", "")
+        if rel_path not in by_file:
+            file_order.append(rel_path)
+            by_file[rel_path] = []
+        by_file[rel_path].append(change)
 
-        if not rel_path or not original:
-            return {"applied": False, "reason": "empty file or original", "failed_file": rel_path}
+    if len(file_order) > MAX_CHANGED_FILES:
+        logger.warning("apply_changes: truncated %d unique files to %d", len(file_order), MAX_CHANGED_FILES)
+        file_order = file_order[:MAX_CHANGED_FILES]
+
+    # Validate each file: apply all its changes sequentially in memory
+    validated: list[tuple[str, str, str]] = []  # (abs_path, final_content, rel_path)
+
+    for rel_path in file_order:
+        if not rel_path:
+            return {"applied": False, "reason": "empty file path", "failed_file": ""}
 
         if not _check_path_safe(repo_path, rel_path):
             logger.warning("apply_changes: path traversal rejected — %s", rel_path)
@@ -117,31 +125,42 @@ def apply_changes(repo_path: str, changes: list[dict]) -> dict:
             return {"applied": False, "reason": "file not found", "failed_file": rel_path}
 
         with open(abs_path, encoding="utf-8") as f:
-            content = f.read()
+            current_content = f.read()
 
-        if original not in content:
-            logger.warning("apply_changes: original text not found in %s", rel_path)
-            return {"applied": False, "reason": "original text not found", "failed_file": rel_path}
+        descriptions: list[str] = []
+        for change in by_file[rel_path]:
+            original = change.get("original", "")
+            replacement = change.get("replacement", "")
+            description = change.get("description", "")
 
-        if original == replacement:
-            logger.warning("apply_changes: no-op change — %s", rel_path)
-            return {"applied": False, "reason": "no-op: original equals replacement", "failed_file": rel_path}
+            if not original:
+                return {"applied": False, "reason": "empty original", "failed_file": rel_path}
 
-        new_content = content.replace(original, replacement, 1)
+            if original not in current_content:
+                logger.warning("apply_changes: original text not found in %s", rel_path)
+                return {"applied": False, "reason": "original text not found", "failed_file": rel_path}
+
+            if original == replacement:
+                logger.warning("apply_changes: no-op change — %s", rel_path)
+                return {"applied": False, "reason": "no-op: original equals replacement", "failed_file": rel_path}
+
+            current_content = current_content.replace(original, replacement, 1)
+            descriptions.append(description)
 
         if rel_path.endswith(".py"):
             try:
-                ast.parse(new_content)
+                ast.parse(current_content)
             except SyntaxError as exc:
                 logger.warning("apply_changes: syntax error in %s — %s", rel_path, exc)
                 return {"applied": False, "reason": f"syntax error: {exc}", "failed_file": rel_path}
 
-        validated.append((abs_path, new_content, rel_path, description))
+        validated.append((abs_path, current_content, rel_path))
+        logger.info("apply_changes: validated %s (%d change(s))", rel_path, len(descriptions))
 
-    for abs_path, new_content, rel_path, description in validated:
+    for abs_path, final_content, rel_path in validated:
         with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        logger.info("apply_changes: wrote %s — %s", rel_path, description)
+            f.write(final_content)
+        logger.info("apply_changes: wrote %s", rel_path)
 
     files = [v[2] for v in validated]
     return {"applied": True, "files": files, "count": len(files)}

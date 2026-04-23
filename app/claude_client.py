@@ -54,8 +54,10 @@ FIX_PROMPT = (
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
     "Call the apply_code_changes tool with one to three concrete code changes that together fully implement "
-    "what the story describes. Each change must be in a different file. Only include a change in a file "
-    "if that file genuinely needs to change to satisfy the story. "
+    "what the story describes. Each entry in the changes array must target a DIFFERENT file — never repeat "
+    "the same file path twice. If a file needs multiple edits (e.g. a new import plus a new function), "
+    "combine them into one contiguous original/replacement block for that file. "
+    "Only include a file if it genuinely needs to change to satisfy the story. "
     "If the story is not directly actionable, suggest the most relevant improvement in any of the files. "
     "Each change must be: specific (reference exact existing text), safe (no breaking changes unless "
     "fixing a clear bug), and complete (all lines needed in that file in one contiguous block). "
