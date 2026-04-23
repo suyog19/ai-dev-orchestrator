@@ -1,9 +1,7 @@
 import logging
 import sys
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
-
-from fastapi import HTTPException
 from pydantic import BaseModel
 
 from app.database import init_db
