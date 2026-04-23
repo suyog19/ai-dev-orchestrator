@@ -90,6 +90,9 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS approval_requested_at        TIMESTAMP    NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS approval_received_at         TIMESTAMP    NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS created_jira_children_count  INTEGER      NULL",
+                # Phase 6 Iteration 8 — store planning metadata for API inspection
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS assumptions_json    TEXT NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS open_questions_json TEXT NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -494,6 +497,100 @@ def complete_planning_run(run_id: int, created_count: int):
                 """,
                 (created_count, run_id),
             )
+
+
+def store_planning_metadata(run_id: int, assumptions: list, open_questions: list):
+    """Persist assumptions and open_questions lists from a Claude planning response."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET assumptions_json=%s, open_questions_json=%s, updated_at=NOW()
+                WHERE id=%s
+                """,
+                (json.dumps(assumptions), json.dumps(open_questions), run_id),
+            )
+
+
+def list_planning_runs(limit: int = 10) -> list[dict]:
+    """Return recent planning runs, newest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, status, approval_status,
+                       current_step, created_jira_children_count,
+                       error_detail, created_at, completed_at,
+                       approval_requested_at, approval_received_at
+                FROM workflow_runs
+                WHERE workflow_type IN ('epic_breakdown', 'feature_breakdown')
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (min(limit, 50),),
+            )
+            cols = [
+                "id", "issue_key", "workflow_type", "status", "approval_status",
+                "current_step", "created_jira_children_count",
+                "error_detail", "created_at", "completed_at",
+                "approval_requested_at", "approval_received_at",
+            ]
+            return [
+                {c: (v.isoformat() if hasattr(v, "isoformat") else v) for c, v in zip(cols, row)}
+                for row in cur.fetchall()
+            ]
+
+
+def get_planning_run_detail(run_id: int) -> dict | None:
+    """Return full detail for a planning run including all proposed/created items."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, status, approval_status,
+                       current_step, created_jira_children_count, error_detail,
+                       created_at, completed_at,
+                       approval_requested_at, approval_received_at,
+                       assumptions_json, open_questions_json
+                FROM workflow_runs
+                WHERE id = %s
+                  AND workflow_type IN ('epic_breakdown', 'feature_breakdown')
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [
+                "id", "issue_key", "workflow_type", "status", "approval_status",
+                "current_step", "created_jira_children_count", "error_detail",
+                "created_at", "completed_at",
+                "approval_requested_at", "approval_received_at",
+                "assumptions_json", "open_questions_json",
+            ]
+            result = {c: (v.isoformat() if hasattr(v, "isoformat") else v) for c, v in zip(cols, row)}
+            result["assumptions"] = json.loads(result.pop("assumptions_json") or "[]")
+            result["open_questions"] = json.loads(result.pop("open_questions_json") or "[]")
+
+            cur.execute(
+                """
+                SELECT sequence_number, title, status, created_issue_key,
+                       confidence, description, acceptance_criteria,
+                       rationale, dependency_notes, risk_notes
+                FROM planning_outputs
+                WHERE run_id = %s
+                ORDER BY sequence_number
+                """,
+                (run_id,),
+            )
+            item_cols = [
+                "sequence_number", "title", "status", "created_issue_key",
+                "confidence", "description", "acceptance_criteria",
+                "rationale", "dependency_notes", "risk_notes",
+            ]
+            result["items"] = [dict(zip(item_cols, r)) for r in cur.fetchall()]
+    return result
 
 
 def get_created_children_for_epic(issue_key: str, exclude_run_id: int) -> dict | None:

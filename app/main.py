@@ -8,7 +8,11 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from app.database import init_db, get_conn
+from app.database import (
+    init_db, get_conn,
+    list_planning_runs, get_planning_run_detail,
+    approve_planning_run, reject_planning_run,
+)
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
@@ -138,6 +142,70 @@ def modify_repo_mapping(mapping_id: int, body: RepoMappingUpdate):
 def deactivate_repo_mapping(mapping_id: int):
     if not disable_mapping(mapping_id):
         raise HTTPException(status_code=404, detail=f"No mapping found for id={mapping_id}")
+
+
+# ---------------------------------------------------------------------------
+# Planning run inspection
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/planning-runs")
+def list_planning_runs_endpoint(limit: int = 10):
+    """Return recent planning runs (epic_breakdown / feature_breakdown), newest first."""
+    return list_planning_runs(limit)
+
+
+@app.get("/debug/planning-runs/{run_id}")
+def get_planning_run_endpoint(run_id: int):
+    """Return full detail for a planning run: items, approval status, assumptions, open questions."""
+    run = get_planning_run_detail(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"No planning run found for id={run_id}")
+    return run
+
+
+@app.post("/debug/planning-runs/{run_id}/approve", status_code=200)
+def approve_planning_run_endpoint(run_id: int):
+    """Approve a pending planning run and trigger Jira child creation.
+
+    Equivalent to sending APPROVE <run_id> via Telegram.
+    Only works when the run is in WAITING_FOR_APPROVAL + approval_status=PENDING.
+    """
+    from app.database import get_pending_planning_run
+    from app.workflows import create_jira_stories_for_run
+    run = get_pending_planning_run(run_id)
+    if not run:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending planning run for id={run_id} (must be WAITING_FOR_APPROVAL + PENDING)",
+        )
+    approve_planning_run(run_id)
+    issue_key = run.get("issue_key") or run.get("parent_issue_key", "?")
+    create_jira_stories_for_run(run_id, issue_key)
+    return {"approved": True, "run_id": run_id, "issue_key": issue_key}
+
+
+@app.post("/debug/planning-runs/{run_id}/reject", status_code=200)
+def reject_planning_run_endpoint(run_id: int):
+    """Reject a pending planning run.
+
+    Equivalent to sending REJECT <run_id> via Telegram.
+    Only works when the run is in WAITING_FOR_APPROVAL + approval_status=PENDING.
+    """
+    from app.database import get_pending_planning_run
+    from app.telegram import send_message
+    run = get_pending_planning_run(run_id)
+    if not run:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending planning run for id={run_id} (must be WAITING_FOR_APPROVAL + PENDING)",
+        )
+    reject_planning_run(run_id)
+    issue_key = run.get("issue_key") or run.get("parent_issue_key", "?")
+    send_message(
+        "epic_breakdown_rejected", "REJECTED",
+        f"{issue_key}: proposal rejected via HTTP debug endpoint (run_id={run_id})",
+    )
+    return {"rejected": True, "run_id": run_id, "issue_key": issue_key}
 
 
 # ---------------------------------------------------------------------------

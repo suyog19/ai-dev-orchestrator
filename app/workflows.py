@@ -13,7 +13,7 @@ from app.database import (
     record_attempt, complete_attempt,
     add_planning_output, get_planning_outputs, update_planning_output_status,
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
-    get_created_children_for_epic,
+    get_created_children_for_epic, store_planning_metadata,
 )
 from app.test_runner import run_tests
 
@@ -416,6 +416,11 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
 
     logger.info("epic_breakdown: stored %d proposals (run_id=%s)", len(output_ids), run_id)
 
+    # --- Persist metadata for API inspection ---
+    assumptions = plan.get("assumptions") or []
+    open_questions = plan.get("open_questions") or []
+    store_planning_metadata(run_id, assumptions, open_questions)
+
     # --- Request approval ---
     request_planning_approval(run_id)
     set_run_waiting_for_approval(run_id)
@@ -424,8 +429,6 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
         f"  {i}. {item.get('title', '?')} [{item.get('confidence', '?')}]"
         for i, item in enumerate(items, 1)
     )
-    assumptions = plan.get("assumptions") or []
-    open_questions = plan.get("open_questions") or []
     extra = ""
     if assumptions:
         extra += "\nAssumptions:\n" + "\n".join(f"  - {a}" for a in assumptions)
