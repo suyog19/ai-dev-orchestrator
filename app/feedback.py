@@ -57,3 +57,51 @@ class MemoryKind:
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5
 MEMORY_MAX_CHARS   = 1000
+
+
+def categorize_execution_failure(
+    test_status: str | None,
+    merge_status: str | None,
+    error_detail: str | None,
+    current_step: str | None,
+) -> str:
+    """Return the most specific FailureCategory for a failed story_implementation run.
+
+    Priority order: most observable signal first, then string patterns, then fallback.
+    """
+    err = (error_detail or "").lower()
+
+    if test_status in ("FAILED", "ERROR"):
+        return FailureCategory.TEST_FAILURE
+    if "interrupted by worker restart" in err:
+        return FailureCategory.WORKER_INTERRUPTED
+    if "syntax error" in err or "syntaxerror" in err:
+        return FailureCategory.SYNTAX_FAILURE
+    if any(p in err for p in (
+        "path traversal", "original text not found",
+        "file not found", "no-op", "empty changes",
+    )):
+        return FailureCategory.APPLY_VALIDATION_FAILURE
+    if merge_status == "FAILED" or "merge" in (current_step or "").lower():
+        return FailureCategory.MERGE_FAILURE
+    return FailureCategory.UNKNOWN
+
+
+def categorize_planning_failure(
+    error_detail: str | None,
+    current_step: str | None,
+) -> str:
+    """Return the most specific FailureCategory for a failed epic_breakdown run."""
+    err = (error_detail or "").lower()
+
+    if "duplicate breakdown blocked" in err:
+        return FailureCategory.DUPLICATE_BLOCKED
+    if "rejected by user" in err:
+        return FailureCategory.APPROVAL_REJECTED
+    if "regeneration requested" in err:
+        return FailureCategory.APPROVAL_REGENERATED
+    if "jira creation failed" in err or (current_step or "") == "creating_jira_issues":
+        return FailureCategory.JIRA_CREATION_FAILURE
+    if "interrupted by worker restart" in err:
+        return FailureCategory.WORKER_INTERRUPTED
+    return FailureCategory.UNKNOWN

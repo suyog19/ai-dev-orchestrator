@@ -534,14 +534,14 @@ def record_execution_feedback(run_id: int) -> int:
     Should be called from the worker after the run reaches its final status
     (COMPLETED or FAILED). Returns the number of events written.
     """
-    from app.feedback import FeedbackSource, FeedbackType, FailureCategory
+    from app.feedback import FeedbackSource, FeedbackType, categorize_execution_failure
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT issue_key, status, test_status, retry_count,
-                       merge_status, files_changed_count, error_detail
+                       merge_status, files_changed_count, error_detail, current_step
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -549,7 +549,8 @@ def record_execution_feedback(run_id: int) -> int:
             row = cur.fetchone()
             if not row:
                 return 0
-            issue_key, status, test_status, retry_count, merge_status, files_changed_count, error_detail = row
+            issue_key, status, test_status, retry_count, merge_status, \
+                files_changed_count, error_detail, current_step = row
 
             # Resolve repo_slug from active mapping for this project
             repo_slug = None
@@ -582,14 +583,9 @@ def record_execution_feedback(run_id: int) -> int:
                 _ev(FeedbackType.EXECUTION_COMPLETED, "true")
             else:
                 _ev(FeedbackType.EXECUTION_FAILED, "true")
-                # Basic categorisation — refined further in Iteration 3
-                err = (error_detail or "").lower()
-                if test_status in ("FAILED", "ERROR"):
-                    category = FailureCategory.TEST_FAILURE
-                elif "interrupted by worker restart" in err:
-                    category = FailureCategory.WORKER_INTERRUPTED
-                else:
-                    category = FailureCategory.UNKNOWN
+                category = categorize_execution_failure(
+                    test_status, merge_status, error_detail, current_step,
+                )
                 _ev(FeedbackType.FAILURE_CATEGORY, category)
 
             if test_status:
@@ -624,7 +620,7 @@ def record_planning_feedback(run_id: int) -> int:
     (COMPLETED, REJECTED, REGENERATE_REQUESTED).
     Returns the number of events written.
     """
-    from app.feedback import FeedbackSource, FeedbackType, FailureCategory
+    from app.feedback import FeedbackSource, FeedbackType, FailureCategory, categorize_planning_failure
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -632,7 +628,7 @@ def record_planning_feedback(run_id: int) -> int:
                 """
                 SELECT issue_key, approval_status,
                        approval_requested_at, approval_received_at,
-                       error_detail
+                       error_detail, status, current_step
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -640,7 +636,7 @@ def record_planning_feedback(run_id: int) -> int:
             row = cur.fetchone()
             if not row:
                 return 0
-            issue_key, approval_status, req_at, recv_at, error_detail = row
+            issue_key, approval_status, req_at, recv_at, error_detail, run_status, current_step = row
 
             cur.execute(
                 "SELECT COUNT(*) FROM planning_outputs WHERE run_id = %s",
@@ -683,6 +679,12 @@ def record_planning_feedback(run_id: int) -> int:
                 _ev(FeedbackType.PLANNING_REGENERATED, "true",
                     {"reason": error_detail} if error_detail else None)
                 _ev(FeedbackType.FAILURE_CATEGORY, FailureCategory.APPROVAL_REGENERATED)
+
+            # Catch FAILED runs not covered by the approval_status branches above:
+            # duplicate_blocked, jira_creation_failure, worker_interrupted, etc.
+            elif run_status == "FAILED":
+                category = categorize_planning_failure(error_detail, current_step)
+                _ev(FeedbackType.FAILURE_CATEGORY, category)
 
             if not events:
                 return 0
