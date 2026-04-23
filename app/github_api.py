@@ -77,3 +77,31 @@ def _get_existing_pr(slug: str, head_branch: str, base_branch: str) -> dict:
     data = prs[0]
     logger.info("Found existing PR: #%s — %s", data["number"], data["html_url"])
     return {"number": data["number"], "url": data["html_url"], "title": data["title"]}
+
+
+def ensure_label(repo_name: str, name: str, color: str = "0075ca", description: str = "") -> None:
+    """Create the label if it doesn't already exist on the repo. Silently no-ops if present."""
+    slug = _normalize_slug(repo_name)
+    response = requests.post(
+        f"{GITHUB_API}/repos/{slug}/labels",
+        json={"name": name, "color": color, "description": description},
+        headers=_headers(),
+        timeout=15,
+    )
+    if response.status_code == 422:
+        return  # already exists
+    response.raise_for_status()
+    logger.info("Label created: %s on %s", name, slug)
+
+
+def add_label_to_pr(repo_name: str, pr_number: int, label_name: str) -> None:
+    """Apply a label to an existing PR by number."""
+    slug = _normalize_slug(repo_name)
+    response = requests.post(
+        f"{GITHUB_API}/repos/{slug}/issues/{pr_number}/labels",
+        json={"labels": [label_name]},
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    logger.info("Label '%s' applied to PR #%s", label_name, pr_number)
