@@ -13,6 +13,7 @@ from app.database import (
     record_attempt, complete_attempt,
     add_planning_output, get_planning_outputs, update_planning_output_status,
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
+    get_created_children_for_epic,
 )
 from app.test_runner import run_tests
 
@@ -359,6 +360,25 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     update_run_step(run_id, "planning")
     update_run_field(run_id, parent_issue_key=issue_key)
     send_message("epic_breakdown_started", "RUNNING", f"{issue_key}: {summary}")
+
+    # --- Idempotency guard: block if a prior run already created children for this Epic ---
+    existing = get_created_children_for_epic(issue_key, exclude_run_id=run_id)
+    if existing:
+        logger.warning(
+            "epic_breakdown: duplicate blocked — %s already has %d Stories from run %s",
+            issue_key, existing["count"], existing["run_id"],
+        )
+        fail_run(
+            run_id,
+            f"Duplicate breakdown blocked: {issue_key} already has {existing['count']} "
+            f"Stories created by run {existing['run_id']}.",
+        )
+        send_message(
+            "planning_duplicate_blocked", "BLOCKED",
+            f"{issue_key}: already has {existing['count']} Stories from run {existing['run_id']}.\n"
+            f"To rebuild from scratch, send:\n  REGENERATE {existing['run_id']}",
+        )
+        return
 
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")

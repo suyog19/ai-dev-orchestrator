@@ -494,3 +494,70 @@ def complete_planning_run(run_id: int, created_count: int):
                 """,
                 (created_count, run_id),
             )
+
+
+def get_created_children_for_epic(issue_key: str, exclude_run_id: int) -> dict | None:
+    """Return info about an existing completed breakdown for this epic, or None.
+
+    Looks for any planning_outputs row with status='CREATED' belonging to a run for
+    issue_key that is not exclude_run_id. Used to block accidental duplicate breakdowns.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, COUNT(po.id) AS created_count
+                FROM planning_outputs po
+                JOIN workflow_runs wr ON wr.id = po.run_id
+                WHERE po.parent_issue_key = %s
+                  AND po.status = 'CREATED'
+                  AND wr.id != %s
+                GROUP BY wr.id
+                ORDER BY wr.id DESC
+                LIMIT 1
+                """,
+                (issue_key, exclude_run_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {"run_id": row[0], "count": row[1]}
+
+
+def get_planning_run_for_regeneration(run_id: int) -> dict | None:
+    """Return a planning run for REGENERATE, accepting both pending and completed runs.
+
+    Matches:
+      - WAITING_FOR_APPROVAL + approval_status=PENDING  (normal regenerate mid-approval)
+      - COMPLETED + approval_status=APPROVED            (regenerate after children already created)
+
+    Returns the same shape as get_pending_planning_run.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, wr.issue_key, wr.workflow_type, wr.related_event_id,
+                       wr.parent_issue_key, we.payload_json
+                FROM workflow_runs wr
+                LEFT JOIN workflow_events we ON we.id = wr.related_event_id
+                WHERE wr.id = %s
+                  AND (
+                    (wr.status = 'WAITING_FOR_APPROVAL' AND wr.approval_status = 'PENDING')
+                    OR
+                    (wr.status = 'COMPLETED' AND wr.approval_status = 'APPROVED')
+                  )
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    cols = ["id", "issue_key", "workflow_type", "related_event_id", "parent_issue_key", "payload_json"]
+    result = dict(zip(cols, row))
+    try:
+        payload = json.loads(result.pop("payload_json") or "{}")
+        result["summary"] = payload.get("issue", {}).get("fields", {}).get("summary", "")
+    except Exception:
+        result["summary"] = ""
+    return result

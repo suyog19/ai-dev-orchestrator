@@ -7,6 +7,7 @@ from app.database import (
     get_conn,
     get_pending_planning_run, approve_planning_run, reject_planning_run,
     request_regeneration, create_planning_run,
+    get_planning_run_for_regeneration,
 )
 from app.dispatcher import dispatch
 from app.telegram import send_message, parse_approval_command
@@ -97,13 +98,23 @@ async def telegram_webhook(request: Request):
     action, run_id = cmd
     logger.info("Telegram approval command received: %s %s", action, run_id)
 
-    run = get_pending_planning_run(run_id)
-    if not run:
-        send_message(
-            "approval_error", "ERROR",
-            f"No pending planning run found for ID {run_id}.\n"
-            f"Run may not exist, already actioned, or not in WAITING_FOR_APPROVAL state.",
+    # REGENERATE accepts both pending and completed runs; APPROVE/REJECT only accept pending.
+    if action == "REGENERATE":
+        run = get_planning_run_for_regeneration(run_id)
+        not_found_msg = (
+            f"No actionable planning run found for ID {run_id}.\n"
+            f"REGENERATE requires the run to be in WAITING_FOR_APPROVAL (pending) "
+            f"or COMPLETED (already approved and children created)."
         )
+    else:
+        run = get_pending_planning_run(run_id)
+        not_found_msg = (
+            f"No pending planning run found for ID {run_id}.\n"
+            f"Run may not exist, already actioned, or not in WAITING_FOR_APPROVAL state."
+        )
+
+    if not run:
+        send_message("approval_error", "ERROR", not_found_msg)
         return {"ok": True}
 
     issue_key = run.get("issue_key", "?")
