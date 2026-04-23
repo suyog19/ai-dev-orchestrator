@@ -1,8 +1,9 @@
 import difflib
 import logging
+from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
@@ -12,6 +13,7 @@ from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
+MAX_FILES_FOR_AUTOMERGE = 3
 
 logger = logging.getLogger("worker")
 
@@ -291,6 +293,42 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     )
     add_label_to_pr(mapping["repo_slug"], pr["number"], AI_LABEL)
     update_run_field(run_id, pr_url=pr["url"])
-    update_run_step(run_id, "done")
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
+
+    # --- Auto-merge policy ---
+    pr_title = f"ai: {issue_key} — {suggestion_description}"
+    auto_merge_ok = (
+        mapping.get("auto_merge_enabled")
+        and final_test_result["status"] == "PASSED"
+        and applied.get("applied", False)
+        and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
+    )
+
+    update_run_step(run_id, "merge_check")
+    if auto_merge_ok:
+        try:
+            merge_pull_request(mapping["repo_slug"], pr["number"], pr_title)
+            update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
+            send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr['number']} auto-merged (squash)")
+            logger.info("story_implementation: PR #%s auto-merged", pr["number"])
+        except Exception as exc:
+            update_run_field(run_id, merge_status="FAILED")
+            send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
+            logger.error("story_implementation: auto-merge failed — %s", exc)
+    else:
+        reasons = []
+        if not mapping.get("auto_merge_enabled"):
+            reasons.append("auto_merge disabled for repo")
+        if final_test_result["status"] != "PASSED":
+            reasons.append(f"tests {final_test_result['status']}")
+        if not applied.get("applied", False):
+            reasons.append("fallback apply used")
+        if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
+            reasons.append(f"{applied.get('count')} files > {MAX_FILES_FOR_AUTOMERGE} limit")
+        reason_str = "; ".join(reasons) if reasons else "conditions not met"
+        update_run_field(run_id, merge_status="SKIPPED")
+        send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")
+        logger.info("story_implementation: auto-merge skipped — %s", reason_str)
+
+    update_run_step(run_id, "done")
