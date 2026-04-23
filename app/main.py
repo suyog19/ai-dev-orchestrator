@@ -58,6 +58,26 @@ def debug_telegram():
     return {"sent": True}
 
 
+@app.get("/debug/telegram/set-webhook")
+def register_telegram_webhook(base_url: str | None = None):
+    """Register the Telegram bot webhook. Call once after each new deployment.
+
+    Pass ?base_url=https://your-domain.com or set PUBLIC_BASE_URL env var.
+    """
+    import os
+    from app.telegram import set_webhook
+    if not base_url:
+        base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if not base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide ?base_url=https://your-domain.com or set PUBLIC_BASE_URL env var",
+        )
+    webhook_url = f"{base_url.rstrip('/')}/webhooks/telegram"
+    result = set_webhook(webhook_url)
+    return {"webhook_url": webhook_url, "telegram_response": result}
+
+
 # ---------------------------------------------------------------------------
 # Repo mapping endpoints
 # ---------------------------------------------------------------------------

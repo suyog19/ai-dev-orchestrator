@@ -1,10 +1,16 @@
 import json
 import logging
+import os
 from fastapi import APIRouter, Request, HTTPException
 
-from app.database import get_conn
+from app.database import (
+    get_conn,
+    get_pending_planning_run, approve_planning_run, reject_planning_run,
+    request_regeneration, create_planning_run,
+)
 from app.dispatcher import dispatch
-from app.telegram import send_message
+from app.telegram import send_message, parse_approval_command
+from app.queue import enqueue
 
 logger = logging.getLogger("orchestrator")
 router = APIRouter()
@@ -55,3 +61,87 @@ async def jira_webhook(request: Request):
     dispatch(issue_type, new_status, event_id, issue_key=issue_key, summary=summary)
 
     return {"received": True, "processed": True}
+
+
+@router.post("/webhooks/telegram")
+async def telegram_webhook(request: Request):
+    """Receive approval commands from the Telegram bot.
+
+    Accepts: APPROVE <run_id> | REJECT <run_id> | REGENERATE <run_id>
+    Messages from chats other than TELEGRAM_CHAT_ID are silently ignored.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    message = payload.get("message") or payload.get("edited_message") or {}
+    text = (message.get("text") or "").strip()
+    incoming_chat_id = str(message.get("chat", {}).get("id", ""))
+
+    # Only process messages from the configured chat
+    expected_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if expected_chat_id and incoming_chat_id != expected_chat_id:
+        logger.warning("Telegram webhook: message from unexpected chat %s — ignored", incoming_chat_id)
+        return {"ok": True}
+
+    if not text:
+        return {"ok": True}
+
+    cmd = parse_approval_command(text)
+    if not cmd:
+        logger.info("Telegram webhook: non-approval message ignored (%r)", text[:60])
+        return {"ok": True}
+
+    action, run_id = cmd
+    logger.info("Telegram approval command received: %s %s", action, run_id)
+
+    run = get_pending_planning_run(run_id)
+    if not run:
+        send_message(
+            "approval_error", "ERROR",
+            f"No pending planning run found for ID {run_id}.\n"
+            f"Run may not exist, already actioned, or not in WAITING_FOR_APPROVAL state.",
+        )
+        return {"ok": True}
+
+    issue_key = run.get("issue_key", "?")
+
+    if action == "APPROVE":
+        approve_planning_run(run_id)
+        send_message(
+            "epic_breakdown_approved", "APPROVED",
+            f"{issue_key}: proposal approved (run_id={run_id})\n"
+            f"Jira Stories will be created shortly.",
+        )
+        logger.info("Planning run %s APPROVED for %s", run_id, issue_key)
+
+    elif action == "REJECT":
+        reject_planning_run(run_id)
+        send_message(
+            "epic_breakdown_rejected", "REJECTED",
+            f"{issue_key}: proposal rejected (run_id={run_id})\n"
+            f"No Jira Stories will be created.",
+        )
+        logger.info("Planning run %s REJECTED for %s", run_id, issue_key)
+
+    elif action == "REGENERATE":
+        request_regeneration(run_id)
+        new_run_id = create_planning_run(
+            issue_key=issue_key,
+            workflow_type=run["workflow_type"],
+            related_event_id=run.get("related_event_id"),
+        )
+        summary = run.get("summary") or issue_key
+        enqueue(new_run_id, run["workflow_type"], issue_key, "Epic", summary)
+        send_message(
+            "epic_breakdown_regenerate", "RUNNING",
+            f"{issue_key}: regenerating breakdown\n"
+            f"Old run_id={run_id} closed. New run_id={new_run_id} queued.",
+        )
+        logger.info(
+            "Planning run %s superseded by REGENERATE — new run_id=%s for %s",
+            run_id, new_run_id, issue_key,
+        )
+
+    return {"ok": True}

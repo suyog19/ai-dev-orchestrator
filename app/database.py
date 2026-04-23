@@ -369,3 +369,113 @@ def set_run_waiting_for_approval(run_id: int):
                 "UPDATE workflow_runs SET status='WAITING_FOR_APPROVAL', updated_at=NOW() WHERE id=%s",
                 (run_id,),
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Approval gate helpers
+# ---------------------------------------------------------------------------
+
+def get_pending_planning_run(run_id: int) -> dict | None:
+    """Return a planning run dict if it is WAITING_FOR_APPROVAL with approval_status=PENDING.
+
+    Includes issue_key, workflow_type, related_event_id, parent_issue_key, and summary
+    extracted from the original workflow_events payload.
+    Returns None if the run doesn't exist or is not in a pending approval state.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT wr.id, wr.issue_key, wr.workflow_type, wr.related_event_id,
+                       wr.parent_issue_key, we.payload_json
+                FROM workflow_runs wr
+                LEFT JOIN workflow_events we ON we.id = wr.related_event_id
+                WHERE wr.id = %s
+                  AND wr.status = 'WAITING_FOR_APPROVAL'
+                  AND wr.approval_status = 'PENDING'
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    cols = ["id", "issue_key", "workflow_type", "related_event_id", "parent_issue_key", "payload_json"]
+    result = dict(zip(cols, row))
+    try:
+        payload = json.loads(result.pop("payload_json") or "{}")
+        result["summary"] = payload.get("issue", {}).get("fields", {}).get("summary", "")
+    except Exception:
+        result["summary"] = ""
+    return result
+
+
+def approve_planning_run(run_id: int):
+    """Transition a planning run to APPROVED — ready for Jira child creation."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET status='APPROVED', approval_status='APPROVED',
+                    approval_received_at=NOW(), updated_at=NOW()
+                WHERE id=%s
+                """,
+                (run_id,),
+            )
+
+
+def reject_planning_run(run_id: int):
+    """Transition a planning run to FAILED/REJECTED and mark all its proposals as REJECTED."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET status='FAILED', approval_status='REJECTED',
+                    approval_received_at=NOW(),
+                    error_detail='Rejected by user via Telegram',
+                    completed_at=NOW(), updated_at=NOW()
+                WHERE id=%s
+                """,
+                (run_id,),
+            )
+            cur.execute(
+                "UPDATE planning_outputs SET status='REJECTED', updated_at=NOW() WHERE run_id=%s",
+                (run_id,),
+            )
+
+
+def request_regeneration(run_id: int):
+    """Close an existing planning run as superseded and mark its proposals as REJECTED."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET status='FAILED', approval_status='REGENERATE_REQUESTED',
+                    approval_received_at=NOW(),
+                    error_detail='Regeneration requested by user via Telegram',
+                    completed_at=NOW(), updated_at=NOW()
+                WHERE id=%s
+                """,
+                (run_id,),
+            )
+            cur.execute(
+                "UPDATE planning_outputs SET status='REJECTED', updated_at=NOW() WHERE run_id=%s",
+                (run_id,),
+            )
+
+
+def create_planning_run(issue_key: str, workflow_type: str, related_event_id: int | None) -> int:
+    """Insert a new QUEUED workflow_run for a planning workflow and return its id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO workflow_runs (workflow_type, status, related_event_id, issue_key)
+                VALUES (%s, 'QUEUED', %s, %s)
+                RETURNING id
+                """,
+                (workflow_type, related_event_id, issue_key),
+            )
+            return cur.fetchone()[0]

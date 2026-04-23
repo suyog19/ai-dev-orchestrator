@@ -20,7 +20,7 @@ def _active_run_exists(issue_key: str, workflow_type: str) -> int | None:
                 SELECT id FROM workflow_runs
                 WHERE issue_key = %s
                   AND workflow_type = %s
-                  AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_APPROVAL')
+                  AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_APPROVAL', 'APPROVED')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
