@@ -14,7 +14,9 @@ def send_message(event: str, status: str, details: str) -> None:
         logger.warning("Telegram not configured — skipping notification")
         return
 
-    text = f"[Orchestrator]\nEvent: {event}\nStatus: {status}\nDetails: {details}"
+    env_name = os.environ.get("ENV_NAME", "").strip()
+    prefix = f"[{env_name}] " if env_name else ""
+    text = f"{prefix}[Orchestrator]\nEvent: {event}\nStatus: {status}\nDetails: {details}"
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text}).encode()
 

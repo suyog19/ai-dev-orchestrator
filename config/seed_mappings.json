@@ -4,6 +4,7 @@
     "issue_type": "Story",
     "repo_slug": "suyog19/sandbox-fastapi-app",
     "base_branch": "main",
-    "notes": "KAN project — Phase 4 Jira integration"
+    "auto_merge_enabled": true,
+    "notes": "KAN project — sandbox repo, auto-merge enabled under strict conditions (Phase 5+)"
   }
 ]

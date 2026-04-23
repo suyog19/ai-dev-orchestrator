@@ -122,3 +122,44 @@ docker compose up -d --force-recreate
 ```bash
 docker exec <container-name> env | grep <VAR_NAME>
 ```
+
+## Phase 5 Configuration
+
+### Environment naming (Phase 5+)
+
+Each VM's `/home/ubuntu/.env.orchestrator` must include `ENV_NAME`:
+
+- Dev VM: `ENV_NAME=DEV`
+- Prod VM: `ENV_NAME=PROD`
+
+This value is prepended to every Telegram message as `[DEV]` or `[PROD]`.
+
+### Sandbox repo policy (Phase 5+)
+
+**Policy: Option A — Controlled merge-forward.**
+
+The sandbox repo (`suyog19/sandbox-fastapi-app`) is long-lived. Approved PRs are merged
+between sessions so the codebase gradually improves. Auto-merge is enabled for this repo
+(`auto_merge_enabled: true` in `config/seed_mappings.json`) and will be enforced by code
+logic starting in Phase 5 Iteration 6. Until that iteration, the flag exists in the DB
+but has no runtime effect.
+
+Auto-merge conditions (enforced from Iteration 6 onward):
+- tests passed (`test_status = PASSED`)
+- PR created successfully
+- `auto_merge_enabled = true` on the repo mapping
+- `files_changed_count` within configured threshold
+- no skipped or failed tests
+
+### Trigger definitions (Phase 5+)
+
+| Field | Value |
+|---|---|
+| Jira trigger status | `Ready for Dev` (case-insensitive) |
+| Supported issue type | `Story` |
+| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
+| Test command | `pytest -q` |
+| Dependency install | `pip install -r requirements.txt` (run in workspace before pytest) |
+| Auto-merge enabled | `suyog19/sandbox-fastapi-app` only |
+| Max fix attempts | 1 (max 2 total coding passes per workflow) |
+| Max changed files | 3 |

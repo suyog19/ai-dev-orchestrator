@@ -68,13 +68,22 @@ def init_db(retries: int = 5, delay: int = 3):
             """)
             # Migrations — add columns that may not exist on older deployments
             for col_sql in [
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS error_detail   TEXT          NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS started_at     TIMESTAMP     NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS completed_at   TIMESTAMP     NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS current_step   VARCHAR(100)  NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS working_branch VARCHAR(200)  NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS pr_url         VARCHAR(500)  NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS issue_key      VARCHAR(100)  NULL",
+                # Phase 3/4 columns
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS error_detail        TEXT          NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS started_at          TIMESTAMP     NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS completed_at        TIMESTAMP     NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS current_step        VARCHAR(100)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS working_branch      VARCHAR(200)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS pr_url              VARCHAR(500)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS issue_key           VARCHAR(100)  NULL",
+                # Phase 5 columns
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_status         VARCHAR(20)   NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_command        VARCHAR(200)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_output         TEXT          NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS retry_count         INTEGER       NOT NULL DEFAULT 0",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS files_changed_count INTEGER       NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS merge_status        VARCHAR(30)   NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS merged_at           TIMESTAMP     NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -88,15 +97,35 @@ def init_db(retries: int = 5, delay: int = 3):
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS repo_mappings (
-                    id                SERIAL PRIMARY KEY,
-                    jira_project_key  VARCHAR(50)   NOT NULL,
-                    issue_type        VARCHAR(50)   NULL,
-                    repo_slug         VARCHAR(200)  NOT NULL,
-                    base_branch       VARCHAR(100)  NOT NULL DEFAULT 'main',
-                    is_active         BOOLEAN       NOT NULL DEFAULT TRUE,
-                    notes             TEXT          NULL,
-                    created_at        TIMESTAMP     NOT NULL DEFAULT NOW(),
-                    updated_at        TIMESTAMP     NOT NULL DEFAULT NOW()
+                    id                  SERIAL PRIMARY KEY,
+                    jira_project_key    VARCHAR(50)   NOT NULL,
+                    issue_type          VARCHAR(50)   NULL,
+                    repo_slug           VARCHAR(200)  NOT NULL,
+                    base_branch         VARCHAR(100)  NOT NULL DEFAULT 'main',
+                    is_active           BOOLEAN       NOT NULL DEFAULT TRUE,
+                    notes               TEXT          NULL,
+                    created_at          TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at          TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "ALTER TABLE repo_mappings ADD COLUMN IF NOT EXISTS "
+                "auto_merge_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_attempts (
+                    id              SERIAL PRIMARY KEY,
+                    run_id          INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    attempt_number  INTEGER       NOT NULL,
+                    attempt_type    VARCHAR(20)   NOT NULL,
+                    model_used      VARCHAR(100)  NULL,
+                    status          VARCHAR(20)   NOT NULL DEFAULT 'RUNNING',
+                    started_at      TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    completed_at    TIMESTAMP     NULL,
+                    failure_summary TEXT          NULL,
+                    test_status     VARCHAR(20)   NULL,
+                    files_touched   TEXT          NULL
                 )
             """)
 
@@ -154,7 +183,11 @@ def update_run_step(run_id: int, step: str):
 
 def update_run_field(run_id: int, **fields):
     """Update arbitrary columns on a workflow_run row."""
-    allowed = {"working_branch", "pr_url"}
+    allowed = {
+        "working_branch", "pr_url",
+        "test_status", "test_command", "test_output",
+        "retry_count", "files_changed_count", "merge_status", "merged_at",
+    }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
