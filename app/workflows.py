@@ -1,6 +1,7 @@
 import logging
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
+from app.github_api import create_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.file_modifier import modify_file
 from app.telegram import send_message
@@ -40,3 +41,13 @@ def story_implementation(run_id: int, issue_key: str, summary: str) -> None:
     )
     send_message("git_push", "COMPLETE", f"{issue_key}: branch {branch} pushed to GitHub")
     logger.info("story_implementation: pushed branch %s", branch)
+
+    pr = create_pull_request(
+        repo_name=mapping["repo_name"],
+        head_branch=branch,
+        base_branch=mapping["target_branch"],
+        title=f"ai: {issue_key} — {summary}",
+        body=f"Automated PR created by AI Dev Orchestrator.\n\n**Issue:** {issue_key}\n**Summary:** {summary}",
+    )
+    send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
+    logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
