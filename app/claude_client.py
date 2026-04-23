@@ -39,18 +39,45 @@ SYSTEM_PROMPT = (
     "points or overall architecture. Be specific. Avoid filler phrases."
 )
 
+FIX_PROMPT = (
+    "You are a code repair assistant. A previous implementation attempt failed tests. "
+    "You will be given: the original story, the current state of the changed file, and the failing test output. "
+    "Call the apply_code_change tool with a targeted fix to make the failing tests pass. "
+    "Rules:\n"
+    "- Change as few lines as possible\n"
+    "- Do not break currently passing tests\n"
+    "- Stay within the same file\n"
+    "- Do not import or reference types that do not already exist in the codebase\n"
+    "- If the error is an import of a non-existent type, remove that import and rewrite the code to use existing types"
+)
+
 SUGGEST_PROMPT = (
     "You are a code improvement assistant. You will be given a Jira story and one or more source files. "
-    "Suggest ONE small, concrete code change in ONE file that moves the implementation toward what the "
-    "story describes. Choose the most relevant file. "
-    "If the story is not directly actionable (e.g. it describes a test or process), suggest the most "
-    "relevant improvement you can find in any of the files instead. "
+    "Call the apply_code_change tool with ONE concrete code change in ONE file that moves the implementation "
+    "toward what the story describes. Choose the most relevant file. "
+    "If the story is not directly actionable, suggest the most relevant improvement in any of the files. "
     "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
-    "fixing a clear bug), and minimal (change as few lines as possible). "
-    "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
-    '{"file": "<relative path>", "description": "<one sentence>", '
-    '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
+    "fixing a clear bug), and complete (include ALL changes needed in one contiguous block — e.g. if a "
+    "new function needs a new import, include both in the replacement). "
+    "You may add imports for names that genuinely exist in the codebase. "
+    "Do not invent new class names or types that are not defined anywhere in the provided files."
 )
+
+# Tool schema used by both suggest_change and fix_change to guarantee structured output
+_CHANGE_TOOL = {
+    "name": "apply_code_change",
+    "description": "Apply a targeted code change to a source file",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file":        {"type": "string", "description": "Relative path to the file to change"},
+            "description": {"type": "string", "description": "One sentence describing what the change does"},
+            "original":    {"type": "string", "description": "The exact existing text to replace (must match file content exactly)"},
+            "replacement": {"type": "string", "description": "The new text that replaces the original"},
+        },
+        "required": ["file", "description", "original", "replacement"],
+    },
+}
 
 
 def _read_truncated(path: str, max_lines: int = 150) -> str | None:
@@ -184,13 +211,16 @@ def _select_files_for_story(
     return result
 
 
+_CLIENT = anthropic.Anthropic(timeout=120.0)
+
+
 def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     """Call Claude Sonnet to produce a 3-5 sentence technical summary of the repo.
 
     Uses prompt caching on the stable system prompt to reduce cost on repeated calls.
     Returns the summary string.
     """
-    client = anthropic.Anthropic()
+    client = _CLIENT
 
     key_files = _collect_key_files(repo_path, analysis.get("primary_language", "Unknown"))
 
@@ -238,7 +268,7 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     list, giving Claude context most relevant to the story intent.
     Returns a dict with keys: file, description, original, replacement.
     """
-    client = anthropic.Anthropic()
+    client = _CLIENT
 
     primary_language = analysis.get("primary_language", "Python")
     selected = _select_files_for_story(repo_path, primary_language, issue_summary)
@@ -257,7 +287,7 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
     user_content = (
         f"{story_context}"
         f"Available source files (ordered by relevance to story):{file_sections}\n"
-        f"Suggest one small improvement to ONE of the files above that best addresses the story."
+        f"Suggest one improvement to ONE of the files above that best addresses the story."
     )
 
     response = client.messages.create(
@@ -268,27 +298,80 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
             "text": SUGGEST_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
+        tools=[_CHANGE_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_change"},
         messages=[{"role": "user", "content": user_content}],
     )
 
-    raw = next((b.text for b in response.content if b.type == "text"), "{}")
     logger.info(
         "Claude suggestion done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
 
-    # Strip accidental markdown fences
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_block:
+        return tool_block.input
 
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.warning("Claude returned non-JSON suggestion: %s", raw[:200])
-        fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
-        return {"file": fallback_file, "description": raw[:200], "original": "", "replacement": ""}
+    logger.warning("Claude suggestion: no tool_use block in response")
+    fallback_file = selected[1][0] if len(selected) > 1 else selected[0][0]
+    return {"file": fallback_file, "description": "No tool call returned", "original": "", "replacement": ""}
+
+
+def fix_change(
+    repo_path: str,
+    analysis: dict,
+    issue_key: str,
+    issue_summary: str,
+    previous_suggestion: dict,
+    test_output: str,
+) -> dict:
+    """Ask Claude to fix a failing implementation.
+
+    Sends the original story, the current file content, and the trimmed test failure
+    output. Returns the same shape as suggest_change: {file, original, replacement, description}.
+    """
+    client = _CLIENT
+
+    changed_file = previous_suggestion.get("file", "")
+    file_abs = os.path.join(repo_path, changed_file)
+    current_content = _read_truncated(file_abs) or "(file not found)"
+
+    # Trim test output to the most useful tail (last 60 lines)
+    failure_lines = (test_output or "").strip().splitlines()
+    trimmed_output = "\n".join(failure_lines[-60:]) if failure_lines else "(no output)"
+
+    user_content = (
+        f"Story: {issue_key} — {issue_summary}\n\n"
+        f"The previous implementation changed `{changed_file}` but tests are failing.\n\n"
+        f"Current file content:\n--- {changed_file} ---\n```\n{current_content}\n```\n\n"
+        f"Failing test output (last 60 lines):\n```\n{trimmed_output}\n```\n\n"
+        f"Call apply_code_change with a minimal fix to `{changed_file}` that makes the failing tests pass "
+        f"without breaking any currently passing tests."
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=[{
+            "type": "text",
+            "text": FIX_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_CHANGE_TOOL],
+        tool_choice={"type": "tool", "name": "apply_code_change"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Claude fix done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_block:
+        return tool_block.input
+
+    logger.warning("Claude fix: no tool_use block in response")
+    return {"file": changed_file, "description": "No tool call returned", "original": "", "replacement": ""}

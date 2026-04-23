@@ -5,3 +5,5 @@ psycopg2-binary==2.9.10
 redis==5.2.1
 requests==2.32.3
 anthropic==0.52.0
+pytest==8.3.5
+httpx==0.28.1
