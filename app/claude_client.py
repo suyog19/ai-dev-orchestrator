@@ -64,9 +64,10 @@ SUGGEST_PROMPT = (
     "If the story is not directly actionable (e.g. it describes a test or process), suggest the most "
     "relevant improvement you can find in any of the files instead. "
     "The change must be: specific (reference exact existing text), safe (no breaking changes unless "
-    "fixing a clear bug), and minimal (change as few lines as possible). "
-    "IMPORTANT: Only use types, functions, and imports that already exist in the file you are modifying. "
-    "Do not reference classes or modules that are not already present in the codebase. "
+    "fixing a clear bug), and complete (include ALL changes needed in one contiguous block — e.g. if a "
+    "new function needs a new import, put both in the replacement). "
+    "You may add imports for names that genuinely exist in the codebase. "
+    "Do not invent new class names or types that are not defined anywhere in the provided files. "
     "Respond with ONLY valid JSON — no markdown fences, no explanation — in this exact format:\n"
     '{"file": "<relative path>", "description": "<one sentence>", '
     '"original": "<exact existing text to replace>", "replacement": "<new text>"}'
@@ -283,6 +284,7 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
         f"Suggest one small improvement to ONE of the files above that best addresses the story."
     )
 
+    # Prefill the assistant turn with "{" to force JSON-only output
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -291,23 +293,18 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
             "text": SUGGEST_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        messages=[{"role": "user", "content": user_content}],
+        messages=[
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": "{"},
+        ],
     )
 
-    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    raw = "{" + next((b.text for b in response.content if b.type == "text"), "}")
     logger.info(
         "Claude suggestion done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
-
-    # Strip accidental markdown fences
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
 
     try:
         return json.loads(raw)
@@ -349,6 +346,7 @@ def fix_change(
         f"without breaking any currently passing tests."
     )
 
+    # Prefill the assistant turn with "{" to force JSON-only output
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -357,34 +355,22 @@ def fix_change(
             "text": FIX_PROMPT,
             "cache_control": {"type": "ephemeral"},
         }],
-        messages=[{"role": "user", "content": user_content}],
+        messages=[
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": "{"},
+        ],
     )
 
-    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    # Prepend the prefilled "{" that the SDK does not include in the response
+    raw = "{" + next((b.text for b in response.content if b.type == "text"), "}")
     logger.info(
         "Claude fix done (sonnet) — input=%s output=%s",
         response.usage.input_tokens,
         response.usage.output_tokens,
     )
 
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Claude returned prose — try to extract the JSON object from it
-        match = re.search(r'\{[^{}]*"file"[^{}]*"original"[^{}]*"replacement"[^{}]*\}', raw, re.DOTALL)
-        if match:
-            try:
-                extracted = json.loads(match.group(0))
-                logger.info("Extracted JSON from prose fix response")
-                return extracted
-            except json.JSONDecodeError:
-                pass
-        logger.warning("Claude returned non-JSON fix: %s", raw[:200])
+        logger.warning("Claude returned non-JSON fix even with prefill: %s", raw[:200])
         return {"file": changed_file, "description": raw[:200], "original": "", "replacement": ""}
