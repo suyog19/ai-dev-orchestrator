@@ -17,7 +17,7 @@ from app.database import (
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
-from app.database import add_manual_memory
+from app.database import add_manual_memory, generate_repo_memory_snapshot
 
 load_dotenv()
 
@@ -485,3 +485,103 @@ def list_memory_snapshots(scope_type: str | None = None, scope_key: str | None =
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Feedback events — raw signal inspection
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/feedback-events")
+def list_feedback_events(
+    limit: int = 20,
+    source_type: str | None = None,
+    repo_slug: str | None = None,
+    feedback_type: str | None = None,
+    source_run_id: int | None = None,
+):
+    """Return raw feedback_events rows, newest first.
+
+    Optional filters: source_type, repo_slug, feedback_type, source_run_id.
+    Max limit: 100.
+    """
+    limit = min(limit, 100)
+
+    conditions = []
+    params: list = []
+    if source_type:
+        conditions.append("source_type = %s")
+        params.append(source_type)
+    if repo_slug:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    if feedback_type:
+        conditions.append("feedback_type = %s")
+        params.append(feedback_type)
+    if source_run_id is not None:
+        conditions.append("source_run_id = %s")
+        params.append(source_run_id)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, source_type, source_run_id, epic_key, story_key,
+                       repo_slug, feedback_type, feedback_value, created_at
+                FROM feedback_events
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":            r[0],
+            "source_type":   r[1],
+            "source_run_id": r[2],
+            "epic_key":      r[3],
+            "story_key":     r[4],
+            "repo_slug":     r[5],
+            "feedback_type": r[6],
+            "value":         r[7],
+            "created_at":    r[8].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Memory recompute — force-refresh a derived snapshot
+# ---------------------------------------------------------------------------
+
+@app.post("/debug/memory/recompute", status_code=200)
+def recompute_memory(scope_type: str, scope_key: str):
+    """Force-refresh a derived memory snapshot for the given scope.
+
+    scope_type=repo  → recomputes both planning_guidance and execution_guidance
+                       for the given repo_slug (scope_key).
+    scope_type=epic  → recomputes the epic execution_guidance rollup
+                       for the given epic_key (scope_key).
+
+    Returns the updated snapshot(s). Does not affect manual_note entries.
+    """
+    if scope_type == "repo":
+        result = generate_repo_memory_snapshot(scope_key)
+        return {"scope_type": scope_type, "scope_key": scope_key, "result": result}
+    if scope_type == "epic":
+        result = generate_epic_outcome_rollup(scope_key)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No Stories found for Epic {scope_key} — cannot generate rollup.",
+            )
+        return {"scope_type": scope_type, "scope_key": scope_key, "result": result}
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported scope_type '{scope_type}'. Use 'repo' or 'epic'.",
+    )
