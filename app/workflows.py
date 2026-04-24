@@ -29,6 +29,7 @@ from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, Re
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
 from app.clarification import pause_for_clarification, ClarificationRequested, is_clarification_enabled
+from app.deployment_validator import run_deployment_validation
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -670,6 +671,72 @@ def evaluate_release_decision(
     }
 
 
+def _run_post_merge_validation(
+    run_id: int,
+    issue_key: str,
+    repo_slug: str,
+    commit_sha: str | None = None,
+    pr_number: int | None = None,
+    environment: str = "dev",
+) -> None:
+    """Run deployment validation after a successful merge.
+
+    Non-fatal: any exception is caught and logged. Validation failure never
+    rolls back the merge — it is observational only at Phase 16.
+    """
+    try:
+        update_run_step(run_id, "deployment_validation")
+        import os
+        timeout_s = int(os.environ.get("DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS", "120"))
+        retry_n   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_COUNT", "3"))
+        retry_d   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS", "10"))
+
+        result = run_deployment_validation(
+            run_id=run_id,
+            repo_slug=repo_slug,
+            environment=environment,
+            commit_sha=commit_sha,
+            pr_number=pr_number,
+            timeout_seconds=timeout_s,
+            retry_count=retry_n,
+            retry_delay_seconds=retry_d,
+        )
+
+        status = result["status"]
+        summary = result["summary"]
+        passed = sum(1 for r in result.get("smoke_results", []) if r.get("status") == "PASSED")
+        total  = len(result.get("smoke_results", []))
+
+        if status == "PASSED":
+            send_message(
+                "deployment_validation_passed", "COMPLETE",
+                f"{issue_key}: deployment validation passed\n"
+                f"Smoke tests: {passed}/{total} passed\n{summary}",
+            )
+        elif status in ("FAILED", "ERROR"):
+            failed_names = [
+                r.get("name", "?")
+                for r in result.get("smoke_results", [])
+                if r.get("status") != "PASSED"
+            ]
+            send_message(
+                "deployment_validation_failed", "FAILED",
+                f"{issue_key}: deployment validation {status}\n"
+                f"Failed: {', '.join(failed_names) or summary}",
+            )
+        elif status == "NOT_CONFIGURED":
+            logger.info(
+                "_run_post_merge_validation: no profile for %s — NOT_CONFIGURED (silent)",
+                repo_slug,
+            )
+        # SKIPPED — no Telegram noise
+
+    except Exception as exc:
+        logger.error(
+            "_run_post_merge_validation: non-fatal error for run_id=%s — %s", run_id, exc,
+        )
+
+
 def _story_review_and_release(
     run_id: int,
     issue_key: str,
@@ -837,6 +904,12 @@ def _story_review_and_release(
             merge_pull_request(mapping["repo_slug"], pr_number, pr["title"])
             update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
             send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr_number} auto-merged after clarification")
+            _run_post_merge_validation(
+                run_id=run_id,
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+                pr_number=pr_number,
+            )
         except Exception as exc:
             update_run_field(run_id, merge_status="FAILED")
             send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
@@ -1588,6 +1661,13 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
             send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr['number']} auto-merged (squash)")
             logger.info("story_implementation: PR #%s auto-merged", pr["number"])
+            _run_post_merge_validation(
+                run_id=run_id,
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+                commit_sha=get_run_state(run_id).get("head_sha"),
+                pr_number=pr["number"],
+            )
         except Exception as exc:
             update_run_field(run_id, merge_status="FAILED")
             send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
