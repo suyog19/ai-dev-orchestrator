@@ -71,7 +71,9 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
 - `app/git_ops.py` — clone, commit, push
 - `app/repo_mapping.py` — CRUD for `repo_mappings` table
-- `app/test_runner.py` — runs `pytest -q` in a cloned workspace
+- `app/repo_profiler.py` — detects repo capability profile from cloned workspace (detection order: Gradle > Maven > Node > Python > Unknown); `detect_repo_capability_profile()`, `get_test/build/lint_command_for_profile()`
+- `app/command_runner.py` — `run_repo_command()`: safe, injection-proof command execution using `shlex.split()` (no `shell=True`); handles timeout/FileNotFoundError/OSError; output truncated at 4000 chars
+- `app/test_runner.py` — profile-aware test/build/lint runner: `run_tests()` (with dep install), `run_build()`, `run_lint()` all delegate to `run_repo_command()`
 - `app/telegram.py` — `send_message(event_type, status, detail)` used by all workflow steps for Telegram notifications
 - `app/queue.py` — Redis queue enqueue/dequeue
 - `app/clarification.py` — clarification loop: detects vagueness/ambiguity, sends Telegram questions, suspends runs, resumes on answer
@@ -84,8 +86,10 @@ Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
   → Redis Queue → Worker thread
 
   story_implementation:
-    clone repo → analyze → summarize → suggest change (+ memory) → apply
-    → run tests → [fix attempt if failed] → commit/push → PR (store head_sha)
+    clone repo → analyze → detect capability profile (upsert DB) → summarize → suggest change (+ memory) → apply
+    → run tests (profile-aware: pip/npm install + profile test command) → [fix attempt if failed]
+    → run build (if profile has build command) → run lint (if profile has lint command)
+    → commit/push → PR (store head_sha)
     → Reviewer Agent (review_pr) → store verdict → post PR comment → Telegram
     → Test Quality Agent (review_test_quality) → store verdict → post PR comment → Telegram
     → Architecture Agent (review_architecture) → store verdict → post PR comment → Telegram
@@ -128,6 +132,7 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `security_events` | Append-only audit log of auth failures, webhook rejections, write blocks |
 | `control_flags` | Runtime control flags (paused state); DB takes precedence over env var |
 | `github_status_updates` | Append-only audit log of every GitHub commit status publish attempt; one row per gate per run per attempt |
+| `repo_capability_profiles` | Active capability profile per repo (profile_name, commands, capabilities_json); upserted on each clone |
 
 **`workflow_runs` status flow:**
 ```
@@ -143,6 +148,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 **`workflow_runs.architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR` (NULL until arch review completes)
 **`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
 **`workflow_runs` Phase 13 columns:** `head_sha` (fetched from GitHub after PR creation), `github_statuses_published` (bool), `github_statuses_published_at` (timestamp)
+**`workflow_runs` Phase 15 columns:** `capability_profile_name`, `build_status`, `lint_status`, `dependency_install_status`
 
 **`clarification_requests.status` values:** `PENDING` | `ANSWERED` | `CANCELLED` | `EXPIRED`
 **Clarification context keys:** `pre_planning` (epic), `pre_suggest` (story implementation), `pre_review` (review agents)
@@ -200,6 +206,8 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/debug/workflow-runs/{run_id}/republish-github-statuses` | Re-publish statuses idempotently (query: repo_slug) |
 | POST | `/admin/github/statuses/backfill` | Backfill statuses for recent eligible runs (body: repo_slug, limit, only_missing) |
 | POST | `/admin/github/branch-protection/validate-required-checks` | Dry-run check for required `orchestrator/release-gate` context (body: repo_slug, branch) |
+| GET | `/debug/repo-capability-profiles` | List all capability profiles (filter: repo_slug) |
+| GET | `/debug/repo-capability-profiles/{repo_slug}` | Get active profile for one repo |
 | GET | `/admin/ui/login` | Dashboard login page |
 | POST | `/admin/ui/login` | Submit credentials; sets `orchestrator_admin_session` cookie |
 | GET | `/admin/ui/logout` | Clear session cookie |
@@ -229,14 +237,38 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 
 | Setting | Value |
 |---|---|
-| Test command | `pytest -q` (after `pip install -r requirements.txt`) |
+| Test command | Profile-based (`get_test_command_for_profile()`); defaults to `pytest -q` for Python FastAPI |
 | Max fix attempts | 1 (max 2 total coding passes per run) |
 | Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
-| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + `architecture_status=ARCHITECTURE_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed; all evaluated by `evaluate_release_decision()` in `workflows.py` |
-| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
+| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + `architecture_status=ARCHITECTURE_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed + profile policy allows auto-merge; all evaluated by `evaluate_release_decision()` in `workflows.py` |
+| Test-enabled repo | `suyog19/sandbox-fastapi-app` (Python), `suyog19/sandbox-java-maven`, `suyog19/sandbox-java-gradle`, `suyog19/sandbox-node-react` |
 | Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
 
 File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-test files + up to 2 Python import dependencies + best test file (max 6 files total).
+
+### Capability Profiles (Phase 15)
+
+`app/repo_profiler.py` — detection order: Gradle > Maven > Node > Python > Unknown.
+
+| Profile | Detected by | Test command | Auto-merge |
+|---|---|---|---|
+| `python_fastapi` | `requirements.txt` / `pyproject.toml` + FastAPI reference or `app/main.py` | `pytest -q` | Allowed |
+| `java_maven` | `pom.xml` | `mvn test -q` (or `./mvnw test -q` if wrapper present) | Disabled |
+| `java_gradle` | `build.gradle` or (`gradlew` + `settings.gradle`) | `./gradlew test` or `gradle test` | Disabled |
+| `node_react` | `package.json` + (vite/next config OR react dep OR `src/`) | From `package.json` scripts | Disabled |
+| `generic_unknown` | fallback | None | Disabled |
+
+**Profile release policies** (`_PROFILE_RELEASE_POLICY` in `workflows.py`):
+- `python_fastapi`: `allow_auto_merge=True`, `require_tests=True`, `require_build=False`
+- `java_maven`/`java_gradle`: `allow_auto_merge=False`, `require_tests=True`, `require_build=True`
+- `node_react`: `allow_auto_merge=False`, `require_tests=False`, `require_build=True`
+- `generic_unknown`: `allow_auto_merge=False`, all requirements False
+
+**Build/lint policy**: build `FAILED` = `RELEASE_BLOCKED`; lint `FAILED` = `RELEASE_SKIPPED`; `NOT_RUN` = skip only if `require_build=True` for that profile.
+
+**File classification** (`_classify_changed_files(files, profile_name)`): Java uses controller/service/repository/entity/config groups; Node uses component/hook/route/state/api/config groups; Python uses original api/model/storage/config groups. Used in Architecture and Test Quality Agent context packages.
+
+**Skip detection** (`_detect_skipped_tests(diff, output, profile_name)`): Python: `@pytest.mark.skip`; Java: `@Disabled`, `@Ignore`; Node: `it.skip`, `xtest`, `describe.skip`, `.todo`.
 
 ### epic_breakdown
 
