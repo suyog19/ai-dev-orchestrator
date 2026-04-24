@@ -748,6 +748,16 @@ def pause_orchestrator(request: Request):
     return {"paused": True, "message": "Orchestrator is now paused. New workflows and Telegram commands will be blocked."}
 
 
+@app.get("/admin/github/branch-protection")
+def audit_branch_protection(repo_slug: str, branch: str = "main"):
+    """Fetch GitHub branch protection rules for the given repo and branch."""
+    from app.github_api import get_branch_protection
+    try:
+        return get_branch_protection(repo_slug, branch)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
+
+
 @app.post("/admin/resume", status_code=200)
 def resume_orchestrator(request: Request):
     """Resume automation — re-enables Jira workflows and Telegram commands."""

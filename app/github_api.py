@@ -126,6 +126,65 @@ def post_pr_comment(repo_name: str, pr_number: int, body: str) -> dict:
     return {"id": data["id"], "html_url": data["html_url"]}
 
 
+def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
+    """Fetch branch protection info and return an audit summary.
+
+    Returns a dict with: repo_slug, branch, protected, required_reviews,
+    required_status_checks, allow_force_pushes, allow_deletions, warnings.
+    """
+    slug = _normalize_slug(repo_name)
+    response = requests.get(
+        f"{GITHUB_API}/repos/{slug}/branches/{branch}/protection",
+        headers=_headers(),
+        timeout=10,
+    )
+    if response.status_code == 404:
+        return {
+            "repo_slug": slug,
+            "branch": branch,
+            "protected": False,
+            "required_reviews": False,
+            "required_status_checks": [],
+            "allow_force_pushes": True,
+            "allow_deletions": True,
+            "warnings": [f"Branch '{branch}' has no protection rules"],
+        }
+    response.raise_for_status()
+    data = response.json()
+    warnings = []
+
+    req_reviews = data.get("required_pull_request_reviews") or {}
+    required_reviews = bool(req_reviews)
+    if not required_reviews:
+        warnings.append("No required PR reviews")
+
+    req_checks = data.get("required_status_checks") or {}
+    checks = req_checks.get("contexts", []) + req_checks.get("checks", [])
+    if not checks:
+        warnings.append("No required status checks configured")
+
+    force_push = (data.get("allow_force_pushes") or {}).get("enabled", False)
+    if force_push:
+        warnings.append("Force pushes are allowed on this branch")
+
+    allow_del = (data.get("allow_deletions") or {}).get("enabled", False)
+    if allow_del:
+        warnings.append("Branch deletions are allowed")
+
+    return {
+        "repo_slug": slug,
+        "branch": branch,
+        "protected": True,
+        "required_reviews": required_reviews,
+        "required_reviews_count": req_reviews.get("required_approving_review_count", 0),
+        "dismiss_stale_reviews": req_reviews.get("dismiss_stale_reviews", False),
+        "required_status_checks": checks,
+        "allow_force_pushes": force_push,
+        "allow_deletions": allow_del,
+        "warnings": warnings,
+    }
+
+
 def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:
     """Squash-merge a PR. Returns {"sha": str, "merged": bool, "message": str}.
 
