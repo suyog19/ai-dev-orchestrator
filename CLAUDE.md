@@ -50,7 +50,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/main.py` — FastAPI app, all HTTP endpoints
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()` uses forced `tool_choice=submit_review` for structured output
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()` and `review_test_quality()` both use forced `tool_choice` for structured output
 - `app/database.py` — all DB access; schema migrations in `init_db()`
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
@@ -73,7 +73,11 @@ Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
     clone repo → analyze → summarize → suggest change (+ memory) → apply
     → run tests → [fix attempt if failed] → commit/push → PR
     → Reviewer Agent (review_pr) → store verdict → post PR comment → Telegram
-    → merge gate (APPROVED_BY_AI → merge | BLOCKED → BLOCKED_BY_REVIEW | else → SKIPPED)
+    → Test Quality Agent (review_test_quality) → store verdict → post PR comment → Telegram
+    → merge gate (APPROVED_BY_AI + TEST_QUALITY_APPROVED → merge
+                 | BLOCKED → BLOCKED_BY_REVIEW
+                 | TESTS_BLOCKING → BLOCKED_BY_TEST_QUALITY
+                 | else → SKIPPED)
 
   epic_breakdown:
     fetch planning memory → Claude decompose (+ memory) → store proposals
@@ -103,6 +107,7 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `feedback_events` | Atomic signals written after each run completes (append-only) |
 | `memory_snapshots` | Derived and human-authored guidance; one row per (scope_type, scope_key, memory_kind) |
 | `agent_reviews` | One row per Reviewer Agent verdict; FK to `workflow_runs` |
+| `agent_test_quality_reviews` | One row per Test Quality Agent verdict; FK to `workflow_runs` |
 
 **`workflow_runs` status flow:**
 ```
@@ -112,8 +117,9 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
                                                     → FAILED    (after REJECT/REGENERATE)
 ```
 
-**`workflow_runs.merge_status` values:** `MERGED` | `SKIPPED` | `BLOCKED_BY_REVIEW` | `FAILED`
+**`workflow_runs.merge_status` values:** `MERGED` | `SKIPPED` | `BLOCKED_BY_REVIEW` | `BLOCKED_BY_TEST_QUALITY` | `FAILED`
 **`workflow_runs.review_status` values:** `APPROVED_BY_AI` | `NEEDS_CHANGES` | `BLOCKED` | `ERROR` (NULL until review completes)
+**`workflow_runs.test_quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR` (NULL until TQ review completes)
 
 **`memory_snapshots` kinds:** `planning_guidance`, `execution_guidance`, `manual_note`
 **`memory_snapshots` scopes:** `repo` (scope_key = repo_slug), `epic` (scope_key = epic_key)
@@ -148,6 +154,8 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/debug/memory/recompute` | Force-refresh a derived snapshot (scope_type=repo\|epic) |
 | GET | `/debug/agent-reviews` | List Reviewer Agent verdicts (filter: run_id, repo_slug, review_status) |
 | GET | `/debug/workflow-runs/{run_id}/reviews` | All Reviewer Agent verdicts for one run |
+| GET | `/debug/test-quality-reviews` | List Test Quality Agent verdicts (filter: run_id, repo_slug, quality_status) |
+| GET | `/debug/workflow-runs/{run_id}/test-quality` | All Test Quality Agent verdicts for one run |
 
 ## Workflow Configuration
 
@@ -158,7 +166,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | Test command | `pytest -q` (after `pip install -r requirements.txt`) |
 | Max fix attempts | 1 (max 2 total coding passes per run) |
 | Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
-| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + PR created + `auto_merge_enabled=true` + ≤3 files changed |
+| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed |
 | Test-enabled repo | `suyog19/sandbox-fastapi-app` |
 | Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
 
@@ -214,57 +222,24 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
 
 **Review feedback events:** `review_status`, `review_risk_level`, `review_approved`, `review_needs_changes`, `review_blocked`
-<<<<<<< HEAD
-=======
 
-## Workflow Configuration
+### Phase 9 — Test Quality Agent (Phase 9+)
 
-### story_implementation
-
-| Setting | Value |
-|---|---|
-| Test command | `pytest -q` (after `pip install -r requirements.txt`) |
-| Max fix attempts | 1 (max 2 total coding passes per run) |
-| Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
-| Auto-merge conditions | tests PASSED + PR created + `auto_merge_enabled=true` + ≤3 files changed |
-| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
-| Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
-
-File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-test files + up to 2 Python import dependencies + best test file (max 6 files total).
-
-### epic_breakdown
+**`quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR`
+**`confidence_level` values:** `LOW` | `MEDIUM` | `HIGH`
 
 | Setting | Value |
 |---|---|
-| Max Stories per Epic | 8 |
-| Output issue type | `Story` |
-| Approval commands | `APPROVE <run_id>` / `REJECT <run_id>` / `REGENERATE <run_id>` |
-| Idempotency guard | Blocks if the Epic already has Jira children |
+| Review required | `true` — every `story_implementation` run triggers a TQ review |
+| Blocks merge | `true` — `TEST_QUALITY_APPROVED` required for auto-merge |
+| Test Quality Agent prompt | `TEST_QUALITY_PROMPT` in `app/claude_client.py` |
+| Output format | Forced tool_use (`submit_test_quality_review`) with required structured fields |
+| GitHub action | Top-level PR comment with emoji verdict summary |
+| Merge on `TESTS_WEAK` | `merge_status=SKIPPED` |
+| Merge on `TESTS_BLOCKING` | `merge_status=BLOCKED_BY_TEST_QUALITY` |
+| Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
 
-### Memory injection
-
-| Setting | Value |
-|---|---|
-| Max bullets injected | 5 |
-| Max chars injected | 1000 |
-| Scopes | `repo` (execution guidance), `epic` (planning guidance) |
-| Refresh | Triggered on every feedback write (`on_write`) |
-
-### Failure categories (defined in `app/feedback.py`)
-
-| Category | When applied |
-|---|---|
-| `test_failure` | Tests ran and failed |
-| `syntax_failure` | Python syntax/parse error in generated code |
-| `apply_validation_failure` | File apply guard rejected the change |
-| `jira_creation_failure` | Jira API error during child creation |
-| `merge_failure` | PR creation or auto-merge failed |
-| `duplicate_blocked` | Breakdown blocked by idempotency guard |
-| `approval_rejected` | User rejected a planning proposal |
-| `approval_regenerated` | User requested regeneration |
-| `worker_interrupted` | Run was RUNNING when worker restarted |
-| `unknown` | Error does not match any known pattern |
->>>>>>> origin/main
+**Test Quality feedback events:** `test_quality_status`, `test_quality_confidence`, `test_quality_approved`, `tests_weak`, `tests_blocking`, `missing_test_count`, `suspicious_test_count`
 
 ## Telegram Message Format
 
@@ -314,11 +289,7 @@ docker exec <container-name> env | grep <VAR_NAME>
 
 ## Working Style
 
-<<<<<<< HEAD
 Implement one iteration at a time. After each iteration: commit, push to `dev`, wait for CI/CD (`gh run watch`), then **validate autonomously on the dev EC2 instance** (SSH to `65.2.140.4`, exec into the app container, run validation scripts) before reporting the iteration complete. Do not rely on local Docker for validation. Only ask the user to proceed once the EC2 validation passes.
-=======
-Implement one iteration at a time. After each: confirm it runs, provide test steps, wait for user confirmation before moving to the next step.
->>>>>>> origin/main
 
 When a decision affects architecture, multiple valid approaches exist, credentials are needed, or external services require setup — ask before proceeding, using this format:
 
