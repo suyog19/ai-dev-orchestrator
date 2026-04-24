@@ -41,6 +41,15 @@ class FeedbackType:
     TESTS_BLOCKING              = "tests_blocking"
     MISSING_TEST_COUNT          = "missing_test_count"
     SUSPICIOUS_TEST_COUNT       = "suspicious_test_count"
+    # Architecture signals (Phase 10)
+    ARCHITECTURE_STATUS         = "architecture_status"
+    ARCHITECTURE_RISK_LEVEL     = "architecture_risk_level"
+    ARCHITECTURE_APPROVED       = "architecture_approved"
+    ARCHITECTURE_NEEDS_REVIEW   = "architecture_needs_review"
+    ARCHITECTURE_BLOCKED        = "architecture_blocked"
+    # Release Gate signals (Phase 10)
+    RELEASE_DECISION            = "release_decision"
+    RELEASE_BLOCKING_GATE_COUNT = "release_blocking_gate_count"
 
 
 class FailureCategory:
@@ -72,8 +81,9 @@ class MemoryKind:
 # Phase 8 — Reviewer Agent constants / Phase 9 — Test Quality Agent constants
 
 class AgentName:
-    REVIEWER_AGENT      = "reviewer_agent"
-    TEST_QUALITY_AGENT  = "test_quality_agent"
+    REVIEWER_AGENT       = "reviewer_agent"
+    TEST_QUALITY_AGENT   = "test_quality_agent"
+    ARCHITECTURE_AGENT   = "architecture_agent"
 
 
 class ReviewStatus:
@@ -102,6 +112,26 @@ class TestQualityConfidence:
     HIGH   = "HIGH"
 
 
+class ArchitectureStatus:
+    APPROVED      = "ARCHITECTURE_APPROVED"
+    NEEDS_REVIEW  = "ARCHITECTURE_NEEDS_REVIEW"
+    BLOCKED       = "ARCHITECTURE_BLOCKED"
+    ERROR         = "ERROR"
+
+
+class ArchitectureRiskLevel:
+    LOW    = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH   = "HIGH"
+
+
+class ReleaseDecision:
+    APPROVED = "RELEASE_APPROVED"
+    SKIPPED  = "RELEASE_SKIPPED"
+    BLOCKED  = "RELEASE_BLOCKED"
+    ERROR    = "RELEASE_ERROR"
+
+
 # Phase 8 config
 REVIEW_REQUIRED     = True   # every story_implementation run triggers a review
 REVIEW_BLOCKS_MERGE = True   # APPROVED_BY_AI required for auto-merge
@@ -109,6 +139,10 @@ REVIEW_BLOCKS_MERGE = True   # APPROVED_BY_AI required for auto-merge
 # Phase 9 config
 TEST_QUALITY_REQUIRED     = True  # every story_implementation run triggers test quality review
 TEST_QUALITY_BLOCKS_MERGE = True  # TEST_QUALITY_APPROVED required for auto-merge
+
+# Phase 10 config
+ARCHITECTURE_REVIEW_REQUIRED     = True  # every story_implementation run triggers architecture review
+ARCHITECTURE_REVIEW_BLOCKS_MERGE = True  # ARCHITECTURE_APPROVED required for auto-merge
 
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5

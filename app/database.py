@@ -103,6 +103,14 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_required    BOOLEAN      NOT NULL DEFAULT TRUE",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_completed_at TIMESTAMP   NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_summary     TEXT         NULL",
+                # Phase 10 — Architecture Agent + Release Gate
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_status        VARCHAR(50)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_required      BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_completed_at  TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_summary       TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision           VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision_reason    TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decided_at         TIMESTAMP    NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -222,6 +230,29 @@ def init_db(retries: int = 5, delay: int = 3):
                     findings_json            TEXT          NULL,
                     recommendations_json     TEXT          NULL,
                     blocking_reasons_json    TEXT          NULL,
+                    model_used               VARCHAR(100)  NULL,
+                    memory_snapshot_ids_json TEXT          NULL,
+                    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Phase 10 — Architecture Agent reviews
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agent_architecture_reviews (
+                    id                       SERIAL PRIMARY KEY,
+                    run_id                   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    pr_number                INTEGER       NULL,
+                    pr_url                   VARCHAR(500)  NULL,
+                    repo_slug                VARCHAR(200)  NULL,
+                    story_key                VARCHAR(100)  NULL,
+                    agent_name               VARCHAR(100)  NOT NULL DEFAULT 'architecture_agent',
+                    architecture_status      VARCHAR(50)   NOT NULL,
+                    risk_level               VARCHAR(20)   NULL,
+                    summary                  TEXT          NULL,
+                    impact_areas_json        TEXT          NULL,
+                    blocking_reasons_json    TEXT          NULL,
+                    recommendations_json     TEXT          NULL,
                     model_used               VARCHAR(100)  NULL,
                     memory_snapshot_ids_json TEXT          NULL,
                     created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
@@ -352,6 +383,10 @@ def update_run_field(run_id: int, **fields):
         # Phase 9
         "test_quality_status", "test_quality_required",
         "test_quality_completed_at", "test_quality_summary",
+        # Phase 10
+        "architecture_status", "architecture_required",
+        "architecture_completed_at", "architecture_summary",
+        "release_decision", "release_decision_reason", "release_decided_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
