@@ -941,7 +941,8 @@ def record_execution_feedback(run_id: int) -> int:
             cur.execute(
                 """
                 SELECT issue_key, status, test_status, retry_count,
-                       merge_status, files_changed_count, error_detail, current_step
+                       merge_status, files_changed_count, error_detail, current_step,
+                       review_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -950,7 +951,7 @@ def record_execution_feedback(run_id: int) -> int:
             if not row:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
-                files_changed_count, error_detail, current_step = row
+                files_changed_count, error_detail, current_step, review_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -999,6 +1000,26 @@ def record_execution_feedback(run_id: int) -> int:
                 _ev(FeedbackType.MERGE_STATUS, merge_status)
             if files_changed_count is not None:
                 _ev(FeedbackType.FILES_CHANGED_COUNT, files_changed_count)
+
+            # Review signals (Phase 8)
+            if review_status:
+                from app.feedback import ReviewStatus
+                _ev(FeedbackType.REVIEW_STATUS, review_status)
+                if review_status == ReviewStatus.APPROVED_BY_AI:
+                    _ev(FeedbackType.REVIEW_APPROVED, "true")
+                elif review_status == ReviewStatus.NEEDS_CHANGES:
+                    _ev(FeedbackType.REVIEW_NEEDS_CHANGES, "true")
+                elif review_status == ReviewStatus.BLOCKED:
+                    _ev(FeedbackType.REVIEW_BLOCKED, "true")
+
+                # Look up risk_level from agent_reviews for this run
+                cur.execute(
+                    "SELECT risk_level FROM agent_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                )
+                ar = cur.fetchone()
+                if ar and ar[0]:
+                    _ev(FeedbackType.REVIEW_RISK_LEVEL, ar[0])
 
             if not events:
                 return 0
