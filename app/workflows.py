@@ -562,6 +562,24 @@ _PROFILE_RELEASE_POLICY: dict[str, dict] = {
 }
 _DEFAULT_PROFILE_POLICY: dict = {"allow_auto_merge": True, "require_tests": True, "require_build": False, "require_lint": False}
 
+# Phase 16 — deployment validation policy.
+# deployment_validation_required=False for all profiles: validation is post-merge
+# and observational only. It never retroactively alters the release_decision set
+# before merge. Promote to required=True per profile when environments are stable.
+_PROFILE_DEPLOYMENT_POLICY: dict[str, dict] = {
+    "python_fastapi":  {"deployment_validation_required": False},
+    "java_maven":      {"deployment_validation_required": False},
+    "java_gradle":     {"deployment_validation_required": False},
+    "node_react":      {"deployment_validation_required": False},
+    "generic_unknown": {"deployment_validation_required": False},
+}
+_DEFAULT_DEPLOYMENT_POLICY: dict = {"deployment_validation_required": False}
+
+
+def get_deployment_policy_for_profile(profile_name: str | None) -> dict:
+    """Return the deployment validation policy for a capability profile."""
+    return _PROFILE_DEPLOYMENT_POLICY.get(profile_name or "", _DEFAULT_DEPLOYMENT_POLICY)
+
 
 def evaluate_release_decision(
     mapping: dict,
@@ -682,14 +700,29 @@ def _run_post_merge_validation(
     """Run deployment validation after a successful merge.
 
     Non-fatal: any exception is caught and logged. Validation failure never
-    rolls back the merge — it is observational only at Phase 16.
+    rolls back the merge or alters the release_decision already stored — it is
+    observational only. Policy is defined in _PROFILE_DEPLOYMENT_POLICY.
     """
     try:
-        update_run_step(run_id, "deployment_validation")
         import os
+        if os.environ.get("DEPLOYMENT_VALIDATION_ENABLED", "true").lower() != "true":
+            logger.info("_run_post_merge_validation: disabled by env var — run_id=%s", run_id)
+            return
+
+        update_run_step(run_id, "deployment_validation")
         timeout_s = int(os.environ.get("DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS", "120"))
         retry_n   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_COUNT", "3"))
         retry_d   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS", "10"))
+
+        # Log the active deployment policy for this run (observational — required=False means
+        # a FAILED result is recorded and surfaced but never retroactively alters release_decision)
+        run_state_for_policy = get_run_state(run_id)
+        profile_name_for_policy = (run_state_for_policy or {}).get("capability_profile_name") or "generic_unknown"
+        dep_policy = _PROFILE_DEPLOYMENT_POLICY.get(profile_name_for_policy, _DEFAULT_DEPLOYMENT_POLICY)
+        logger.info(
+            "_run_post_merge_validation: profile=%s required=%s run_id=%s",
+            profile_name_for_policy, dep_policy["deployment_validation_required"], run_id,
+        )
 
         result = run_deployment_validation(
             run_id=run_id,

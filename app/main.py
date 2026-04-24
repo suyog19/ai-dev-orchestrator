@@ -1068,6 +1068,28 @@ def get_repo_capability_profile(repo_slug: str):
     return profile
 
 
+@app.get("/debug/deployment-policy")
+def get_deployment_policy(profile_name: str | None = None):
+    """Return the deployment validation policy for a capability profile.
+
+    If profile_name is omitted, returns the policy for all known profiles.
+    deployment_validation_required=False means a FAILED result is recorded and
+    surfaced but never retroactively alters the release_decision.
+    """
+    from app.workflows import get_deployment_policy_for_profile, _PROFILE_DEPLOYMENT_POLICY, _DEFAULT_DEPLOYMENT_POLICY
+    if profile_name:
+        return {
+            "profile_name": profile_name,
+            "policy": get_deployment_policy_for_profile(profile_name),
+            "note": "deployment_validation_required=False means observational only — does not block or revert merge",
+        }
+    return {
+        "profiles": {k: v for k, v in _PROFILE_DEPLOYMENT_POLICY.items()},
+        "default": _DEFAULT_DEPLOYMENT_POLICY,
+        "note": "deployment_validation_required=False means observational only — does not block or revert merge",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 16 — Deployment Profiles
 # ---------------------------------------------------------------------------
