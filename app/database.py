@@ -1345,6 +1345,21 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             release_row = cur.fetchone()
 
+            # --- Deployment Validation stats (Phase 16) ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_passed' AND feedback_value='true') AS dv_passed,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_failed' AND feedback_value='true') AS dv_failed,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_error'  AND feedback_value='true') AS dv_error,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_status') AS dv_total
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            dv_stats_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -1454,6 +1469,22 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                         "release_skipped":  int(rel_skipped or 0),
                     })
 
+            # Phase 16: deployment validation summary
+            if dv_stats_row:
+                dv_passed, dv_failed, dv_error, dv_total = dv_stats_row
+                if int(dv_total or 0) > 0:
+                    exec_bullets.append(
+                        f"Deployment validation: {int(dv_passed or 0)} passed, "
+                        f"{int(dv_failed or 0)} failed, "
+                        f"{int(dv_error or 0)} error of {int(dv_total)} recent validations"
+                    )
+                    exec_evidence.update({
+                        "dv_passed": int(dv_passed or 0),
+                        "dv_failed": int(dv_failed or 0),
+                        "dv_error":  int(dv_error or 0),
+                        "dv_total":  int(dv_total or 0),
+                    })
+
             exec_summary = (
                 "\n".join(f"- {b}" for b in exec_bullets)
                 if exec_bullets else "No execution runs recorded yet."
@@ -1552,7 +1583,8 @@ def record_execution_feedback(run_id: int) -> int:
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
                        review_status, test_quality_status,
-                       architecture_status, release_decision
+                       architecture_status, release_decision,
+                       deployment_validation_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1563,7 +1595,8 @@ def record_execution_feedback(run_id: int) -> int:
             issue_key, status, test_status, retry_count, merge_status, \
                 files_changed_count, error_detail, current_step, \
                 review_status, test_quality_status, \
-                architecture_status, release_decision = row
+                architecture_status, release_decision, \
+                deployment_validation_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1702,6 +1735,36 @@ def record_execution_feedback(run_id: int) -> int:
                     _ev(FeedbackType.CLARIFICATION_CANCELLED, "true")
                 if any(s == "EXPIRED" for s in statuses):
                     _ev(FeedbackType.CLARIFICATION_EXPIRED, "true")
+
+            # Deployment validation signals (Phase 16)
+            if deployment_validation_status:
+                from app.feedback import FeedbackTypeP16, DeploymentValidationStatus as DVS
+                _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_STATUS, deployment_validation_status)
+                if deployment_validation_status == DVS.PASSED:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_PASSED, "true")
+                elif deployment_validation_status == DVS.FAILED:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_FAILED, "true")
+                    # Count failed smoke tests from the latest deployment_validations row
+                    try:
+                        cur.execute(
+                            """
+                            SELECT smoke_results_json FROM deployment_validations
+                            WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                            """,
+                            (run_id,),
+                        )
+                        dv_row = cur.fetchone()
+                        if dv_row and dv_row[0]:
+                            smoke_results = json.loads(dv_row[0])
+                            failed_count = sum(
+                                1 for r in smoke_results if r.get("status") != "PASSED"
+                            )
+                            if failed_count > 0:
+                                _ev(FeedbackTypeP16.DEPLOYMENT_SMOKE_FAILURE_COUNT, failed_count)
+                    except Exception:
+                        pass
+                elif deployment_validation_status == DVS.ERROR:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_ERROR, "true")
 
             if not events:
                 return 0
