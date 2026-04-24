@@ -61,6 +61,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
 - `app/file_modifier.py` — applies code patches returned by Claude (original → replacement matching)
 - `app/repo_analysis.py` — introspects cloned repos (language detection, entry points, file counts) before Claude calls
+- `app/security.py` — admin key middleware, GitHub write guard, Redis rate limiting
 - `app/webhooks.py` — Jira and Telegram webhook receivers
 - `app/jira_client.py` — Jira REST API v3 calls; `get_issue_details()` fetches story summary + ADF-parsed description + acceptance criteria for the Reviewer Agent
 - `app/github_api.py` — GitHub API calls (PR creation, labels, merge, `post_pr_comment()`)
@@ -116,6 +117,8 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `agent_reviews` | One row per Reviewer Agent verdict; FK to `workflow_runs` |
 | `agent_test_quality_reviews` | One row per Test Quality Agent verdict; FK to `workflow_runs` |
 | `agent_architecture_reviews` | One row per Architecture Agent verdict; FK to `workflow_runs` |
+| `security_events` | Append-only audit log of auth failures, webhook rejections, write blocks |
+| `control_flags` | Runtime control flags (paused state); DB takes precedence over env var |
 
 **`workflow_runs` status flow:**
 ```
@@ -316,7 +319,7 @@ Two separate VMs. Never share a VM between dev and prod.
 | Dev | `65.2.140.4` | `dev` | `self-hosted-dev` | `dev.orchestrator.suyogjoshi.com` |
 | Prod | `13.234.33.241` | `main` | `self-hosted-prod` | `orchestrator.suyogjoshi.com` |
 
-## Security Layer (Phase 11)
+## Security Layer
 
 **`app/security.py`** is the central security module.
 
@@ -409,5 +412,4 @@ RECOMMENDATION: <recommendation + why>
 - Memory pruning / decay (snapshots are recomputed from raw events — no TTL needed)
 - Semantic/vector search for memory retrieval (rule-based aggregation is sufficient)
 - UI or dashboard
-- Production security hardening
 - Multi-agent planning
