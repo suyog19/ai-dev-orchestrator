@@ -1,0 +1,22 @@
+# Phase 16 — Deployment profile seeds.
+# Profiles are upserted idempotently on app startup (ON CONFLICT DO UPDATE).
+# Manual DB changes are preserved: upsert only sets fields defined here.
+# To disable seeding entirely, delete or empty this file.
+#
+# deployment_type options: ec2_service | github_pages | huggingface_space | none
+# smoke_tests: list of { name, type, method, path, expected_status, expected_contains }
+
+profiles:
+  - repo_slug: suyog19/sandbox-fastapi-app
+    environment: dev
+    deployment_type: ec2_service
+    base_url: ""
+    healthcheck_path: /healthz
+    enabled: false
+    smoke_tests:
+      - name: healthcheck
+        type: http
+        method: GET
+        path: /healthz
+        expected_status: 200
+        expected_contains: "ok"

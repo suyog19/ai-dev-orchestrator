@@ -468,6 +468,9 @@ def init_db(retries: int = 5, delay: int = 3):
         mappings = json.loads(seed_file.read_text())
         upsert_seed_mappings(mappings)
 
+    # Seed deployment profiles from config/deployment_profiles.yaml (Phase 16)
+    seed_deployment_profiles()
+
     logger.info("Database initialized — tables ready")
 
 
@@ -3636,3 +3639,91 @@ def list_deployment_validations(
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Profile seeding
+# ---------------------------------------------------------------------------
+
+def seed_deployment_profiles() -> int:
+    """Idempotently seed deployment_profiles from config/deployment_profiles.yaml.
+
+    Uses ON CONFLICT (repo_slug, environment) DO UPDATE so manual DB changes
+    to fields NOT defined in the YAML are preserved. Returns the number of
+    profiles upserted (0 if file absent or empty).
+
+    Invalid YAML or missing required fields are logged as warnings; startup
+    is never aborted.
+    """
+    seed_file = Path(__file__).parent.parent / "config" / "deployment_profiles.yaml"
+    if not seed_file.exists():
+        return 0
+
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        # PyYAML is in requirements.txt; log and continue
+        logger.warning("seed_deployment_profiles: PyYAML not installed — skipping seed")
+        return 0
+
+    try:
+        content = yaml.safe_load(seed_file.read_text())
+    except Exception as exc:
+        logger.warning("seed_deployment_profiles: invalid YAML — %s", exc)
+        return 0
+
+    if not content or not isinstance(content, dict):
+        return 0
+
+    profiles = content.get("profiles") or []
+    if not profiles:
+        return 0
+
+    seeded = 0
+    for entry in profiles:
+        try:
+            repo_slug        = entry["repo_slug"]
+            environment      = entry.get("environment", "dev")
+            deployment_type  = entry["deployment_type"]
+        except KeyError as exc:
+            logger.warning("seed_deployment_profiles: missing required field %s in entry %s — skipping", exc, entry)
+            continue
+
+        smoke_tests = entry.get("smoke_tests") or []
+        smoke_json  = json.dumps(smoke_tests)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO deployment_profiles
+                            (repo_slug, environment, deployment_type, base_url,
+                             healthcheck_path, smoke_tests_json, enabled, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (repo_slug, environment)
+                        DO UPDATE SET
+                            deployment_type  = EXCLUDED.deployment_type,
+                            base_url         = EXCLUDED.base_url,
+                            healthcheck_path = EXCLUDED.healthcheck_path,
+                            smoke_tests_json = EXCLUDED.smoke_tests_json,
+                            enabled          = EXCLUDED.enabled,
+                            updated_at       = NOW()
+                        """,
+                        (
+                            repo_slug,
+                            environment,
+                            deployment_type,
+                            entry.get("base_url") or None,
+                            entry.get("healthcheck_path"),
+                            smoke_json,
+                            entry.get("enabled", True),
+                        ),
+                    )
+            seeded += 1
+        except Exception as exc:
+            logger.warning("seed_deployment_profiles: failed to seed %s/%s — %s", repo_slug, environment, exc)
+
+    if seeded:
+        logger.info("seed_deployment_profiles: seeded %d profile(s)", seeded)
+    return seeded
