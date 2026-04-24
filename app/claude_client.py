@@ -413,6 +413,9 @@ REVIEWER_PROMPT = (
     "- BLOCKED: tests failed, or the diff clearly contradicts the story intent\n"
     "- NEEDS_CHANGES: implementation is plausible but incomplete, risky, or questionable\n"
     "- APPROVED_BY_AI: story alignment, code risk, and test state are all acceptable\n\n"
+    "Clarification: If there is genuine ambiguity that makes it impossible to give a safe verdict "
+    "and a human answer would resolve it, you may set needs_clarification=true with a specific question and options. "
+    "Only use this when the ambiguity is blocking — do not use it to avoid making a judgement call.\n\n"
     "Call the submit_review tool only — do not respond with prose."
 )
 
@@ -474,6 +477,32 @@ _REVIEW_TOOL = {
         "required": ["review_status", "risk_level", "summary", "findings", "blocking_reasons", "recommendations"],
     },
 }
+
+_REVIEW_CLARIFICATION_FIELDS = {
+    "needs_clarification": {
+        "type": "boolean",
+        "description": (
+            "Set to true only if there is genuine blocking ambiguity that a human must resolve. "
+            "Omit or set false otherwise."
+        ),
+    },
+    "clarification_question": {
+        "type": "string",
+        "description": "Specific question for the human if needs_clarification=true.",
+    },
+    "clarification_context_summary": {
+        "type": "string",
+        "description": "Brief context explaining why clarification is needed.",
+    },
+    "clarification_options": {
+        "type": "array",
+        "description": "2-4 short options for the human to choose from.",
+        "items": {"type": "string"},
+    },
+}
+
+# Inject clarification fields into _REVIEW_TOOL schema
+_REVIEW_TOOL["input_schema"]["properties"].update(_REVIEW_CLARIFICATION_FIELDS)
 
 TEST_QUALITY_PROMPT = (
     "You are an independent Test Quality Agent. Your job is to assess whether the tests "
@@ -1044,6 +1073,9 @@ ARCHITECTURE_PROMPT = (
     "- ARCHITECTURE_APPROVED: change is scoped to the Story, no meaningful architecture or system risk detected.\n\n"
     "Do not penalize for style. Do not comment on test adequacy (that is the Test Quality Agent's job). "
     "Do not repeat what the Reviewer Agent says about code quality. "
+    "Clarification: If there is genuine blocking architectural ambiguity that a human must resolve "
+    "and an answer would change your verdict, set needs_clarification=true with a specific question and options. "
+    "Only use this when truly necessary — do not avoid making a judgement call.\n\n"
     "Call the submit_architecture_review tool only — do not respond with prose."
 )
 
@@ -1112,6 +1144,9 @@ _ARCHITECTURE_TOOL = {
         ],
     },
 }
+
+# Inject clarification fields into _ARCHITECTURE_TOOL schema
+_ARCHITECTURE_TOOL["input_schema"]["properties"].update(_REVIEW_CLARIFICATION_FIELDS)
 
 
 def review_architecture(

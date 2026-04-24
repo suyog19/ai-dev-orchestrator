@@ -2423,6 +2423,29 @@ def get_clarification_by_id(clarification_id: int) -> dict | None:
     }
 
 
+def get_run_state(run_id: int) -> dict | None:
+    """Return pr_url, working_branch and test fields for a run — used for review-stage resume."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pr_url, working_branch, test_status, test_command, test_output
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "pr_url":         row[0],
+        "working_branch": row[1],
+        "test_status":    row[2],
+        "test_command":   row[3],
+        "test_output":    row[4],
+    }
+
+
 def list_pending_clarifications(limit: int = 50) -> list[dict]:
     """Return all PENDING clarification_requests, oldest first."""
     with get_conn() as conn:

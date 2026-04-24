@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment, get_pr_diff
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
 from app.jira_client import get_issue_details
@@ -20,12 +20,13 @@ from app.database import (
     store_agent_review,
     store_test_quality_review,
     store_architecture_review,
+    get_active_clarification,
+    get_run_state,
 )
 from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision, ClarificationContextKey
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
 from app.clarification import pause_for_clarification, ClarificationRequested, is_clarification_enabled
-from app.database import get_active_clarification
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -510,6 +511,169 @@ def evaluate_release_decision(
     }
 
 
+def _story_review_and_release(
+    run_id: int,
+    issue_key: str,
+    summary: str,
+    mapping: dict,
+    run_state: dict,
+    clarification_answer: str | None = None,
+) -> None:
+    """Run review agents and release gate for a story that already has a PR.
+
+    Used on resume after a review-stage clarification is answered.
+    Reconstructs context from DB + GitHub diff instead of re-running implementation.
+    """
+    pr_url = run_state["pr_url"]
+    pr_number_match = __import__("re").search(r"/pull/(\d+)$", pr_url or "")
+    if not pr_number_match:
+        logger.error("_story_review_and_release: cannot extract PR number from url=%s", pr_url)
+        fail_run(run_id, f"Review resume failed: cannot parse PR number from {pr_url}")
+        return
+    pr_number = int(pr_number_match.group(1))
+    pr = {"number": pr_number, "url": pr_url, "title": f"ai: {issue_key} — {summary}", "body": ""}
+
+    execution_memory = ""
+    try:
+        execution_memory = get_execution_memory(mapping["repo_slug"])
+    except Exception:
+        pass
+    if clarification_answer:
+        note = f"User clarification for review: {clarification_answer}"
+        execution_memory = f"{execution_memory}\n\n{note}" if execution_memory else note
+
+    story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("_story_review_and_release: get_issue_details failed (non-fatal) — %s", exc)
+
+    diff_block = ""
+    try:
+        diff_block = get_pr_diff(mapping["repo_slug"], pr_number)
+    except Exception as exc:
+        logger.warning("_story_review_and_release: get_pr_diff failed (non-fatal) — %s", exc)
+
+    final_test_result = {
+        "status": run_state.get("test_status") or "NOT_RUN",
+        "command": run_state.get("test_command") or "",
+        "output": run_state.get("test_output") or "",
+    }
+
+    review_package = _build_review_package(
+        issue_key=issue_key,
+        summary=summary,
+        story_details=story_details,
+        mapping=mapping,
+        branch=run_state.get("working_branch", ""),
+        pr=pr,
+        commit_message=f"ai: {issue_key} — {summary}",
+        final_changes=[],
+        diff_block=diff_block,
+        final_test_result=final_test_result,
+        retry_count=0,
+        execution_memory=execution_memory,
+    )
+
+    send_message(
+        "review_resumed", "RUNNING",
+        f"{issue_key}: re-running review agents after clarification answer",
+    )
+
+    # --- Reviewer Agent ---
+    update_run_step(run_id, "reviewing")
+    verdict: dict = {}
+    try:
+        verdict = review_pr(**review_package)
+        store_agent_review(
+            run_id=run_id, verdict=verdict, pr_number=pr_number,
+            pr_url=pr_url, repo_slug=mapping["repo_slug"], story_key=issue_key,
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr_number, _format_review_comment(verdict))
+        except Exception:
+            pass
+        send_message(
+            "review_completed", verdict.get("review_status", "UNKNOWN"),
+            f"{issue_key}: PR #{pr_number} verdict={verdict.get('review_status')} risk={verdict.get('risk_level')}",
+        )
+    except Exception as exc:
+        verdict = {
+            "review_status": ReviewStatus.ERROR, "risk_level": "HIGH",
+            "summary": f"Reviewer Agent error: {exc}",
+            "findings": [], "blocking_reasons": [str(exc)], "recommendations": [],
+        }
+        logger.error("_story_review_and_release: Reviewer Agent failed — %s", exc)
+
+    # --- Architecture Agent ---
+    update_run_step(run_id, "architecture_review")
+    arch_verdict: dict = {}
+    try:
+        arch_package = _build_architecture_review_package(
+            issue_key=issue_key, summary=summary, story_details=story_details,
+            mapping=mapping, pr=pr, final_changes=[], diff_block=diff_block,
+            final_test_result=final_test_result, verdict=verdict, tq_verdict={},
+            retry_count=0, execution_memory=execution_memory, repo_analysis={},
+        )
+        arch_verdict = review_architecture(**arch_package)
+        store_architecture_review(
+            run_id=run_id, verdict=arch_verdict, pr_number=pr_number,
+            pr_url=pr_url, repo_slug=mapping["repo_slug"], story_key=issue_key,
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr_number, _format_architecture_comment(arch_verdict))
+        except Exception:
+            pass
+        send_message(
+            "architecture_review_completed", arch_verdict.get("architecture_status", "UNKNOWN"),
+            f"{issue_key}: arch={arch_verdict.get('architecture_status')} risk={arch_verdict.get('risk_level')}",
+        )
+    except Exception as exc:
+        arch_verdict = {
+            "architecture_status": ArchitectureStatus.ERROR, "risk_level": "HIGH",
+            "summary": f"Architecture Agent error: {exc}",
+            "impact_areas": [], "blocking_reasons": [str(exc)], "recommendations": [],
+        }
+        logger.error("_story_review_and_release: Architecture Agent failed — %s", exc)
+
+    # --- Release Gate ---
+    review_status = verdict.get("review_status", ReviewStatus.ERROR)
+    test_quality_status = TestQualityStatus.ERROR
+    architecture_status = arch_verdict.get("architecture_status", ArchitectureStatus.ERROR)
+
+    update_run_step(run_id, "release_gate")
+    release = evaluate_release_decision(
+        mapping=mapping,
+        final_test_result=final_test_result,
+        applied={"applied": True, "count": 0, "files": []},
+        review_status=review_status,
+        test_quality_status=test_quality_status,
+        architecture_status=architecture_status,
+    )
+    update_run_field(
+        run_id,
+        release_decision=release["release_decision"],
+        release_decision_reason=release["reason"],
+        release_decided_at=datetime.now(timezone.utc),
+    )
+
+    update_run_step(run_id, "merge_check")
+    if release["can_auto_merge"]:
+        try:
+            ensure_github_writes_allowed("merge_pr", mapping["repo_slug"], run_id)
+            merge_pull_request(mapping["repo_slug"], pr_number, pr["title"])
+            update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
+            send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr_number} auto-merged after clarification")
+        except Exception as exc:
+            update_run_field(run_id, merge_status="FAILED")
+            send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
+    else:
+        update_run_field(run_id, merge_status="SKIPPED")
+        send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: merge skipped ({release['reason']})")
+
+    update_run_step(run_id, "done")
+
+
 def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
     logger.info("story_implementation: starting %s (%s) — %s", issue_key, issue_type, summary)
 
@@ -520,6 +684,29 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     if not mapping:
         logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
+
+    # --- Skip to review if resuming after a review-stage clarification ---
+    # If pr_url is already set in the run AND there's an answered PRE_REVIEW clarification,
+    # skip re-implementation and jump straight to the review agents with injected answer.
+    try:
+        run_state = get_run_state(run_id)
+        if run_state and run_state.get("pr_url"):
+            review_clar = get_active_clarification(run_id)
+            if review_clar and review_clar["status"] == "ANSWERED" and review_clar.get("context_key") == ClarificationContextKey.PRE_REVIEW:
+                logger.info(
+                    "story_implementation: review-stage resume detected (pr_url set, PRE_REVIEW answered) — skipping to review",
+                )
+                _story_review_and_release(
+                    run_id=run_id,
+                    issue_key=issue_key,
+                    summary=summary,
+                    mapping=mapping,
+                    run_state=run_state,
+                    clarification_answer=review_clar.get("answer_text"),
+                )
+                return
+    except Exception as exc:
+        logger.warning("story_implementation: review-resume pre-check failed (non-fatal) — %s", exc)
 
     # --- Memory context for execution prompts ---
     execution_memory = ""
@@ -896,6 +1083,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
                 f"{verdict.get('summary', '')}"
             ),
         )
+        # Reviewer requests clarification — pause workflow
+        if verdict.get("needs_clarification") and is_clarification_enabled():
+            pause_for_clarification(
+                run_id=run_id,
+                question=verdict.get("clarification_question", "Reviewer needs clarification to proceed."),
+                context_key=ClarificationContextKey.PRE_REVIEW,
+                context_summary=verdict.get("clarification_context_summary") or f"PR #{pr['number']} review",
+                options=verdict.get("clarification_options"),
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
     except Exception as exc:
         logger.error("story_implementation: Reviewer Agent failed — %s", exc)
         error_verdict = {
@@ -1049,6 +1249,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
                 f"{arch_verdict.get('summary', '')}"
             ),
         )
+        # Architecture Agent requests clarification — pause workflow
+        if arch_verdict.get("needs_clarification") and is_clarification_enabled():
+            pause_for_clarification(
+                run_id=run_id,
+                question=arch_verdict.get("clarification_question", "Architecture Agent needs clarification."),
+                context_key=ClarificationContextKey.PRE_REVIEW,
+                context_summary=arch_verdict.get("clarification_context_summary") or f"PR #{pr['number']} arch review",
+                options=arch_verdict.get("clarification_options"),
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
     except Exception as exc:
         logger.error("story_implementation: Architecture Agent failed — %s", exc)
         arch_verdict = {
