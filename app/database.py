@@ -334,6 +334,70 @@ def update_run_field(run_id: int, **fields):
 
 
 # ---------------------------------------------------------------------------
+# Phase 8 — Reviewer Agent helpers
+# ---------------------------------------------------------------------------
+
+def store_agent_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist a Reviewer Agent verdict and update workflow_runs review fields.
+
+    Inserts one row into agent_reviews and sets review_status + review_completed_at
+    on the parent workflow_run. Returns the new agent_reviews.id.
+    """
+    from app.feedback import AgentName
+
+    review_status = verdict.get("review_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, review_status, risk_level, summary,
+                     findings_json, recommendations_json, blocking_reasons_json,
+                     model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.REVIEWER_AGENT,
+                    review_status,
+                    verdict.get("risk_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("findings") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    json.dumps(verdict.get("blocking_reasons") or []),
+                    model_used,
+                ),
+            )
+            review_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET review_status = %s, review_completed_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+                """,
+                (review_status, run_id),
+            )
+
+    logger.info(
+        "store_agent_review: run_id=%s review_id=%s status=%s",
+        run_id, review_id, review_status,
+    )
+    return review_id
+
+
+# ---------------------------------------------------------------------------
 # Phase 6 — planning helpers
 # ---------------------------------------------------------------------------
 

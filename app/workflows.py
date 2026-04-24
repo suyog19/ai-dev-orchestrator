@@ -5,7 +5,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr
 from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
@@ -17,7 +17,9 @@ from app.database import (
     get_created_children_for_epic, store_planning_metadata,
     record_planning_feedback, record_execution_feedback,
     get_planning_memory, get_execution_memory,
+    store_agent_review,
 )
+from app.feedback import ReviewStatus
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -411,6 +413,60 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         review_package["test_result"]["status"],
         len(review_package["story_context"]["acceptance_criteria"]),
     )
+
+    # --- Run Reviewer Agent ---
+    update_run_step(run_id, "reviewing")
+    verdict: dict = {}
+    try:
+        verdict = review_pr(**review_package)
+        store_agent_review(
+            run_id=run_id,
+            verdict=verdict,
+            pr_number=pr["number"],
+            pr_url=pr["url"],
+            repo_slug=mapping["repo_slug"],
+            story_key=issue_key,
+        )
+        logger.info(
+            "story_implementation: review complete — status=%s risk=%s",
+            verdict.get("review_status"), verdict.get("risk_level"),
+        )
+        send_message(
+            "review_completed",
+            verdict.get("review_status", "UNKNOWN"),
+            (
+                f"{issue_key}: PR #{pr['number']}\n"
+                f"Verdict: {verdict.get('review_status')}\n"
+                f"Risk: {verdict.get('risk_level')}\n"
+                f"{verdict.get('summary', '')}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("story_implementation: Reviewer Agent failed — %s", exc)
+        error_verdict = {
+            "review_status": ReviewStatus.ERROR,
+            "risk_level": "HIGH",
+            "summary": f"Reviewer Agent error: {exc}",
+            "findings": [],
+            "blocking_reasons": [str(exc)],
+            "recommendations": [],
+        }
+        try:
+            store_agent_review(
+                run_id=run_id,
+                verdict=error_verdict,
+                pr_number=pr["number"],
+                pr_url=pr["url"],
+                repo_slug=mapping["repo_slug"],
+                story_key=issue_key,
+            )
+        except Exception as db_exc:
+            logger.error("story_implementation: store_agent_review failed — %s", db_exc)
+        send_message(
+            "review_error", "ERROR",
+            f"{issue_key}: Reviewer Agent error — {exc}",
+        )
+        verdict = error_verdict
 
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
