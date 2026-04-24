@@ -894,6 +894,35 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             exec_categories = cur.fetchall()
 
+            # --- Reviewer Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_approved'      AND feedback_value='true') AS rev_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_needs_changes' AND feedback_value='true') AS rev_needs_changes,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_blocked'       AND feedback_value='true') AS rev_blocked,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_status') AS rev_total
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            review_row = cur.fetchone()
+
+            # --- Test Quality Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='test_quality_approved' AND feedback_value='true') AS tq_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='tests_weak'            AND feedback_value='true') AS tq_weak,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='tests_blocking'        AND feedback_value='true') AS tq_blocking
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            tq_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -942,6 +971,36 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                 exec_evidence["failure_categories"] = {
                     cat: int(cnt) for cat, cnt in exec_categories
                 }
+
+            if review_row:
+                rev_approved, rev_needs_changes, rev_blocked, rev_total = review_row
+                if rev_total and int(rev_total) > 0:
+                    exec_bullets.append(
+                        f"Reviewer Agent: {int(rev_approved or 0)} approved, "
+                        f"{int(rev_needs_changes or 0)} needs-changes, "
+                        f"{int(rev_blocked or 0)} blocked of {int(rev_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "review_approved":      int(rev_approved or 0),
+                        "review_needs_changes": int(rev_needs_changes or 0),
+                        "review_blocked":       int(rev_blocked or 0),
+                        "review_total":         int(rev_total or 0),
+                    })
+
+            if tq_row:
+                tq_approved, tq_weak, tq_blocking = tq_row
+                tq_total = (tq_approved or 0) + (tq_weak or 0) + (tq_blocking or 0)
+                if int(tq_total) > 0:
+                    exec_bullets.append(
+                        f"Test Quality Agent: {int(tq_approved or 0)} approved, "
+                        f"{int(tq_weak or 0)} weak, "
+                        f"{int(tq_blocking or 0)} blocking of {int(tq_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "tq_approved":  int(tq_approved or 0),
+                        "tq_weak":      int(tq_weak or 0),
+                        "tq_blocking":  int(tq_blocking or 0),
+                    })
 
             exec_summary = (
                 "\n".join(f"- {b}" for b in exec_bullets)
