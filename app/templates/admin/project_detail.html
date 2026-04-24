@@ -233,6 +233,35 @@
 </section>
 {% endif %}
 
+{% if snapshots_by_kind.makefile_recommendation %}
+{% set mf = snapshots_by_kind.makefile_recommendation %}
+<section>
+  <h2>Makefile Recommendation</h2>
+  <div style="background:#fff8e1;border:1px solid #ffd54f;border-radius:4px;padding:14px;margin-bottom:8px">
+    <strong>No test/build/lint commands detected.</strong>
+    Adding a root Makefile will allow the orchestrator to validate changes automatically.
+  </div>
+  {% if mf.details and mf.details.suggested_makefile %}
+  <h3 style="margin-top:12px">Suggested Makefile</h3>
+  <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:0.88em;white-space:pre-wrap">{{ mf.details.suggested_makefile }}</pre>
+  {% endif %}
+  {% if mf.details and mf.details.suggested_hints_entry %}
+  {% set hint = mf.details.suggested_hints_entry %}
+  <h3 style="margin-top:12px">config/repo_command_hints.yaml entry (after adding Makefile)</h3>
+  <pre style="background:#f5f5f5;padding:12px;border-radius:4px;font-size:0.88em">repos:
+  {{ repo_slug }}:
+    profile_name: {{ hint.profile_name }}
+    test_command: {{ hint.test_command }}
+    build_command: {{ hint.build_command }}
+    lint_command: {{ hint.lint_command }}</pre>
+  {% endif %}
+  {% if mf.details and mf.details.action_required %}
+  <p style="margin-top:8px;color:#666">Action: {{ mf.details.action_required }}</p>
+  {% endif %}
+  <p class="text-muted" style="font-size:0.8em;margin-top:8px">Updated {{ mf.updated_at[:16] if mf.updated_at else "—" }}</p>
+</section>
+{% endif %}
+
 {% if snapshots %}
 <section>
   <h2>All Knowledge Snapshots</h2>

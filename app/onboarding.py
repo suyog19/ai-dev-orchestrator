@@ -130,6 +130,87 @@ def _check_deployment_profile(
     return "DRAFT_CREATED", notes
 
 
+def _generate_makefile_recommendation(repo_slug: str, structure_scan: dict):
+    """Generate and persist a Makefile recommendation for generic_unknown repos.
+
+    Called only when profile is generic_unknown and no test command is available.
+    Does NOT commit or modify the repo.
+    """
+    top_level = structure_scan.get("top_level_dirs", [])
+    source_files = structure_scan.get("service_files", []) + structure_scan.get("config_files", [])
+
+    # Detect likely language for the recommendation
+    py_count = sum(1 for f in source_files if f.endswith(".py"))
+    js_count = sum(1 for f in source_files if f.endswith((".js", ".ts")))
+    language_hint = "python" if py_count > js_count else ("javascript" if js_count > 0 else "unknown")
+
+    if language_hint == "python":
+        makefile_content = """test:
+\tpython -m pytest -q --tb=short
+
+lint:
+\tpython -m flake8 .
+
+install:
+\tpip install -r requirements.txt"""
+        test_target_note = "pytest — assumes requirements.txt is present"
+    elif language_hint == "javascript":
+        makefile_content = """test:
+\tnpm test
+
+build:
+\tnpm run build
+
+lint:
+\tnpm run lint
+
+install:
+\tnpm install"""
+        test_target_note = "npm test — adjust for your test runner"
+    else:
+        makefile_content = """test:
+\t# add your test command here
+
+build:
+\t# add your build command here
+
+lint:
+\t# add your lint command here"""
+        test_target_note = "fill in appropriate commands for your stack"
+
+    has_services = bool(top_level)
+    summary = (
+        f"Repo '{repo_slug}' is detected as generic_unknown with no test/build/lint commands. "
+        f"Adding a root Makefile will allow the orchestrator to validate changes automatically.\n\n"
+        f"Suggested Makefile:\n{makefile_content}\n\n"
+        f"Note: {test_target_note}. "
+        f"Once added, update config/repo_command_hints.yaml with profile_name and commands."
+    )
+
+    details = {
+        "profile_issue": "generic_unknown — no commands detected",
+        "language_hint": language_hint,
+        "suggested_makefile": makefile_content,
+        "suggested_hints_entry": {
+            "profile_name": f"{language_hint}_monorepo" if has_services else f"{language_hint}_project",
+            "test_command": "make test",
+            "build_command": "make build",
+            "lint_command": "make lint",
+        },
+        "action_required": "Create a root Makefile with test/build/lint targets, then add entry to config/repo_command_hints.yaml",
+        "auto_merged_blocked_reason": "generic_unknown profile disables auto-merge by policy — fix commands to enable it",
+        "do_not_modify_repo": True,
+    }
+
+    upsert_knowledge_snapshot(
+        repo_slug=repo_slug,
+        snapshot_kind="makefile_recommendation",
+        summary=summary,
+        details=details,
+        source_files=None,
+    )
+
+
 def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: str):
     """Execute the project onboarding workflow.
 
@@ -341,6 +422,16 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
             "Project onboarding deployment check done: run_id=%s status=%s",
             onboarding_run_id, deploy_status,
         )
+
+        # ------------------------------------------------------------------
+        # Step 8: Makefile recommendation (generic_unknown only, non-fatal)
+        # ------------------------------------------------------------------
+        if profile_name == "generic_unknown" and test_result == "NOT_RUN":
+            try:
+                _generate_makefile_recommendation(repo_slug, structure)
+                logger.info("Makefile recommendation generated for %s", repo_slug)
+            except Exception as exc:
+                logger.warning("Makefile recommendation failed (non-fatal): %s", exc)
 
     finally:
         if os.path.isdir(work_dir):
