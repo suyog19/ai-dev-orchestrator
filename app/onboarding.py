@@ -181,8 +181,8 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
             repo_slug=repo_slug,
             snapshot_kind="architecture",
             summary=arch_summary,
-            details=json.dumps(arch),
-            source_files=json.dumps(structure.get("routing_files", []) + structure.get("config_files", [])),
+            details=arch,
+            source_files=structure.get("routing_files", []) + structure.get("config_files", []),
         )
 
         # Also persist open_questions as a separate snapshot if any
@@ -192,7 +192,7 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
                 repo_slug=repo_slug,
                 snapshot_kind="open_questions",
                 summary="\n".join(f"- {q}" for q in open_questions),
-                details=json.dumps({"open_questions": open_questions}),
+                details={"open_questions": open_questions},
                 source_files=None,
             )
 
