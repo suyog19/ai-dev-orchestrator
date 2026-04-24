@@ -598,6 +598,8 @@ def update_run_field(run_id: int, **fields):
         "architecture_status", "architecture_required",
         "architecture_completed_at", "architecture_summary",
         "release_decision", "release_decision_reason", "release_decided_at",
+        # Phase 13
+        "head_sha", "github_statuses_published", "github_statuses_published_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -2611,6 +2613,73 @@ def list_clarifications(status: str | None = None, run_id: int | None = None, li
             "telegram_message_id": r[12],
             "created_at":          r[13].isoformat() if r[13] else None,
             "expires_at":          r[14].isoformat() if r[14] else None,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — GitHub commit status helpers
+# ---------------------------------------------------------------------------
+
+def record_github_status_update(
+    run_id: int,
+    repo_slug: str,
+    commit_sha: str,
+    context: str,
+    state: str,
+    description: str | None = None,
+    pr_number: int | None = None,
+    target_url: str | None = None,
+    github_response_json: str | None = None,
+) -> int:
+    """Insert a row into github_status_updates and return its id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO github_status_updates
+                    (run_id, repo_slug, commit_sha, pr_number, context, state,
+                     description, target_url, github_response_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (run_id, repo_slug, commit_sha, pr_number, context, state,
+                 description, target_url, github_response_json),
+            )
+            return cur.fetchone()[0]
+
+
+def list_github_status_updates(run_id: int) -> list[dict]:
+    """Return all github_status_updates rows for a run, newest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, repo_slug, commit_sha, pr_number, context,
+                       state, description, target_url, github_response_json,
+                       created_at, updated_at
+                FROM github_status_updates
+                WHERE run_id = %s
+                ORDER BY created_at DESC
+                """,
+                (run_id,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":                   r[0],
+            "run_id":               r[1],
+            "repo_slug":            r[2],
+            "commit_sha":           r[3],
+            "pr_number":            r[4],
+            "context":              r[5],
+            "state":                r[6],
+            "description":          r[7],
+            "target_url":           r[8],
+            "github_response_json": r[9],
+            "created_at":           r[10].isoformat() if r[10] else None,
+            "updated_at":           r[11].isoformat() if r[11] else None,
         }
         for r in rows
     ]

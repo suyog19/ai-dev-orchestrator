@@ -197,6 +197,52 @@ def get_pr_diff(repo_name: str, pr_number: int) -> str:
     return response.text
 
 
+_VALID_GITHUB_STATES = {"success", "failure", "pending", "error"}
+
+
+def create_commit_status(
+    repo_slug: str,
+    sha: str,
+    state: str,
+    context: str,
+    description: str,
+    target_url: str | None = None,
+) -> dict:
+    """Publish a GitHub commit status on a specific SHA.
+
+    state must be one of: success, failure, pending, error.
+    Raises ValueError for invalid state, RuntimeError/HTTPError on API failures.
+    Returns the GitHub API response dict.
+    """
+    if state not in _VALID_GITHUB_STATES:
+        raise ValueError(f"Invalid GitHub status state '{state}'. Must be one of {_VALID_GITHUB_STATES}")
+    if not sha or len(sha) < 7:
+        raise ValueError(f"Invalid commit SHA: {sha!r}")
+
+    # GitHub descriptions >140 chars are silently truncated — enforce here so logs are accurate
+    if len(description) > 140:
+        description = description[:137] + "..."
+
+    slug = _normalize_slug(repo_slug)
+    payload: dict = {"state": state, "context": context, "description": description}
+    if target_url:
+        payload["target_url"] = target_url
+
+    response = requests.post(
+        f"{GITHUB_API}/repos/{slug}/statuses/{sha}",
+        json=payload,
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    logger.info(
+        "Commit status published: repo=%s sha=%.8s context=%s state=%s",
+        slug, sha, context, state,
+    )
+    return data
+
+
 def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:
     """Squash-merge a PR. Returns {"sha": str, "merged": bool, "message": str}.
 
