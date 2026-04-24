@@ -284,6 +284,20 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS security_events (
+                    id           SERIAL PRIMARY KEY,
+                    event_type   VARCHAR(100)  NOT NULL,
+                    source       VARCHAR(100)  NULL,
+                    actor        VARCHAR(200)  NULL,
+                    endpoint     VARCHAR(300)  NULL,
+                    method       VARCHAR(20)   NULL,
+                    status       VARCHAR(50)   NULL,
+                    details_json TEXT          NULL,
+                    created_at   TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
     if seed_file.exists():
@@ -325,6 +339,81 @@ def recover_stale_runs() -> int:
             )
             recovered = cur.rowcount
     return recovered
+
+
+def record_security_event(
+    event_type: str,
+    source: str | None = None,
+    actor: str | None = None,
+    endpoint: str | None = None,
+    method: str | None = None,
+    status: str | None = None,
+    details: dict | None = None,
+) -> int:
+    """Persist a security audit event. Returns the new row id."""
+    details_json = json.dumps(details) if details else None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO security_events
+                    (event_type, source, actor, endpoint, method, status, details_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (event_type, source, actor, endpoint, method, status, details_json),
+            )
+            return cur.fetchone()[0]
+
+
+def list_security_events(
+    event_type: str | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return security_events rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+    if event_type:
+        conditions.append("event_type = %s")
+        params.append(event_type)
+    if source:
+        conditions.append("source = %s")
+        params.append(source)
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, event_type, source, actor, endpoint, method, status,
+                       details_json, created_at
+                FROM security_events
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":         r[0],
+            "event_type": r[1],
+            "source":     r[2],
+            "actor":      r[3],
+            "endpoint":   r[4],
+            "method":     r[5],
+            "status":     r[6],
+            "details":    json.loads(r[7]) if r[7] else None,
+            "created_at": r[8].isoformat() if r[8] else None,
+        }
+        for r in rows
+    ]
 
 
 def update_run_step(run_id: int, step: str):
