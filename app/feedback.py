@@ -270,6 +270,29 @@ class FeedbackTypeP16:
     DEPLOYMENT_SMOKE_FAILURE_COUNT = "deployment_smoke_failure_count"
 
 
+# Phase 17 — Project Onboarding constants
+
+class OnboardingStatus:
+    PENDING   = "PENDING"
+    RUNNING   = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED    = "FAILED"
+
+
+class SnapshotKind:
+    ARCHITECTURE          = "architecture"
+    COMMANDS              = "commands"
+    TESTING               = "testing"
+    DEPLOYMENT            = "deployment"
+    CODING_CONVENTIONS    = "coding_conventions"
+    OPEN_QUESTIONS        = "open_questions"
+    ONBOARDING_RETROSPECTIVE = "onboarding_retrospective"
+
+
+# Workflow type constant used in queue messages
+PROJECT_ONBOARDING = "project_onboarding"
+
+
 def categorize_execution_failure(
     test_status: str | None,
     merge_status: str | None,

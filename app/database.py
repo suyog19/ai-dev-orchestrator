@@ -441,6 +441,52 @@ def init_db(retries: int = 5, delay: int = 3):
             ]:
                 cur.execute(col_sql)
 
+            # Phase 17 — project onboarding tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS project_onboarding_runs (
+                    id                        SERIAL PRIMARY KEY,
+                    repo_slug                 VARCHAR(200) NOT NULL,
+                    base_branch               VARCHAR(100) NOT NULL DEFAULT 'main',
+                    status                    VARCHAR(50)  NOT NULL,
+                    current_step              VARCHAR(100) NULL,
+                    capability_profile_name   VARCHAR(100) NULL,
+                    architecture_summary      TEXT         NULL,
+                    test_command              TEXT         NULL,
+                    build_command             TEXT         NULL,
+                    lint_command              TEXT         NULL,
+                    test_result               VARCHAR(50)  NULL,
+                    build_result              VARCHAR(50)  NULL,
+                    lint_result               VARCHAR(50)  NULL,
+                    deployment_profile_status VARCHAR(50)  NULL,
+                    risk_notes_json           TEXT         NULL,
+                    recommendations_json      TEXT         NULL,
+                    error_detail              TEXT         NULL,
+                    created_at                TIMESTAMP    NOT NULL DEFAULT NOW(),
+                    completed_at              TIMESTAMP    NULL
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_onboarding_runs_repo_slug "
+                "ON project_onboarding_runs (repo_slug)"
+            )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS project_knowledge_snapshots (
+                    id               SERIAL PRIMARY KEY,
+                    repo_slug        VARCHAR(200) NOT NULL,
+                    snapshot_kind    VARCHAR(100) NOT NULL,
+                    summary          TEXT         NOT NULL,
+                    details_json     TEXT         NULL,
+                    source_files_json TEXT        NULL,
+                    created_at       TIMESTAMP    NOT NULL DEFAULT NOW(),
+                    updated_at       TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_snapshots_repo_kind "
+                "ON project_knowledge_snapshots (repo_slug, snapshot_kind)"
+            )
+
             # Seed default control flags from env (only if not already set)
             import os as _os
             _defaults = {
@@ -3790,3 +3836,225 @@ def seed_deployment_profiles() -> int:
     if seeded:
         logger.info("seed_deployment_profiles: seeded %d profile(s)", seeded)
     return seeded
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — Project Onboarding
+# ---------------------------------------------------------------------------
+
+def create_onboarding_run(repo_slug: str, base_branch: str = "main") -> int:
+    """Insert a new project_onboarding_runs row with status=PENDING. Returns the new id."""
+    from app.feedback import OnboardingStatus
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO project_onboarding_runs (repo_slug, base_branch, status)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (repo_slug, base_branch, OnboardingStatus.PENDING),
+            )
+            return cur.fetchone()[0]
+
+
+def update_onboarding_run(run_id: int, **kwargs) -> None:
+    """Update arbitrary fields on a project_onboarding_runs row."""
+    if not kwargs:
+        return
+    set_clauses = ", ".join(f"{k}=%s" for k in kwargs)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE project_onboarding_runs SET {set_clauses} WHERE id=%s",
+                (*kwargs.values(), run_id),
+            )
+
+
+def get_onboarding_run(run_id: int) -> dict | None:
+    """Return a single project_onboarding_runs row as a dict, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, base_branch, status, current_step,
+                       capability_profile_name, architecture_summary,
+                       test_command, build_command, lint_command,
+                       test_result, build_result, lint_result,
+                       deployment_profile_status, risk_notes_json,
+                       recommendations_json, error_detail,
+                       created_at, completed_at
+                FROM project_onboarding_runs WHERE id=%s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "repo_slug": row[1], "base_branch": row[2], "status": row[3],
+        "current_step": row[4], "capability_profile_name": row[5],
+        "architecture_summary": row[6], "test_command": row[7],
+        "build_command": row[8], "lint_command": row[9],
+        "test_result": row[10], "build_result": row[11], "lint_result": row[12],
+        "deployment_profile_status": row[13],
+        "risk_notes": json.loads(row[14] or "[]"),
+        "recommendations": json.loads(row[15] or "[]"),
+        "error_detail": row[16],
+        "created_at": row[17].isoformat() if row[17] else None,
+        "completed_at": row[18].isoformat() if row[18] else None,
+    }
+
+
+def list_onboarding_runs(repo_slug: str | None = None, limit: int = 20) -> list[dict]:
+    """List project_onboarding_runs rows, most recent first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if repo_slug:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, base_branch, status, current_step,
+                           capability_profile_name, test_result, build_result, lint_result,
+                           deployment_profile_status, error_detail, created_at, completed_at
+                    FROM project_onboarding_runs
+                    WHERE repo_slug=%s ORDER BY id DESC LIMIT %s
+                    """,
+                    (repo_slug, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, base_branch, status, current_step,
+                           capability_profile_name, test_result, build_result, lint_result,
+                           deployment_profile_status, error_detail, created_at, completed_at
+                    FROM project_onboarding_runs
+                    ORDER BY id DESC LIMIT %s
+                    """,
+                    (limit,),
+                )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "repo_slug": r[1], "base_branch": r[2], "status": r[3],
+            "current_step": r[4], "capability_profile_name": r[5],
+            "test_result": r[6], "build_result": r[7], "lint_result": r[8],
+            "deployment_profile_status": r[9], "error_detail": r[10],
+            "created_at": r[11].isoformat() if r[11] else None,
+            "completed_at": r[12].isoformat() if r[12] else None,
+        }
+        for r in rows
+    ]
+
+
+def upsert_knowledge_snapshot(
+    repo_slug: str,
+    snapshot_kind: str,
+    summary: str,
+    details: dict | None = None,
+    source_files: list | None = None,
+) -> int:
+    """Insert or update a project_knowledge_snapshots row. Returns the snapshot id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO project_knowledge_snapshots
+                    (repo_slug, snapshot_kind, summary, details_json, source_files_json)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (repo_slug, snapshot_kind) DO UPDATE
+                    SET summary           = EXCLUDED.summary,
+                        details_json      = EXCLUDED.details_json,
+                        source_files_json = EXCLUDED.source_files_json,
+                        updated_at        = NOW()
+                RETURNING id
+                """,
+                (
+                    repo_slug,
+                    snapshot_kind,
+                    summary,
+                    json.dumps(details) if details else None,
+                    json.dumps(source_files) if source_files else None,
+                ),
+            )
+            return cur.fetchone()[0]
+
+
+def get_knowledge_snapshot(repo_slug: str, snapshot_kind: str) -> dict | None:
+    """Return a single project_knowledge_snapshots row, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, snapshot_kind, summary, details_json,
+                       source_files_json, created_at, updated_at
+                FROM project_knowledge_snapshots
+                WHERE repo_slug=%s AND snapshot_kind=%s
+                """,
+                (repo_slug, snapshot_kind),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "repo_slug": row[1], "snapshot_kind": row[2], "summary": row[3],
+        "details": json.loads(row[4] or "{}"),
+        "source_files": json.loads(row[5] or "[]"),
+        "created_at": row[6].isoformat() if row[6] else None,
+        "updated_at": row[7].isoformat() if row[7] else None,
+    }
+
+
+def list_knowledge_snapshots(repo_slug: str) -> list[dict]:
+    """Return all project_knowledge_snapshots for a repo."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, snapshot_kind, summary, details_json,
+                       source_files_json, created_at, updated_at
+                FROM project_knowledge_snapshots
+                WHERE repo_slug=%s ORDER BY snapshot_kind ASC
+                """,
+                (repo_slug,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "repo_slug": r[1], "snapshot_kind": r[2], "summary": r[3],
+            "details": json.loads(r[4] or "{}"),
+            "source_files": json.loads(r[5] or "[]"),
+            "created_at": r[6].isoformat() if r[6] else None,
+            "updated_at": r[7].isoformat() if r[7] else None,
+        }
+        for r in rows
+    ]
+
+
+def get_project_knowledge_for_prompt(repo_slug: str, max_bullets: int = 5, max_chars: int = 1200) -> str:
+    """Return a bounded project knowledge string for prompt injection.
+
+    Retrieves architecture + coding_conventions + deployment snapshots in priority
+    order. Truncates to max_bullets points and max_chars total. Returns empty string
+    if no snapshots exist for the repo.
+    """
+    from app.feedback import SnapshotKind
+    priority_kinds = [
+        SnapshotKind.ARCHITECTURE,
+        SnapshotKind.CODING_CONVENTIONS,
+        SnapshotKind.DEPLOYMENT,
+    ]
+    bullets = []
+    for kind in priority_kinds:
+        snap = get_knowledge_snapshot(repo_slug, kind)
+        if snap and snap.get("summary"):
+            # Take the first non-empty line of the summary as the bullet
+            first_line = snap["summary"].strip().split("\n")[0][:300]
+            bullets.append(f"[{kind}] {first_line}")
+        if len(bullets) >= max_bullets:
+            break
+
+    if not bullets:
+        return ""
+
+    text = "\n".join(f"- {b}" for b in bullets[:max_bullets])
+    return text[:max_chars]
