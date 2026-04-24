@@ -27,6 +27,12 @@ class FeedbackType:
     MERGE_STATUS                = "merge_status"
     FILES_CHANGED_COUNT         = "files_changed_count"
     FAILURE_CATEGORY            = "failure_category"
+    # Review signals (Phase 8)
+    REVIEW_STATUS               = "review_status"
+    REVIEW_RISK_LEVEL           = "review_risk_level"
+    REVIEW_APPROVED             = "review_approved"
+    REVIEW_NEEDS_CHANGES        = "review_needs_changes"
+    REVIEW_BLOCKED              = "review_blocked"
 
 
 class FailureCategory:
@@ -54,6 +60,29 @@ class MemoryKind:
     EXECUTION_GUIDANCE  = "execution_guidance"
     MANUAL_NOTE         = "manual_note"
 
+
+# Phase 8 — Reviewer Agent constants
+
+class AgentName:
+    REVIEWER_AGENT = "reviewer_agent"
+
+
+class ReviewStatus:
+    APPROVED_BY_AI = "APPROVED_BY_AI"
+    NEEDS_CHANGES  = "NEEDS_CHANGES"
+    BLOCKED        = "BLOCKED"
+    ERROR          = "ERROR"
+
+
+class ReviewRiskLevel:
+    LOW    = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH   = "HIGH"
+
+
+# Phase 8 config
+REVIEW_REQUIRED     = True   # every story_implementation run triggers a review
+REVIEW_BLOCKS_MERGE = True   # APPROVED_BY_AI required for auto-merge
 
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5
