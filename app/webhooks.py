@@ -8,6 +8,7 @@ from app.database import (
     get_pending_planning_run, approve_planning_run, reject_planning_run,
     request_regeneration, create_planning_run,
     get_planning_run_for_regeneration, record_planning_feedback,
+    is_paused, record_security_event,
 )
 from app.dispatcher import dispatch
 from app.telegram import send_message, parse_approval_command
@@ -60,6 +61,20 @@ async def jira_webhook(request: Request):
         details=f"{issue_key}: {summary}",
     )
 
+    # Pause check — log and drop the dispatch if orchestrator is paused
+    if is_paused():
+        logger.warning("Orchestrator is PAUSED — Jira webhook received but not dispatched: %s", issue_key)
+        record_security_event(
+            event_type="automation_paused_jira_blocked",
+            source="jira",
+            actor=issue_key,
+            endpoint="/webhooks/jira",
+            method="POST",
+            status="BLOCKED",
+            details={"issue_key": issue_key, "new_status": new_status},
+        )
+        return {"received": True, "processed": False, "reason": "orchestrator_paused"}
+
     dispatch(issue_type, new_status, event_id, issue_key=issue_key, summary=summary)
 
     return {"received": True, "processed": True}
@@ -96,6 +111,21 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     action, run_id = cmd
+
+    # Pause check — block approval commands when paused
+    if is_paused():
+        logger.warning("Orchestrator is PAUSED — Telegram command blocked: %s %s", action, run_id)
+        record_security_event(
+            event_type="automation_paused_telegram_blocked",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="BLOCKED",
+            details={"action": action, "run_id": run_id},
+        )
+        send_message("control", "PAUSED", f"Command {action} {run_id} blocked — orchestrator is paused.")
+        return {"ok": True}
     logger.info("Telegram approval command received: %s %s", action, run_id)
 
     # REGENERATE accepts both pending and completed runs; APPROVE/REJECT only accept pending.

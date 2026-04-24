@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel
 
 from app.security import admin_key_middleware
@@ -20,6 +20,7 @@ from app.database import (
     list_test_quality_reviews,
     list_architecture_reviews,
     list_security_events,
+    get_all_control_flags, set_control_flag, record_security_event, is_paused,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -717,3 +718,48 @@ def get_security_events(
 ):
     """List security audit events. Protected by admin key. Filter by event_type, source, status."""
     return list_security_events(event_type=event_type, source=source, status=status, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Admin — Emergency pause / resume / control status
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/control-status")
+def get_control_status():
+    """Return current runtime control flags."""
+    flags = get_all_control_flags()
+    return {"paused": is_paused(), "flags": flags}
+
+
+@app.post("/admin/pause", status_code=200)
+def pause_orchestrator(request: Request):
+    """Pause automation — blocks new Jira workflows and Telegram commands."""
+    set_control_flag("orchestrator_paused", "true")
+    actor = request.client.host if request.client else "unknown"
+    record_security_event(
+        event_type="automation_paused",
+        source="http",
+        actor=actor,
+        endpoint="/admin/pause",
+        method="POST",
+        status="PAUSED",
+    )
+    logger.warning("Orchestrator PAUSED by %s", actor)
+    return {"paused": True, "message": "Orchestrator is now paused. New workflows and Telegram commands will be blocked."}
+
+
+@app.post("/admin/resume", status_code=200)
+def resume_orchestrator(request: Request):
+    """Resume automation — re-enables Jira workflows and Telegram commands."""
+    set_control_flag("orchestrator_paused", "false")
+    actor = request.client.host if request.client else "unknown"
+    record_security_event(
+        event_type="automation_resumed",
+        source="http",
+        actor=actor,
+        endpoint="/admin/resume",
+        method="POST",
+        status="RESUMED",
+    )
+    logger.info("Orchestrator RESUMED by %s", actor)
+    return {"paused": False, "message": "Orchestrator is now running. New workflows will be accepted."}
