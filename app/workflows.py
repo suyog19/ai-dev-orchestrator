@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr
 from app.jira_client import get_issue_details
@@ -80,6 +80,37 @@ def _build_review_package(
         },
         "memory_context": execution_memory,
     }
+
+
+def _format_review_comment(verdict: dict) -> str:
+    """Render a Reviewer Agent verdict as a GitHub PR comment in markdown."""
+    status = verdict.get("review_status", "UNKNOWN")
+    risk = verdict.get("risk_level", "UNKNOWN")
+    summary = verdict.get("summary", "")
+    findings = verdict.get("findings") or []
+    blocking = verdict.get("blocking_reasons") or []
+    recommendations = verdict.get("recommendations") or []
+
+    status_emoji = {"APPROVED_BY_AI": "✅", "NEEDS_CHANGES": "⚠️", "BLOCKED": "🚫", "ERROR": "❌"}.get(status, "❓")
+
+    findings_lines = "\n".join(
+        f"- [{f.get('severity', 'INFO')}] **{f.get('category', '')}**: {f.get('message', '')}"
+        for f in findings
+    ) or "_None_"
+
+    blocking_lines = "\n".join(f"- {r}" for r in blocking) or "_None_"
+    rec_lines = "\n".join(f"- {r}" for r in recommendations) or "_None_"
+
+    return (
+        f"## {status_emoji} Reviewer Agent Verdict: `{status}`\n\n"
+        f"**Risk:** {risk}\n\n"
+        f"### Summary\n{summary}\n\n"
+        f"### Findings\n{findings_lines}\n\n"
+        f"### Blocking Reasons\n{blocking_lines}\n\n"
+        f"### Recommendations\n{rec_lines}\n\n"
+        f"---\n"
+        f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Reviewer Agent_"
+    )
 
 
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
@@ -431,6 +462,11 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             "story_implementation: review complete — status=%s risk=%s",
             verdict.get("review_status"), verdict.get("risk_level"),
         )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_review_comment(verdict))
+            logger.info("story_implementation: review comment posted to PR #%s", pr["number"])
+        except Exception as comment_exc:
+            logger.warning("story_implementation: PR comment failed (non-fatal) — %s", comment_exc)
         send_message(
             "review_completed",
             verdict.get("review_status", "UNKNOWN"),
@@ -462,6 +498,10 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             )
         except Exception as db_exc:
             logger.error("story_implementation: store_agent_review failed — %s", db_exc)
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_review_comment(error_verdict))
+        except Exception as comment_exc:
+            logger.warning("story_implementation: error PR comment failed (non-fatal) — %s", comment_exc)
         send_message(
             "review_error", "ERROR",
             f"{issue_key}: Reviewer Agent error — {exc}",
