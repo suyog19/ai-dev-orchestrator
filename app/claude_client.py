@@ -475,6 +475,89 @@ _REVIEW_TOOL = {
     },
 }
 
+TEST_QUALITY_PROMPT = (
+    "You are an independent Test Quality Agent. Your job is to assess whether the tests "
+    "in this PR are sufficient to trust that the implementation is correct.\n\n"
+    "You will receive:\n"
+    "- The Jira Story (key, summary, description, acceptance criteria)\n"
+    "- The PR (number, title, body)\n"
+    "- The unified diff (source and test file changes)\n"
+    "- Test results (status, command, output excerpt)\n"
+    "- Implementation context (changed files, retry count)\n"
+    "- Memory context (prior lessons from this repository)\n\n"
+    "Evaluate five dimensions:\n"
+    "1. Acceptance criteria coverage — Do tests map to the Story's acceptance criteria?\n"
+    "2. Changed behaviour coverage — If code behaviour changed, are relevant tests added or updated?\n"
+    "3. Edge cases — Are negative paths, empty inputs, invalid values, not-found cases covered?\n"
+    "4. Test integrity — Were tests weakened, skipped, or assertions removed to make the PR pass?\n"
+    "5. Confidence — Passing tests are necessary but not sufficient. If tests are shallow, block.\n\n"
+    "Verdict rules (strictly enforced):\n"
+    "- TESTS_BLOCKING: tests failed, tests NOT_RUN for a test-capable repo, tests removed/skipped to pass\n"
+    "- TESTS_WEAK: tests pass but do not adequately cover the Story acceptance criteria\n"
+    "- TEST_QUALITY_APPROVED: tests meaningfully cover the Story and changed behaviour\n\n"
+    "Call the submit_test_quality_review tool only — do not respond with prose."
+)
+
+_TEST_QUALITY_TOOL = {
+    "name": "submit_test_quality_review",
+    "description": "Submit a structured test quality verdict for a PR.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "quality_status": {
+                "type": "string",
+                "enum": ["TEST_QUALITY_APPROVED", "TESTS_WEAK", "TESTS_BLOCKING"],
+                "description": (
+                    "Overall verdict. TESTS_BLOCKING if tests failed, not run, or removed to pass. "
+                    "TESTS_WEAK if tests pass but coverage is shallow. "
+                    "TEST_QUALITY_APPROVED only when tests meaningfully cover the Story."
+                ),
+            },
+            "confidence_level": {
+                "type": "string",
+                "enum": ["LOW", "MEDIUM", "HIGH"],
+                "description": "Confidence in the test adequacy assessment.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "1-3 sentences summarising the test quality verdict.",
+            },
+            "coverage_findings": {
+                "type": "array",
+                "description": "Coverage assessment per acceptance criterion or behaviour.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criteria": {"type": "string", "description": "The acceptance criterion or behaviour being assessed."},
+                        "status": {"type": "string", "enum": ["covered", "partial", "missing"], "description": "Coverage status."},
+                        "evidence": {"type": "string", "description": "Test file or test name providing coverage, or reason it is missing."},
+                    },
+                    "required": ["criteria", "status", "evidence"],
+                },
+            },
+            "missing_tests": {
+                "type": "array",
+                "description": "Descriptions of test scenarios that are absent but needed.",
+                "items": {"type": "string"},
+            },
+            "suspicious_tests": {
+                "type": "array",
+                "description": "Tests that appear weakened, skipped, or modified to avoid failure.",
+                "items": {"type": "string"},
+            },
+            "recommendations": {
+                "type": "array",
+                "description": "Non-blocking suggestions for future test improvements.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "quality_status", "confidence_level", "summary",
+            "coverage_findings", "missing_tests", "suspicious_tests", "recommendations",
+        ],
+    },
+}
+
 _CLIENT = anthropic.Anthropic(timeout=120.0)
 
 
@@ -817,5 +900,114 @@ def review_pr(
     tool_block = next((b for b in response.content if b.type == "tool_use"), None)
     if not tool_block:
         raise RuntimeError("Reviewer Agent returned no tool_use block")
+
+    return tool_block.input
+
+
+def review_test_quality(
+    story_context: dict,
+    pr_context: dict,
+    diff_context: dict,
+    test_context: dict,
+    implementation_context: dict,
+    memory_context: str = "",
+) -> dict:
+    """Run the Test Quality Agent against a PR and return a structured verdict.
+
+    story_context keys: key, summary, description, acceptance_criteria (list[str])
+    pr_context keys: number, url, title, body
+    diff_context keys: full_diff (str), changed_files (list[str])
+    test_context keys: status, command, output_excerpt, test_files_changed (list[str]),
+                       skipped_tests_detected (bool)
+    implementation_context keys: files_changed_count, retry_count,
+                                 changed_source_files (list[str]), changed_test_files (list[str])
+    memory_context: formatted bullet string from get_execution_memory()
+
+    Returns the submit_test_quality_review tool input dict:
+    {
+        "quality_status":    "TEST_QUALITY_APPROVED" | "TESTS_WEAK" | "TESTS_BLOCKING",
+        "confidence_level":  "LOW" | "MEDIUM" | "HIGH",
+        "summary":           "...",
+        "coverage_findings": [{"criteria": ..., "status": ..., "evidence": ...}, ...],
+        "missing_tests":     [...],
+        "suspicious_tests":  [...],
+        "recommendations":   [...],
+    }
+    Raises RuntimeError if Claude returns no tool_use block.
+    """
+    ac_lines = "\n".join(
+        f"  - {ac}" for ac in (story_context.get("acceptance_criteria") or [])
+    )
+    story_block = (
+        f"Story: {story_context.get('key', '')} — {story_context.get('summary', '')}\n"
+        f"Description: {story_context.get('description') or '(none)'}\n"
+        f"Acceptance criteria:\n{ac_lines or '  (none provided)'}"
+    )
+
+    pr_body = (pr_context.get("body") or "").strip()[:1000]
+
+    changed_files = "\n".join(f"  - {f}" for f in (diff_context.get("changed_files") or []))
+    src_files = "\n".join(
+        f"  - {f}" for f in (implementation_context.get("changed_source_files") or [])
+    )
+    test_files = "\n".join(
+        f"  - {f}" for f in (implementation_context.get("changed_test_files") or [])
+    )
+
+    output_excerpt = (test_context.get("output_excerpt") or "").strip()
+    output_lines = "\n".join(f"    {ln}" for ln in output_excerpt.splitlines()[-30:])
+    skipped_flag = "YES" if test_context.get("skipped_tests_detected") else "NO"
+
+    diff_trimmed = (diff_context.get("full_diff") or "").strip()
+    if len(diff_trimmed) > 8000:
+        diff_trimmed = diff_trimmed[:8000] + "\n... (diff truncated)"
+
+    memory_block = (
+        f"Prior lessons from this repository:\n{memory_context}\n\n"
+        if memory_context else ""
+    )
+
+    user_content = (
+        f"{story_block}\n\n"
+        f"PR #{pr_context.get('number', '')} — {pr_context.get('title', '')}\n"
+        f"PR URL: {pr_context.get('url', '')}\n"
+        f"PR body:\n{pr_body or '  (none)'}\n\n"
+        f"Changed files ({implementation_context.get('files_changed_count', 0)} total):\n"
+        f"{changed_files or '  (none)'}\n\n"
+        f"Source files changed:\n{src_files or '  (none)'}\n"
+        f"Test files changed:\n{test_files or '  (none)'}\n\n"
+        f"Retry count: {implementation_context.get('retry_count', 0)}\n\n"
+        f"Test execution:\n"
+        f"  Status: {test_context.get('status', 'NOT_RUN')}\n"
+        f"  Command: {test_context.get('command', '')}\n"
+        f"  Skipped tests detected: {skipped_flag}\n"
+        f"  Output (last 30 lines):\n{output_lines or '    (none)'}\n\n"
+        f"Unified diff:\n```\n{diff_trimmed}\n```\n\n"
+        f"{memory_block}"
+        f"Assess the test quality and call submit_test_quality_review with your structured verdict."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=[{
+            "type": "text",
+            "text": TEST_QUALITY_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_TEST_QUALITY_TOOL],
+        tool_choice={"type": "tool", "name": "submit_test_quality_review"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Claude test_quality done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Test Quality Agent returned no tool_use block")
 
     return tool_block.input
