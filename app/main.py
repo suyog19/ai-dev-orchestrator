@@ -26,6 +26,7 @@ from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
+from app.database import list_github_status_updates
 
 load_dotenv()
 
@@ -478,6 +479,53 @@ def get_workflow_run_release_decision(run_id: int):
         "merge_status":            row[6],
         "review_status":           row[7],
         "test_quality_status":     row[8],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — GitHub status update inspection APIs
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/github-status-updates")
+def list_github_status_updates_endpoint(run_id: int):
+    """List all GitHub commit status updates for a specific workflow run."""
+    rows = list_github_status_updates(run_id)
+    return {"run_id": run_id, "count": len(rows), "statuses": rows}
+
+
+@app.get("/debug/workflow-runs/{run_id}/github-statuses")
+def get_run_github_statuses(run_id: int):
+    """Return GitHub commit statuses published for a specific workflow run."""
+    rows = list_github_status_updates(run_id)
+    return {"run_id": run_id, "count": len(rows), "statuses": rows}
+
+
+@app.post("/debug/workflow-runs/{run_id}/republish-github-statuses")
+def republish_github_statuses(run_id: int, repo_slug: str):
+    """Re-publish GitHub commit statuses for a completed run.
+
+    Idempotent: duplicate statuses on GitHub are acceptable (GitHub keeps the latest per context).
+    A new row is always recorded in github_status_updates for the republish attempt.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.database import get_run_verdicts
+    from app.github_status_publisher import publish_github_statuses_for_run
+    from app.security import ensure_github_writes_allowed
+
+    run = get_run_verdicts(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Workflow run {run_id} not found")
+
+    try:
+        ensure_github_writes_allowed("status", repo_slug, run_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    result = publish_github_statuses_for_run(run_id, repo_slug)
+    return {
+        "run_id":    run_id,
+        "repo_slug": repo_slug,
+        "result":    result,
     }
 
 
