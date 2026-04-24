@@ -13,6 +13,11 @@
         <span class="logo">Orchestrator</span>
         <span class="env-badge env-{{ env_name | lower }}">{{ env_name }}</span>
       </div>
+      {% if is_paused() %}
+      <div style="background:#7f1d1d; color:#fca5a5; font-size:11px; font-weight:700; padding:6px 16px; text-transform:uppercase; letter-spacing:0.5px;">
+        ⚠ PAUSED
+      </div>
+      {% endif %}
       <ul class="nav-links">
         <li class="{{ 'active' if page == 'overview' else '' }}"><a href="/admin/ui/overview">Overview</a></li>
         <li class="{{ 'active' if page == 'runs' else '' }}"><a href="/admin/ui/runs">Workflow Runs</a></li>

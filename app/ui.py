@@ -39,8 +39,31 @@ router = APIRouter(prefix="/admin/ui")
 templates = Jinja2Templates(directory="app/templates")
 
 
+def _fmt_ts(value: str | None) -> str:
+    """Format an ISO timestamp string to a readable form, or return '—'."""
+    if not value:
+        return "—"
+    # Trim microseconds and T separator for readability
+    return value[:16].replace("T", " ")
+
+
+templates.env.filters["fmtts"] = _fmt_ts
+templates.env.globals["is_paused"] = is_paused
+
+
 def _env_name() -> str:
     return os.environ.get("ENV_NAME", "DEV")
+
+
+def _base_ctx(request: Request, token: str, page: str) -> dict:
+    """Return the base template context shared by all authenticated pages."""
+    return {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": page,
+        "paused": is_paused(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -113,20 +136,15 @@ def overview_page(request: Request):
     except _LoginRedirect as exc:
         return redirect_to_login(exc.next_url)
 
-    csrf = csrf_token(token)
+    ctx = _base_ctx(request, token, "overview")
     stats = get_overview_stats()
     flags = get_all_control_flags()
 
-    paused = flags.get("orchestrator_paused", {}).get("value", "false").lower() == "true"
     github_writes = os.environ.get("ALLOW_GITHUB_WRITES", "true").lower() == "true"
     auto_merge = os.environ.get("ALLOW_AUTO_MERGE", "true").lower() == "true"
 
     return templates.TemplateResponse("admin/overview.html", {
-        "request": request,
-        "csrf": csrf,
-        "env_name": _env_name(),
-        "page": "overview",
-        "paused": paused,
+        **ctx,
         "github_writes": github_writes,
         "auto_merge": auto_merge,
         "stats": stats,
