@@ -16,6 +16,40 @@ from app.feedback import CapabilityProfile
 
 logger = logging.getLogger("worker")
 
+
+def get_test_command_for_profile(profile: dict) -> str | None:
+    """Return the test command for this profile, or None if tests are not supported.
+
+    None means the caller should mark test_status=NOT_RUN without attempting to run.
+    """
+    if not profile:
+        return None
+    caps = profile.get("capabilities", {})
+    if not caps.get("supports_tests", False):
+        return None
+    return profile.get("test_command")
+
+
+def get_build_command_for_profile(profile: dict) -> str | None:
+    """Return the build command, or None if not supported."""
+    if not profile:
+        return None
+    caps = profile.get("capabilities", {})
+    if not caps.get("supports_build", False):
+        return None
+    return profile.get("build_command")
+
+
+def get_lint_command_for_profile(profile: dict) -> str | None:
+    """Return the lint command, or None if not supported."""
+    if not profile:
+        return None
+    caps = profile.get("capabilities", {})
+    if not caps.get("supports_lint", False):
+        return None
+    return profile.get("lint_command")
+
+
 # ---------------------------------------------------------------------------
 # Profile definitions — commands and capabilities per stack
 # ---------------------------------------------------------------------------

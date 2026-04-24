@@ -839,9 +839,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
     # --- Attempt 1: run tests on the implementation ---
+    _profile_test_cmd = capability_profile.get("test_command") if capability_profile else None
+    _profile_name = capability_profile.get("profile_name") if capability_profile else None
     attempt_1_id = record_attempt(run_id, 1, "implement", "claude-sonnet-4-6")
     update_run_step(run_id, "testing")
-    test_result = run_tests(repo_path)
+    test_result = run_tests(
+        repo_path,
+        profile_command=_profile_test_cmd,
+        profile_name=_profile_name,
+    )
     update_run_field(
         run_id,
         test_status=test_result["status"],
@@ -891,7 +897,11 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.info("story_implementation: fix applied — %s", fix_detail)
 
         update_run_step(run_id, "retesting")
-        retest_result = run_tests(repo_path)
+        retest_result = run_tests(
+            repo_path,
+            profile_command=_profile_test_cmd,
+            profile_name=_profile_name,
+        )
         update_run_field(
             run_id,
             test_status=retest_result["status"],
