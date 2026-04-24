@@ -69,6 +69,17 @@
         <span class="text-muted" style="font-size:0.85em">Requires orchestrator/release-gate as required check</span>
       </td>
     </tr>
+    {% if self_modification_guard %}
+    <tr>
+      <th>Self-Modification Guard</th>
+      <td>
+        <span class="badge badge-failed">ACTIVE</span>
+        <span class="text-muted" style="font-size:0.85em">
+          — orchestrator repo: auto-merge permanently blocked, release gate still runs
+        </span>
+      </td>
+    </tr>
+    {% endif %}
     <tr>
       <th>First-Use Mode</th>
       <td>

@@ -582,6 +582,16 @@ def get_deployment_policy_for_profile(profile_name: str | None) -> dict:
     return _PROFILE_DEPLOYMENT_POLICY.get(profile_name or "", _DEFAULT_DEPLOYMENT_POLICY)
 
 
+def is_self_modification(repo_slug: str) -> bool:
+    """Return True if this run would modify the orchestrator itself.
+
+    Triggered when repo_slug matches ORCHESTRATOR_SELF_REPO env var.
+    Defaults to 'suyog19/ai-dev-orchestrator' if not set.
+    """
+    self_repo = os.environ.get("ORCHESTRATOR_SELF_REPO", "suyog19/ai-dev-orchestrator")
+    return repo_slug == self_repo
+
+
 def is_first_use_mode_active(repo_slug: str) -> bool:
     """Return True if first-use safety mode applies to this repo.
 
@@ -650,6 +660,9 @@ def evaluate_release_decision(
     skip_reasons = []
     if first_use_mode_active:
         skip_reasons.append("first-use safety mode active (first N runs require manual review)")
+    repo_slug = mapping.get("repo_slug", "")
+    if is_self_modification(repo_slug):
+        skip_reasons.append("self-modification guard: orchestrator repo requires manual merge always")
     if not mapping.get("auto_merge_enabled"):
         skip_reasons.append("auto_merge disabled for repo")
     # Phase 15: profile policy — no auto-merge for Java/Node/unknown stacks

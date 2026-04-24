@@ -845,6 +845,10 @@ async def ui_project_detail(request: Request, repo_slug: str):
     completed_run_count = count_completed_workflow_runs_for_repo(repo_slug)
     first_use_mode_active = first_use_enabled and completed_run_count < first_use_run_count
 
+    # Self-modification guard
+    self_repo = _os.environ.get("ORCHESTRATOR_SELF_REPO", "suyog19/ai-dev-orchestrator")
+    self_modification_guard = repo_slug == self_repo
+
     return templates.TemplateResponse("admin/project_detail.html", {
         "request": request,
         "csrf": csrf_token(token),
@@ -863,6 +867,7 @@ async def ui_project_detail(request: Request, repo_slug: str):
         "first_use_mode_active": first_use_mode_active,
         "first_use_run_count": first_use_run_count,
         "completed_run_count": completed_run_count,
+        "self_modification_guard": self_modification_guard,
     })
 
 
@@ -960,4 +965,5 @@ async def ui_activate_project(request: Request, repo_slug: str):
         "first_use_mode_active": first_use_mode_active,
         "first_use_run_count": first_use_run_count,
         "completed_run_count": completed_run_count,
+        "self_modification_guard": repo_slug == _os.environ.get("ORCHESTRATOR_SELF_REPO", "suyog19/ai-dev-orchestrator"),
     })
