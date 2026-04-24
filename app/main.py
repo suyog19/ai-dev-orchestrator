@@ -313,6 +313,12 @@ _RUN_COLS_LIST = [
 
 _RUN_COLS_DETAIL = _RUN_COLS_LIST + [
     "test_command", "test_output", "files_changed_count", "merged_at",
+    # Phase 13
+    "head_sha", "github_statuses_published",
+    # Phase 15
+    "capability_profile_name", "build_status", "lint_status",
+    # Phase 16
+    "deployment_validation_status", "deployment_validation_summary", "deployment_validation_completed_at",
 ]
 
 
