@@ -1417,3 +1417,150 @@ def generate_onboarding_architecture_summary(
         raise RuntimeError("Architecture summary returned no tool_use block")
 
     return tool_block.input
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — Onboarding coding conventions snapshot
+# ---------------------------------------------------------------------------
+
+_ONBOARDING_CONVENTIONS_PROMPT = (
+    "You are a technical analyst performing a project onboarding scan. "
+    "You will be given key source files from a repository. "
+    "Your job is to identify the coding conventions and patterns actually present in the code — "
+    "naming, organisation, error handling, testing style, API style. "
+    "Be specific and concrete. Reference actual patterns you observe. "
+    "Do not invent conventions that aren't in the code."
+)
+
+_ONBOARDING_CONVENTIONS_TOOL = {
+    "name": "submit_coding_conventions",
+    "description": "Submit a structured coding conventions snapshot for a project.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "2-3 sentence plain-English summary of the dominant coding style",
+            },
+            "naming_conventions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Observed naming patterns (e.g. 'snake_case for Python functions', 'PascalCase for React components')",
+            },
+            "folder_organization": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Observed folder structure patterns (e.g. 'routes under app/routes/', 'tests mirror app structure')",
+            },
+            "api_style": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "API / route handler patterns observed",
+            },
+            "error_handling_style": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "How errors are handled in the codebase",
+            },
+            "test_naming_style": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Test function naming and organisation conventions",
+            },
+            "patterns_to_follow": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Specific patterns AI should replicate in new code for this repo",
+            },
+            "patterns_to_avoid": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Patterns that appear absent or inconsistent and should not be introduced",
+            },
+        },
+        "required": [
+            "summary", "naming_conventions", "folder_organization", "api_style",
+            "error_handling_style", "test_naming_style", "patterns_to_follow", "patterns_to_avoid",
+        ],
+    },
+}
+
+
+def generate_onboarding_coding_conventions(
+    repo_path: str,
+    repo_slug: str,
+    structure_scan: dict,
+    profile: dict,
+) -> dict:
+    """Ask Claude to produce a structured coding conventions snapshot for project onboarding.
+
+    Reads source files + test files to identify observed conventions.
+    Returns the submit_coding_conventions tool input dict.
+    Raises RuntimeError if Claude returns no tool_use block.
+    """
+    primary_language = profile.get("primary_language", "unknown")
+
+    # Collect source + test file contents
+    file_sections = ""
+    collected = 0
+
+    candidate_files = (
+        structure_scan.get("routing_files", [])
+        + structure_scan.get("model_files", [])
+        + structure_scan.get("service_files", [])
+        + structure_scan.get("test_files", [])[:4]
+    )
+    # Also add key files (README etc)
+    for readme in ["README.md", "README.rst"]:
+        import os as _os
+        content = _read_truncated(_os.path.join(repo_path, readme), max_lines=40)
+        if content:
+            file_sections += f"\n--- {readme} ---\n{content}\n"
+            collected += 1
+
+    seen: set = set()
+    for rel_path in candidate_files:
+        if collected >= 8:
+            break
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        full = os.path.join(repo_path, rel_path)
+        content = _read_truncated(full, max_lines=80)
+        if content:
+            file_sections += f"\n--- {rel_path} ---\n{content}\n"
+            collected += 1
+
+    user_content = (
+        f"Repo: {repo_slug}\n"
+        f"Profile: {profile.get('profile_name', 'unknown')} "
+        f"({profile.get('primary_language', '?')}/{profile.get('framework', '?')})\n"
+        f"Top-level dirs: {', '.join(structure_scan.get('top_level_dirs', []))}\n\n"
+        f"Source files:{file_sections}\n\n"
+        f"Identify the coding conventions and call submit_coding_conventions."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=[{
+            "type": "text",
+            "text": _ONBOARDING_CONVENTIONS_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_ONBOARDING_CONVENTIONS_TOOL],
+        tool_choice={"type": "tool", "name": "submit_coding_conventions"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Onboarding coding conventions done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Coding conventions returned no tool_use block")
+
+    return tool_block.input

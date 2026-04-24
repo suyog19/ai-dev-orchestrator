@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 
-from app.claude_client import generate_onboarding_architecture_summary
+from app.claude_client import generate_onboarding_architecture_summary, generate_onboarding_coding_conventions
 from app.database import update_onboarding_run, upsert_capability_profile, upsert_knowledge_snapshot
 from app.repo_profiler import (
     detect_repo_capability_profile,
@@ -56,6 +56,7 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
       3. Command validation dry-run (test / build / lint)
       4. Repo structure scan (stored as structure_scan_json)
       5. Architecture summary via Claude (stored as knowledge snapshot)
+      6. Coding conventions snapshot via Claude
 
     Workspace is cleaned up in the finally block regardless of outcome.
     Status transitions are managed by the worker (_execute_onboarding).
@@ -204,6 +205,31 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
         logger.info(
             "Project onboarding architecture summary done: run_id=%s (%d chars, %d open questions)",
             onboarding_run_id, len(arch_summary), len(open_questions),
+        )
+
+        # ------------------------------------------------------------------
+        # Step 6: coding conventions snapshot via Claude
+        # ------------------------------------------------------------------
+        update_onboarding_run(onboarding_run_id, current_step="coding_conventions")
+        conventions = generate_onboarding_coding_conventions(
+            repo_path=repo_path,
+            repo_slug=repo_slug,
+            structure_scan=structure,
+            profile=profile,
+        )
+
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug,
+            snapshot_kind="coding_conventions",
+            summary=conventions.get("summary", ""),
+            details=conventions,
+            source_files=structure.get("routing_files", []) + structure.get("test_files", []),
+        )
+
+        update_onboarding_run(onboarding_run_id, current_step="conventions_captured")
+        logger.info(
+            "Project onboarding conventions captured: run_id=%s (%d patterns_to_follow)",
+            onboarding_run_id, len(conventions.get("patterns_to_follow", [])),
         )
 
     finally:
