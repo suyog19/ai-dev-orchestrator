@@ -1040,7 +1040,7 @@ def record_execution_feedback(run_id: int) -> int:
                 """
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
-                       review_status
+                       review_status, test_quality_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1049,7 +1049,8 @@ def record_execution_feedback(run_id: int) -> int:
             if not row:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
-                files_changed_count, error_detail, current_step, review_status = row
+                files_changed_count, error_detail, current_step, \
+                review_status, test_quality_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1118,6 +1119,35 @@ def record_execution_feedback(run_id: int) -> int:
                 ar = cur.fetchone()
                 if ar and ar[0]:
                     _ev(FeedbackType.REVIEW_RISK_LEVEL, ar[0])
+
+            # Test quality signals (Phase 9)
+            if test_quality_status:
+                from app.feedback import TestQualityStatus
+                _ev(FeedbackType.TEST_QUALITY_STATUS, test_quality_status)
+                if test_quality_status == TestQualityStatus.APPROVED:
+                    _ev(FeedbackType.TEST_QUALITY_APPROVED, "true")
+                elif test_quality_status == TestQualityStatus.WEAK:
+                    _ev(FeedbackType.TESTS_WEAK, "true")
+                elif test_quality_status == TestQualityStatus.BLOCKING:
+                    _ev(FeedbackType.TESTS_BLOCKING, "true")
+
+                cur.execute(
+                    """SELECT confidence_level, missing_tests_json, suspicious_tests_json
+                       FROM agent_test_quality_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1""",
+                    (run_id,),
+                )
+                tqr = cur.fetchone()
+                if tqr:
+                    if tqr[0]:
+                        _ev(FeedbackType.TEST_QUALITY_CONFIDENCE, tqr[0])
+                    try:
+                        _ev(FeedbackType.MISSING_TEST_COUNT, len(json.loads(tqr[1] or "[]")))
+                    except Exception:
+                        pass
+                    try:
+                        _ev(FeedbackType.SUSPICIOUS_TEST_COUNT, len(json.loads(tqr[2] or "[]")))
+                    except Exception:
+                        pass
 
             if not events:
                 return 0
