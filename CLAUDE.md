@@ -63,7 +63,9 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
 - `app/file_modifier.py` — applies code patches returned by Claude (original → replacement matching)
 - `app/repo_analysis.py` — introspects cloned repos (language detection, entry points, file counts) before Claude calls
-- `app/security.py` — admin key middleware, GitHub write guard, Redis rate limiting
+- `app/security.py` — admin key middleware, GitHub write guard, Redis rate limiting; `/admin/ui/*` paths are exempt from header auth via `_UI_EXEMPT_PREFIX` so cookie auth takes over
+- `app/ui.py` — FastAPI router at `/admin/ui`; all browser-facing dashboard pages (login, overview, runs, planning, clarifications, agents, GitHub, memory, security, control); uses Jinja2 templates from `app/templates/admin/` and static assets from `app/static/admin/`
+- `app/ui_auth.py` — cookie auth helpers for the dashboard: `create_session_token()`, `verify_session_token()`, `csrf_token()`, `require_admin_ui()`; signed with `URLSafeTimedSerializer` keyed on ADMIN_API_KEY; 8-hour TTL
 - `app/webhooks.py` — Jira and Telegram webhook receivers
 - `app/jira_client.py` — Jira REST API v3 calls; `get_issue_details()` fetches story summary + ADF-parsed description + acceptance criteria for the Reviewer Agent
 - `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
@@ -198,6 +200,28 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/debug/workflow-runs/{run_id}/republish-github-statuses` | Re-publish statuses idempotently (query: repo_slug) |
 | POST | `/admin/github/statuses/backfill` | Backfill statuses for recent eligible runs (body: repo_slug, limit, only_missing) |
 | POST | `/admin/github/branch-protection/validate-required-checks` | Dry-run check for required `orchestrator/release-gate` context (body: repo_slug, branch) |
+| GET | `/admin/ui/login` | Dashboard login page |
+| POST | `/admin/ui/login` | Submit credentials; sets `orchestrator_admin_session` cookie |
+| GET | `/admin/ui/logout` | Clear session cookie |
+| GET | `/admin/ui/overview` | System overview — stats, recent runs, pending clarifications |
+| GET | `/admin/ui/runs` | Workflow runs list (filter: status, workflow_type, issue_key, release_decision, limit) |
+| GET | `/admin/ui/runs/{run_id}` | Full run detail: all agents, GitHub statuses, active clarification, error |
+| GET | `/admin/ui/planning` | Epic breakdown planning runs list |
+| GET | `/admin/ui/planning/{run_id}` | Planning run detail with proposals |
+| GET | `/admin/ui/clarifications` | Clarifications list (filter: status) |
+| POST | `/admin/ui/clarifications/{id}/answer` | Answer clarification via UI form |
+| POST | `/admin/ui/clarifications/{id}/cancel` | Cancel clarification via UI form |
+| POST | `/admin/ui/clarifications/{id}/resend` | Resend Telegram question via UI form |
+| GET | `/admin/ui/agents` | Agent reviews (tab: reviewer \| test_quality \| architecture; filter: run_id, repo_slug, status) |
+| GET | `/admin/ui/github` | GitHub commit statuses inspector (filter by run_id) + branch protection check |
+| POST | `/admin/ui/github/republish` | Republish GitHub statuses for a run |
+| POST | `/admin/ui/github/validate` | Validate branch protection via UI form |
+| GET | `/admin/ui/memory` | Memory snapshots (filter: scope_type, scope_key) |
+| POST | `/admin/ui/memory/note` | Add/update a manual memory note |
+| GET | `/admin/ui/security` | Security events log (filter: event_type, source, status) |
+| GET | `/admin/ui/control` | Runtime control flags and env vars |
+| POST | `/admin/ui/control/pause` | Pause orchestrator (CSRF-protected) |
+| POST | `/admin/ui/control/resume` | Resume orchestrator (CSRF-protected) |
 
 ## Workflow Configuration
 
@@ -475,6 +499,25 @@ OPTIONS:
 RECOMMENDATION: <recommendation + why>
 ```
 
+## Admin Dashboard (Phase 14)
+
+Browser-based operations console at `/admin/ui`. Served as server-rendered HTML via Jinja2; no JavaScript framework.
+
+**Auth design:**
+- Login form POSTs the `ADMIN_API_KEY` value; on success a signed session cookie (`orchestrator_admin_session`) is set (8-hour TTL)
+- CSRF token derived as `SHA256("csrf:{session_token}")[:32]` — passed as a hidden form field on all mutating POST forms
+- `/admin/ui/*` paths are exempt from the header-key `BaseHTTPMiddleware` (controlled by `_UI_EXEMPT_PREFIX` in `security.py`); cookie auth is handled by `require_admin_ui()` in `app/ui_auth.py`
+- The existing `X-Orchestrator-Admin-Key` header auth for API clients is unaffected
+
+**Template structure:** `app/templates/admin/base.html` is the sidebar layout; all pages `{% extends "admin/base.html" %}`. `is_paused()` is registered as a Jinja2 global so `base.html` can show the PAUSED banner without route changes.
+
+**New DB functions** (in `app/database.py`):
+- `get_overview_stats()` — single-query aggregated dashboard stats
+- `list_workflow_runs_for_ui(status, workflow_type, issue_key, release_decision, limit)` — filterable runs list
+- `get_workflow_run_detail(run_id)` — full run + all agent reviews + clarification + GitHub statuses
+- `list_memory_snapshots(scope_type, scope_key)` — filterable memory listing
+- `list_feedback_events(source_type, repo_slug, limit)` — feedback log
+
 ## Deferred / Out of Scope
 
 - Feature-level Jira hierarchy (locked: Epic → Story only, no Feature or Task levels)
@@ -483,5 +526,4 @@ RECOMMENDATION: <recommendation + why>
 - Run-scope memory injection (single-run signals not worth feeding back into the same run)
 - Memory pruning / decay (snapshots are recomputed from raw events — no TTL needed)
 - Semantic/vector search for memory retrieval (rule-based aggregation is sufficient)
-- UI or dashboard
 - Multi-agent planning
