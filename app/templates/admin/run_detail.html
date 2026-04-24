@@ -102,6 +102,30 @@
   </table>
 </div>
 
+<!-- Phase 15: Capability Profile card -->
+{% if capability_profile %}
+<div class="card">
+  <h2>Capability Profile</h2>
+  <table style="width:auto;">
+    <tbody>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0; white-space:nowrap;">Profile</td><td><code>{{ capability_profile.profile_name or '—' }}</code></td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Language</td><td>{{ capability_profile.primary_language or '—' }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Framework</td><td>{{ capability_profile.framework or '—' }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Package Manager</td><td>{{ capability_profile.package_manager or '—' }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Test Command</td><td>{% if capability_profile.test_command %}<code>{{ capability_profile.test_command }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Build Command</td><td>{% if capability_profile.build_command %}<code>{{ capability_profile.build_command }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Lint Command</td><td>{% if capability_profile.lint_command %}<code>{{ capability_profile.lint_command }}</code>{% else %}<span class="text-muted">—</span>{% endif %}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Auto Merge</td><td>
+        {% set caps = capability_profile.capabilities or {} %}
+        {% if caps.get('supports_auto_merge') %}<span class="pill pill-green" style="font-size:10px;">Allowed</span>
+        {% else %}<span class="pill pill-gray" style="font-size:10px;">Disabled</span>{% endif %}
+      </td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Repo</td><td><code>{{ capability_profile.repo_slug or '—' }}</code></td></tr>
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 <!-- Release decision reason -->
 {% if run.release_decision_reason %}
 <div class="card">

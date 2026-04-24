@@ -31,6 +31,7 @@ from app.database import (
     list_github_status_updates, list_security_events,
     list_memory_snapshots, list_feedback_events, add_manual_memory,
     record_security_event, is_paused,
+    get_active_capability_profile,
 )
 
 logger = logging.getLogger("orchestrator.ui")
@@ -216,12 +217,22 @@ def run_detail(request: Request, run_id: int):
             "message": f"No workflow run found with id={run_id}",
         }, status_code=404)
 
+    # Phase 15: load full capability profile for the repo this run touched
+    capability_profile = None
+    repo_slug = (run or {}).get("repo_slug") or ""
+    if repo_slug:
+        try:
+            capability_profile = get_active_capability_profile(repo_slug)
+        except Exception:
+            pass
+
     return templates.TemplateResponse("admin/run_detail.html", {
         "request": request,
         "csrf": csrf,
         "env_name": _env_name(),
         "page": "runs",
         "run": run,
+        "capability_profile": capability_profile,
     })
 
 
