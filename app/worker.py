@@ -16,10 +16,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback
+from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback, expire_stale_clarifications
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation, epic_breakdown
+from app.clarification import ClarificationRequested
 
 WORKFLOW_HANDLERS = {
     "story_implementation": story_implementation,
@@ -65,6 +66,17 @@ def _execute(job: dict):
 
         try:
             handler(run_id, issue_key, issue_type, summary)
+        except ClarificationRequested as cr:
+            # Workflow paused for user input — status already set to WAITING_FOR_USER_INPUT
+            logger.info(
+                "Workflow WAITING_FOR_USER_INPUT: %s (run_id=%s) — clarification_id=%s",
+                workflow_type, run_id, cr.clarification_id,
+            )
+            send_message(
+                "clarification_requested", "WAITING_FOR_USER_INPUT",
+                f"{issue_key}: waiting for answer to clarification {cr.clarification_id}",
+            )
+            return
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
             logger.error("Workflow FAILED: %s (run_id=%s) — %s", workflow_type, run_id, error_msg)
@@ -113,6 +125,11 @@ def main():
         send_message("startup", "RECOVERY", f"{recovered} stale run(s) recovered — were left RUNNING before restart")
     else:
         logger.info("Startup recovery: no stale runs found")
+
+    expired_runs = expire_stale_clarifications()
+    if expired_runs:
+        logger.warning("Startup recovery: expired %d stale clarification(s) for runs %s", len(expired_runs), expired_runs)
+        send_message("startup", "RECOVERY", f"{len(expired_runs)} stale clarification(s) expired and their runs failed")
 
     while True:
         try:

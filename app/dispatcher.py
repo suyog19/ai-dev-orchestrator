@@ -20,7 +20,7 @@ def _active_run_exists(issue_key: str, workflow_type: str) -> int | None:
                 SELECT id FROM workflow_runs
                 WHERE issue_key = %s
                   AND workflow_type = %s
-                  AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_APPROVAL', 'APPROVED')
+                  AND status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_APPROVAL', 'APPROVED', 'WAITING_FOR_USER_INPUT')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -50,11 +50,11 @@ def dispatch(issue_type: str, new_status: str, event_id: int, issue_key: str = "
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO workflow_runs (workflow_type, status, related_event_id, issue_key)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO workflow_runs (workflow_type, status, related_event_id, issue_key, summary)
+                VALUES (%s, %s, %s, %s, %s)
                 RETURNING id
                 """,
-                (workflow_type, "QUEUED", event_id, issue_key),
+                (workflow_type, "QUEUED", event_id, issue_key, summary or issue_key),
             )
             run_id = cur.fetchone()[0]
 
