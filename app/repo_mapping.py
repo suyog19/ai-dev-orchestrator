@@ -131,33 +131,34 @@ def upsert_seed_mappings(mappings: list[dict]) -> int:
             for m in mappings:
                 cur.execute(
                     """
-                    SELECT id FROM repo_mappings
+                    SELECT id, is_active FROM repo_mappings
                     WHERE jira_project_key = %s
                       AND (issue_type = %s OR (issue_type IS NULL AND %s IS NULL))
                       AND repo_slug = %s
-                      AND is_active = TRUE
                     LIMIT 1
                     """,
                     (m["jira_project_key"], m.get("issue_type"), m.get("issue_type"), m["repo_slug"]),
                 )
                 row = cur.fetchone()
                 if row:
-                    cur.execute(
-                        """
-                        UPDATE repo_mappings
-                           SET base_branch = %s,
-                               notes = %s,
-                               auto_merge_enabled = %s,
-                               updated_at = NOW()
-                         WHERE id = %s
-                        """,
-                        (
-                            m.get("base_branch", "main"),
-                            m.get("notes"),
-                            m.get("auto_merge_enabled", False),
-                            row[0],
-                        ),
-                    )
+                    if row[1]:  # is_active=True: update mutable fields
+                        cur.execute(
+                            """
+                            UPDATE repo_mappings
+                               SET base_branch = %s,
+                                   notes = %s,
+                                   auto_merge_enabled = %s,
+                                   updated_at = NOW()
+                             WHERE id = %s
+                            """,
+                            (
+                                m.get("base_branch", "main"),
+                                m.get("notes"),
+                                m.get("auto_merge_enabled", False),
+                                row[0],
+                            ),
+                        )
+                    # is_active=False: row was intentionally deactivated — leave it alone
                 else:
                     cur.execute(
                         """

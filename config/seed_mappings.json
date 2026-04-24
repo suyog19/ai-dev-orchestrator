@@ -1,10 +1,9 @@
 [
   {
     "jira_project_key": "KAN",
-    "issue_type": "Story",
-    "repo_slug": "suyog19/sandbox-fastapi-app",
+    "repo_slug": "suyog19/suyogjoshi-com",
     "base_branch": "main",
-    "auto_merge_enabled": true,
-    "notes": "KAN project — sandbox repo, auto-merge enabled under strict conditions (Phase 5+)"
+    "auto_merge_enabled": false,
+    "notes": "KAN project — suyogjoshi.com personal website (Phase 17+). Auto-merge disabled; PRs require manual review."
   }
 ]

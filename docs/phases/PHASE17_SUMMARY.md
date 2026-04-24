@@ -121,14 +121,29 @@ After a successful onboarding run, the following is persisted:
 
 ## Validation
 
-Onboarding of `suyog19/sandbox-fastapi-app` (run_id=7) confirmed:
-- All 7 steps completed
-- Capability profile detected: `python_fastapi`
-- Architecture snapshot stored with real module names and entry points
-- Coding conventions snapshot with Python/FastAPI patterns
-- Deployment snapshot: `DRAFT_CREATED` (Docker detected, disabled draft created)
+### Infrastructure validation (Iterations 0–10) — `suyog19/sandbox-fastapi-app`
+
+Sandbox onboarding (run_id=7–9) confirmed the 7-step pipeline end-to-end:
+- Capability profile detected: `python_fastapi`; tests ran and passed
+- Architecture, coding conventions, open questions, and deployment snapshots all stored
 - Project knowledge injected into story prompts (non-fatal path confirmed working)
-- Dashboard displays all sections correctly
+- Dashboard at `/admin/ui/projects` displays all sections correctly
+
+### Real-world validation (Iterations 11–14) — `suyog19/suyogjoshi-com`
+
+Onboarding of the real personal website repo (run_id=10, completed 2026-04-24):
+- **Profile:** `generic_unknown` — Python/FastAPI microservices monorepo (core-api, notifications-router, notifications-worker, payments) deployed as AWS Lambda via Mangum + AWS CDK. No standard test/build/lint commands at root.
+- **Architecture snapshot:** identified Mangum/Lambda adapter, CDK infrastructure, OTP auth in core-api, sparse test coverage (4 test files across 51 source files)
+- **Coding conventions:** synchronous def handlers, HTTPException pattern, sub-package router structure, Pydantic v2 request validation
+- **Deployment:** `DRAFT_CREATED` — github_actions type inferred from `.github/` directory; disabled draft created
+- **Jira mapping:** id=12, KAN → suyogjoshi-com, auto_merge=false
+- **Epic KAN-28** decomposed into 6 documentation Stories using project knowledge context
+- **Story KAN-29** (README rewrite) implemented: PR [suyog19/suyogjoshi-com#10](https://github.com/suyog19/suyogjoshi-com/pull/10) created; all three agents ran; merge SKIPPED pending manual review (reviewer: NEEDS_CHANGES, auto_merge disabled)
+- **Onboarding retrospective** snapshot stored (`snapshot_kind=onboarding_retrospective`)
+
+**Issues discovered and fixed during real validation:**
+- `upsert_seed_mappings` re-created deactivated seed mappings on every app restart (checked `is_active=TRUE` when matching, so deactivated rows were not found and new rows were inserted). Fixed to check without `is_active` filter.
+- Jira webhook filter on dev instance only covered "My Software Team" project, not KAN — webhook events for KAN issues must be simulated via `POST /webhooks/jira?token=<secret>` until the filter is updated.
 
 ---
 
@@ -137,11 +152,18 @@ Onboarding of `suyog19/sandbox-fastapi-app` (run_id=7) confirmed:
 - Claude now has structured context about a repo's architecture and conventions when suggesting changes — reduces hallucinated file names and off-pattern code
 - Onboarding is triggered once manually; future runs are enriched automatically with no extra API calls in the hot path
 - The Jira mapping helper formalizes the onboarding-to-activation sequence: onboard → inspect dashboard → create mapping → start receiving Jira webhooks
+- `onboarding_retrospective` snapshot captures what worked, what failed, and recommended next steps per repo
 
 ---
+
+## Known Gaps / Next Actions for suyogjoshi-com
+
+- **Jira webhook filter** must be updated to include the KAN project so status changes trigger the orchestrator without manual simulation
+- **Deployment base_url** must be set in the deployment profile to enable post-merge smoke testing
+- **Capability profile** is `generic_unknown` — adding a root `Makefile` with `test`/`lint` targets would let the orchestrator validate changes automatically
+- Iteration 13 (merge + deployment validation) not executed — PR #10 open for manual review
 
 ## Deferred
 
 - Automatic re-onboarding on significant codebase changes (no trigger exists yet)
 - `POST /debug/project-knowledge/{repo_slug}/refresh` — endpoint exists as placeholder but does not re-run Claude calls
-- Iteration 11–14 (Learning Platform real-world rehearsal) — requires user to provide repo slug and Jira project key
