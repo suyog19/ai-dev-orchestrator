@@ -1860,7 +1860,7 @@ def get_planning_run_detail(run_id: int) -> dict | None:
                 "confidence", "description", "acceptance_criteria",
                 "rationale", "dependency_notes", "risk_notes",
             ]
-            result["items"] = [dict(zip(item_cols, r)) for r in cur.fetchall()]
+            result["proposals"] = [dict(zip(item_cols, r)) for r in cur.fetchall()]
     return result
 
 

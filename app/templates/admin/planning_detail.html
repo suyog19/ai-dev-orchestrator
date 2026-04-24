@@ -34,15 +34,15 @@
   </div>
   <div class="stat-card">
     <div class="stat-label">Proposed Items</div>
-    <div class="stat-value">{{ run.items | length }}</div>
+    <div class="stat-value">{{ run.proposals | length }}</div>
   </div>
 </div>
 
 <!-- Proposed stories -->
-{% if run.items %}
+{% if run.proposals %}
 <div class="card">
   <h2>Proposed Stories</h2>
-  {% for item in run.items %}
+  {% for item in run.proposals %}
   <div style="border: 1px solid #e5e7eb; border-radius:4px; padding:12px; margin-bottom:12px;">
     <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
       <strong>#{{ item.sequence_number }}</strong>
