@@ -1,0 +1,124 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Deployment Validations{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Deployment Validations</h1>
+  <p class="subtitle">{{ validations|length }} results</p>
+</div>
+
+<!-- Filters -->
+<div class="card" style="margin-bottom:16px;">
+  <form method="get" action="/admin/ui/deployments" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <div class="form-group" style="margin:0; min-width:220px;">
+      <label>Repo Slug</label>
+      <input type="text" name="repo_slug" value="{{ filter_repo_slug }}" placeholder="owner/repo">
+    </div>
+    <div class="form-group" style="margin:0; min-width:160px;">
+      <label>Status</label>
+      <select name="status">
+        <option value="">All</option>
+        {% for s in ['PASSED','FAILED','ERROR','SKIPPED','NOT_CONFIGURED','PENDING','RUNNING'] %}
+        <option value="{{ s }}" {% if filter_status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group" style="margin:0; min-width:80px;">
+      <label>Limit</label>
+      <select name="limit">
+        {% for n in [20, 50, 100] %}<option value="{{ n }}" {% if limit == n %}selected{% endif %}>{{ n }}</option>{% endfor %}
+      </select>
+    </div>
+    <div style="padding-bottom:1px;">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/admin/ui/deployments" class="btn btn-ghost btn-sm" style="margin-left:4px;">Reset</a>
+    </div>
+  </form>
+</div>
+
+<!-- Configured Profiles summary -->
+{% if profiles %}
+<div class="card" style="margin-bottom:16px;">
+  <h2 style="margin-bottom:10px;">Configured Deployment Profiles</h2>
+  <table style="width:100%; font-size:13px;">
+    <thead>
+      <tr>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Repo</th>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Env</th>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Type</th>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Base URL</th>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Smoke Tests</th>
+        <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Enabled</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in profiles %}
+      <tr style="border-bottom:1px solid #f3f4f6;">
+        <td style="padding:6px 8px;"><code>{{ p.repo_slug }}</code></td>
+        <td style="padding:6px 8px;"><code>{{ p.environment }}</code></td>
+        <td style="padding:6px 8px;">{{ p.deployment_type }}</td>
+        <td style="padding:6px 8px; color:#6b7280;">{{ p.base_url or '—' }}</td>
+        <td style="padding:6px 8px;">{{ p.smoke_tests|length }}</td>
+        <td style="padding:6px 8px;">
+          {% if p.enabled %}<span class="pill pill-green pill-sm">Yes</span>
+          {% else %}<span class="pill pill-gray pill-sm">No</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if validations %}
+<div class="card" style="padding:0;">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Run</th>
+          <th>Repo</th>
+          <th>Env</th>
+          <th>Status</th>
+          <th>Smoke Tests</th>
+          <th>Summary</th>
+          <th>Completed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in validations %}
+        <tr>
+          <td>{{ v.id }}</td>
+          <td><a href="/admin/ui/runs/{{ v.run_id }}">#{{ v.run_id }}</a></td>
+          <td style="font-size:12px;"><code>{{ v.repo_slug }}</code></td>
+          <td><code>{{ v.environment }}</code></td>
+          <td>
+            {% if v.status == 'PASSED' %}<span class="pill pill-green">PASSED</span>
+            {% elif v.status == 'FAILED' %}<span class="pill pill-red">FAILED</span>
+            {% elif v.status == 'ERROR' %}<span class="pill pill-red">ERROR</span>
+            {% elif v.status == 'SKIPPED' %}<span class="pill pill-yellow">SKIPPED</span>
+            {% elif v.status == 'NOT_CONFIGURED' %}<span class="pill pill-gray">NOT CONFIGURED</span>
+            {% else %}<span class="pill pill-gray">{{ v.status }}</span>{% endif %}
+          </td>
+          <td style="font-size:12px;">
+            {% set passed = v.smoke_results | selectattr('status','eq','PASSED') | list | length %}
+            {% set total  = v.smoke_results | length %}
+            {% if total > 0 %}{{ passed }}/{{ total }}{% else %}—{% endif %}
+          </td>
+          <td style="font-size:12px; color:#6b7280; max-width:300px; white-space:normal;">{{ v.summary or '—' }}</td>
+          <td style="font-size:12px;">{{ (v.completed_at or '')[:16] or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="card">
+  <p class="text-muted">No deployment validations found{% if filter_repo_slug or filter_status %} matching filters{% endif %}.</p>
+</div>
+{% endif %}
+
+{% endblock %}

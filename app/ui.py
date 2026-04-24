@@ -32,6 +32,7 @@ from app.database import (
     list_memory_snapshots, list_feedback_events, add_manual_memory,
     record_security_event, is_paused,
     get_active_capability_profile,
+    list_deployment_validations, list_deployment_profiles,
 )
 
 logger = logging.getLogger("orchestrator.ui")
@@ -690,3 +691,34 @@ async def ui_resume(request: Request, csrf_submitted: str = Form(alias="csrf")):
                           endpoint="/admin/ui/control/resume", method="POST",
                           status="RESUMED")
     return RedirectResponse(url="/admin/ui/control", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Validations list page
+# ---------------------------------------------------------------------------
+
+@router.get("/deployments", response_class=HTMLResponse)
+async def ui_deployments(
+    request: Request,
+    repo_slug: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    validations = list_deployment_validations(repo_slug=repo_slug, status=status, limit=limit)
+    profiles = list_deployment_profiles()
+    return templates.TemplateResponse("admin/deployments.html", {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": "deployments",
+        "validations": validations,
+        "profiles": profiles,
+        "filter_repo_slug": repo_slug or "",
+        "filter_status": status or "",
+        "limit": limit,
+    })

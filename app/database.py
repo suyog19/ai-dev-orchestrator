@@ -3010,6 +3010,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                        head_sha, files_changed_count, retry_count,
                        error_detail, created_at, started_at, completed_at, merged_at,
                        capability_profile_name, build_status, lint_status, dependency_install_status,
+                       deployment_validation_status, deployment_validation_summary,
+                       deployment_validation_completed_at,
                        (SELECT repo_slug FROM agent_reviews WHERE run_id = wr.id LIMIT 1) AS repo_slug
                 FROM workflow_runs wr WHERE wr.id = %s
                 """,
@@ -3028,6 +3030,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                 "head_sha", "files_changed_count", "retry_count",
                 "error_detail", "created_at", "started_at", "completed_at", "merged_at",
                 "capability_profile_name", "build_status", "lint_status", "dependency_install_status",
+                "deployment_validation_status", "deployment_validation_summary",
+                "deployment_validation_completed_at",
                 "repo_slug",
             ]
             run = {col: (val.isoformat() if hasattr(val, "isoformat") else val) for col, val in zip(cols, row)}
@@ -3121,6 +3125,24 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                         "created_at": r[3].isoformat() if r[3] else None,
                     })
             run["github_statuses"] = gh_statuses
+
+            # Deployment validation (Phase 16)
+            cur.execute(
+                """
+                SELECT id, environment, commit_sha, pr_number, status, summary,
+                       smoke_results_json, started_at, completed_at
+                FROM deployment_validations WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["deployment_validation"] = {
+                "id": r[0], "environment": r[1], "commit_sha": r[2],
+                "pr_number": r[3], "status": r[4], "summary": r[5],
+                "smoke_results": json.loads(r[6] or "[]"),
+                "started_at": r[7].isoformat() if r[7] else None,
+                "completed_at": r[8].isoformat() if r[8] else None,
+            } if r else None
 
     return run
 
