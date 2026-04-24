@@ -391,6 +391,56 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ON repo_capability_profiles (repo_slug)"
             )
 
+            # Phase 16 — Deployment Validation
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deployment_profiles (
+                    id                   SERIAL PRIMARY KEY,
+                    repo_slug            VARCHAR(200) NOT NULL,
+                    environment          VARCHAR(50)  NOT NULL,
+                    deployment_type      VARCHAR(100) NOT NULL,
+                    base_url             TEXT         NULL,
+                    healthcheck_path     TEXT         NULL,
+                    smoke_tests_json     TEXT         NULL,
+                    enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
+                    created_at           TIMESTAMP    NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_deployment_profiles_repo_env "
+                "ON deployment_profiles (repo_slug, environment)"
+            )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deployment_validations (
+                    id                      SERIAL PRIMARY KEY,
+                    run_id                  INTEGER      NOT NULL REFERENCES workflow_runs(id),
+                    repo_slug               VARCHAR(200) NOT NULL,
+                    environment             VARCHAR(50)  NOT NULL,
+                    commit_sha              VARCHAR(100) NULL,
+                    pr_number               INTEGER      NULL,
+                    deployment_profile_id   INTEGER      NULL,
+                    status                  VARCHAR(50)  NOT NULL,
+                    summary                 TEXT         NULL,
+                    smoke_results_json      TEXT         NULL,
+                    started_at              TIMESTAMP    NULL,
+                    completed_at            TIMESTAMP    NULL,
+                    created_at              TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deployment_validations_run_id "
+                "ON deployment_validations (run_id)"
+            )
+
+            # Phase 16 — workflow_runs deployment columns
+            for col_sql in [
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_status      VARCHAR(50)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_summary     TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_completed_at TIMESTAMP   NULL",
+            ]:
+                cur.execute(col_sql)
+
             # Seed default control flags from env (only if not already set)
             import os as _os
             _defaults = {
@@ -3305,3 +3355,262 @@ def list_capability_profiles(repo_slug: str | None = None) -> list[dict]:
                 }
                 for r in rows
             ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Profile helpers
+# ---------------------------------------------------------------------------
+
+def upsert_deployment_profile(data: dict) -> int:
+    """Insert or update a deployment profile (unique on repo_slug + environment).
+
+    Returns the row id.
+    """
+    smoke_tests_json = json.dumps(data.get("smoke_tests") or [])
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO deployment_profiles
+                    (repo_slug, environment, deployment_type, base_url,
+                     healthcheck_path, smoke_tests_json, enabled, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (repo_slug, environment)
+                DO UPDATE SET
+                    deployment_type  = EXCLUDED.deployment_type,
+                    base_url         = EXCLUDED.base_url,
+                    healthcheck_path = EXCLUDED.healthcheck_path,
+                    smoke_tests_json = EXCLUDED.smoke_tests_json,
+                    enabled          = EXCLUDED.enabled,
+                    updated_at       = NOW()
+                RETURNING id
+                """,
+                (
+                    data["repo_slug"],
+                    data["environment"],
+                    data["deployment_type"],
+                    data.get("base_url"),
+                    data.get("healthcheck_path"),
+                    smoke_tests_json,
+                    data.get("enabled", True),
+                ),
+            )
+            return cur.fetchone()[0]
+
+
+def get_deployment_profile(repo_slug: str, environment: str = "dev") -> dict | None:
+    """Return the active deployment profile for a repo+environment, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, environment, deployment_type, base_url,
+                       healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                FROM deployment_profiles
+                WHERE repo_slug=%s AND environment=%s AND enabled=TRUE
+                ORDER BY id DESC LIMIT 1
+                """,
+                (repo_slug, environment),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "repo_slug": row[1], "environment": row[2],
+        "deployment_type": row[3], "base_url": row[4],
+        "healthcheck_path": row[5],
+        "smoke_tests": json.loads(row[6] or "[]"),
+        "enabled": row[7],
+        "created_at": row[8].isoformat() if row[8] else None,
+        "updated_at": row[9].isoformat() if row[9] else None,
+    }
+
+
+def list_deployment_profiles(repo_slug: str | None = None) -> list[dict]:
+    """List deployment profiles, optionally filtered by repo_slug."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if repo_slug:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, environment, deployment_type, base_url,
+                           healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                    FROM deployment_profiles WHERE repo_slug=%s ORDER BY id DESC
+                    """,
+                    (repo_slug,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, environment, deployment_type, base_url,
+                           healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                    FROM deployment_profiles ORDER BY id DESC LIMIT 200
+                    """
+                )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "repo_slug": r[1], "environment": r[2],
+            "deployment_type": r[3], "base_url": r[4],
+            "healthcheck_path": r[5],
+            "smoke_tests": json.loads(r[6] or "[]"),
+            "enabled": r[7],
+            "created_at": r[8].isoformat() if r[8] else None,
+            "updated_at": r[9].isoformat() if r[9] else None,
+        }
+        for r in rows
+    ]
+
+
+def update_deployment_profile_field(profile_id: int, **kwargs) -> None:
+    """Update specific fields on a deployment_profiles row."""
+    allowed = {"deployment_type", "base_url", "healthcheck_path", "smoke_tests_json", "enabled"}
+    sets = []
+    params = []
+    for k, v in kwargs.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=%s")
+        params.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=NOW()")
+    params.append(profile_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE deployment_profiles SET {', '.join(sets)} WHERE id=%s",
+                params,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Validation helpers
+# ---------------------------------------------------------------------------
+
+def store_deployment_validation(
+    run_id: int,
+    repo_slug: str,
+    environment: str,
+    status: str,
+    summary: str | None = None,
+    smoke_results: list | None = None,
+    commit_sha: str | None = None,
+    pr_number: int | None = None,
+    deployment_profile_id: int | None = None,
+) -> int:
+    """Insert a deployment_validations row and update workflow_runs deployment fields.
+
+    Returns the new deployment_validations.id.
+    """
+    smoke_json = json.dumps(smoke_results or [])
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO deployment_validations
+                    (run_id, repo_slug, environment, commit_sha, pr_number,
+                     deployment_profile_id, status, summary, smoke_results_json,
+                     started_at, completed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id
+                """,
+                (
+                    run_id, repo_slug, environment, commit_sha, pr_number,
+                    deployment_profile_id, status, summary, smoke_json,
+                ),
+            )
+            validation_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET deployment_validation_status      = %s,
+                    deployment_validation_summary     = %s,
+                    deployment_validation_completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (status, summary, run_id),
+            )
+    logger.info(
+        "store_deployment_validation: run_id=%s validation_id=%s status=%s",
+        run_id, validation_id, status,
+    )
+    return validation_id
+
+
+def get_deployment_validation(run_id: int) -> dict | None:
+    """Return the latest deployment_validations row for a run, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, repo_slug, environment, commit_sha, pr_number,
+                       deployment_profile_id, status, summary, smoke_results_json,
+                       started_at, completed_at, created_at
+                FROM deployment_validations
+                WHERE run_id=%s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "run_id": row[1], "repo_slug": row[2], "environment": row[3],
+        "commit_sha": row[4], "pr_number": row[5], "deployment_profile_id": row[6],
+        "status": row[7], "summary": row[8],
+        "smoke_results": json.loads(row[9] or "[]"),
+        "started_at": row[10].isoformat() if row[10] else None,
+        "completed_at": row[11].isoformat() if row[11] else None,
+        "created_at": row[12].isoformat() if row[12] else None,
+    }
+
+
+def list_deployment_validations(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List deployment_validations rows, newest first."""
+    conditions: list[str] = []
+    params: list = []
+    if run_id:
+        conditions.append("run_id=%s")
+        params.append(run_id)
+    if repo_slug:
+        conditions.append("repo_slug=%s")
+        params.append(repo_slug)
+    if status:
+        conditions.append("status=%s")
+        params.append(status)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, repo_slug, environment, commit_sha, pr_number,
+                       deployment_profile_id, status, summary, smoke_results_json,
+                       started_at, completed_at, created_at
+                FROM deployment_validations
+                {where}
+                ORDER BY id DESC LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "run_id": r[1], "repo_slug": r[2], "environment": r[3],
+            "commit_sha": r[4], "pr_number": r[5], "deployment_profile_id": r[6],
+            "status": r[7], "summary": r[8],
+            "smoke_results": json.loads(r[9] or "[]"),
+            "started_at": r[10].isoformat() if r[10] else None,
+            "completed_at": r[11].isoformat() if r[11] else None,
+            "created_at": r[12].isoformat() if r[12] else None,
+        }
+        for r in rows
+    ]

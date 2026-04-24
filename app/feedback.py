@@ -175,11 +175,12 @@ CLARIFICATION_TIMEOUT_HOURS  = 24     # hours before a PENDING clarification exp
 
 # Phase 13 — GitHub commit status context names
 class GitHubStatusContext:
-    TESTS            = "orchestrator/tests"
-    REVIEWER         = "orchestrator/reviewer-agent"
-    TEST_QUALITY     = "orchestrator/test-quality-agent"
-    ARCHITECTURE     = "orchestrator/architecture-agent"
-    RELEASE_GATE     = "orchestrator/release-gate"
+    TESTS                 = "orchestrator/tests"
+    REVIEWER              = "orchestrator/reviewer-agent"
+    TEST_QUALITY          = "orchestrator/test-quality-agent"
+    ARCHITECTURE          = "orchestrator/architecture-agent"
+    RELEASE_GATE          = "orchestrator/release-gate"
+    DEPLOYMENT_VALIDATION = "orchestrator/deployment-validation"
 
 
 class GitHubState:
@@ -240,6 +241,33 @@ class FeedbackTypeP15:
     BUILD_STATUS            = "build_status"
     LINT_STATUS             = "lint_status"
     DEPENDENCY_INSTALL      = "dependency_install_status"
+
+
+# Phase 16 — Deployment Validation
+
+class DeploymentType:
+    GITHUB_PAGES     = "github_pages"
+    HUGGINGFACE      = "huggingface_space"
+    EC2_SERVICE      = "ec2_service"
+    NONE             = "none"
+
+
+class DeploymentValidationStatus:
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    PENDING        = "PENDING"
+    RUNNING        = "RUNNING"
+    PASSED         = "PASSED"
+    FAILED         = "FAILED"
+    ERROR          = "ERROR"
+    SKIPPED        = "SKIPPED"
+
+
+class FeedbackTypeP16:
+    DEPLOYMENT_VALIDATION_STATUS = "deployment_validation_status"
+    DEPLOYMENT_VALIDATION_PASSED = "deployment_validation_passed"
+    DEPLOYMENT_VALIDATION_FAILED = "deployment_validation_failed"
+    DEPLOYMENT_VALIDATION_ERROR  = "deployment_validation_error"
+    DEPLOYMENT_SMOKE_FAILURE_COUNT = "deployment_smoke_failure_count"
 
 
 def categorize_execution_failure(
