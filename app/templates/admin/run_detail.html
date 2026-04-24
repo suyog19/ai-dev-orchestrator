@@ -96,8 +96,8 @@
     {% if r.risk_level %} &middot; Risk: <strong>{{ r.risk_level }}</strong>{% endif %}
   </p>
   {% if r.summary %}<p style="margin-top:8px; font-size:13px;">{{ r.summary }}</p>{% endif %}
-  {% if r.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ r.blocking_reasons }}</p>{% endif %}
-  {% if r.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ r.recommendations }}</p>{% endif %}
+  {% if r.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ r.blocking_reasons | join('; ') }}</p>{% endif %}
+  {% if r.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ r.recommendations | join('; ') }}</p>{% endif %}
   {% else %}
   <p class="text-muted">No review recorded.</p>
   {% endif %}
@@ -114,10 +114,11 @@
     {% elif tq.quality_status %}<span class="pill pill-yellow">{{ tq.quality_status }}</span>
     {% endif %}
     {% if tq.confidence_level %} &middot; Confidence: <strong>{{ tq.confidence_level }}</strong>{% endif %}
-    {% if tq.missing_test_count %} &middot; Missing: {{ tq.missing_test_count }}{% endif %}
+    {% if tq.missing_tests %} &middot; Missing: {{ tq.missing_tests|length }}{% endif %}
   </p>
   {% if tq.summary %}<p style="margin-top:8px; font-size:13px;">{{ tq.summary }}</p>{% endif %}
-  {% if tq.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ tq.blocking_reasons }}</p>{% endif %}
+  {% if tq.missing_tests %}<p class="text-yellow" style="font-size:12px; margin-top:6px;"><strong>Missing tests:</strong> {{ tq.missing_tests | join(', ') }}</p>{% endif %}
+  {% if tq.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ tq.recommendations | join('; ') }}</p>{% endif %}
   {% else %}
   <p class="text-muted">No test quality review recorded.</p>
   {% endif %}
@@ -136,8 +137,8 @@
     {% if ar.risk_level %} &middot; Risk: <strong>{{ ar.risk_level }}</strong>{% endif %}
   </p>
   {% if ar.summary %}<p style="margin-top:8px; font-size:13px;">{{ ar.summary }}</p>{% endif %}
-  {% if ar.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ ar.blocking_reasons }}</p>{% endif %}
-  {% if ar.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ ar.recommendations }}</p>{% endif %}
+  {% if ar.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ ar.blocking_reasons | join('; ') }}</p>{% endif %}
+  {% if ar.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ ar.recommendations | join('; ') }}</p>{% endif %}
   {% else %}
   <p class="text-muted">No architecture review recorded.</p>
   {% endif %}

@@ -2866,8 +2866,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
             # Agent reviews
             cur.execute(
                 """
-                SELECT review_status, risk_level, summary, left(blocking_reasons, 500),
-                       left(recommendations, 500), created_at
+                SELECT review_status, risk_level, summary,
+                       blocking_reasons_json, recommendations_json, created_at
                 FROM agent_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
                 """,
                 (run_id,),
@@ -2875,15 +2875,16 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
             r = cur.fetchone()
             run["agent_review"] = {
                 "review_status": r[0], "risk_level": r[1], "summary": r[2],
-                "blocking_reasons": r[3], "recommendations": r[4],
+                "blocking_reasons": json.loads(r[3]) if r[3] else [],
+                "recommendations": json.loads(r[4]) if r[4] else [],
                 "created_at": r[5].isoformat() if r[5] else None,
             } if r else None
 
             # Test quality review
             cur.execute(
                 """
-                SELECT quality_status, confidence_level, summary, left(blocking_reasons, 500),
-                       missing_test_count, suspicious_test_count, created_at
+                SELECT quality_status, confidence_level, summary,
+                       missing_tests_json, suspicious_tests_json, recommendations_json, created_at
                 FROM agent_test_quality_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
                 """,
                 (run_id,),
@@ -2891,16 +2892,17 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
             r = cur.fetchone()
             run["tq_review"] = {
                 "quality_status": r[0], "confidence_level": r[1], "summary": r[2],
-                "blocking_reasons": r[3], "missing_test_count": r[4],
-                "suspicious_test_count": r[5],
+                "missing_tests": json.loads(r[3]) if r[3] else [],
+                "suspicious_tests": json.loads(r[4]) if r[4] else [],
+                "recommendations": json.loads(r[5]) if r[5] else [],
                 "created_at": r[6].isoformat() if r[6] else None,
             } if r else None
 
             # Architecture review
             cur.execute(
                 """
-                SELECT architecture_status, risk_level, summary, left(blocking_reasons, 500),
-                       left(recommendations, 500), created_at
+                SELECT architecture_status, risk_level, summary,
+                       blocking_reasons_json, recommendations_json, created_at
                 FROM agent_architecture_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
                 """,
                 (run_id,),
@@ -2908,7 +2910,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
             r = cur.fetchone()
             run["arch_review"] = {
                 "architecture_status": r[0], "risk_level": r[1], "summary": r[2],
-                "blocking_reasons": r[3], "recommendations": r[4],
+                "blocking_reasons": json.loads(r[3]) if r[3] else [],
+                "recommendations": json.loads(r[4]) if r[4] else [],
                 "created_at": r[5].isoformat() if r[5] else None,
             } if r else None
 
