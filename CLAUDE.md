@@ -48,6 +48,10 @@ Copy `.env.example` to `.env` and fill in secrets. All values are required unles
 | `ALLOW_GITHUB_WRITES` | `true`/`false` — global GitHub write kill switch (default: `true`) |
 | `ALLOW_AUTO_MERGE` | `true`/`false` — auto-merge kill switch (default: `true`) |
 | `ORCHESTRATOR_PAUSED` | `true`/`false` — bootstrap pause state (DB flag takes precedence once set) |
+| `DEPLOYMENT_VALIDATION_ENABLED` | `true`/`false` — kill switch for post-merge smoke testing (default: `true`) |
+| `DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS` | Per-smoke-test HTTP timeout (default: `120`) |
+| `DEPLOYMENT_VALIDATION_RETRY_COUNT` | Retries per smoke test before declaring FAILED (default: `3`) |
+| `DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS` | Delay between retries (default: `10`) |
 
 ## Architecture
 
@@ -78,7 +82,8 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/queue.py` — Redis queue enqueue/dequeue
 - `app/clarification.py` — clarification loop: detects vagueness/ambiguity, sends Telegram questions, suspends runs, resumes on answer
 - `app/github_status_mapper.py` — pure functions mapping internal verdicts → GitHub commit status payloads (state, description, context); one function per gate
-- `app/github_status_publisher.py` — `publish_github_statuses_for_run(run_id, repo_slug, pr_number)`: publishes all 5 statuses after Release Gate, records in DB, non-fatal on failure
+- `app/github_status_publisher.py` — `publish_github_statuses_for_run(run_id, repo_slug, pr_number)`: publishes all 5 pre-merge statuses after Release Gate, non-fatal; `publish_deployment_validation_status()` publishes the 6th (`orchestrator/deployment-validation`) after post-merge validation
+- `app/deployment_validator.py` — `run_http_smoke_test()` (HTTP check with expected_status + expected_contains); `run_deployment_validation()` (loads profile, runs smoke tests with retries, stores result); status values: `NOT_CONFIGURED | SKIPPED | PASSED | FAILED | ERROR`
 
 **Event flow:**
 ```
@@ -96,6 +101,10 @@ Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
     → Unified Release Gate (evaluate_release_decision) → persist release_decision
     → publish GitHub commit statuses (5 contexts via publish_github_statuses_for_run)
       RELEASE_APPROVED → merge
+        → post-merge deployment validation (observational; never reverts merge)
+          → run_deployment_validation() → store in deployment_validations
+          → publish orchestrator/deployment-validation GitHub status
+          → Telegram: deployment_validation_passed | deployment_validation_failed
       RELEASE_BLOCKED  → BLOCKED_BY_REVIEW | BLOCKED_BY_TEST_QUALITY | BLOCKED_BY_ARCHITECTURE
       RELEASE_SKIPPED  → SKIPPED
 
@@ -133,6 +142,8 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `control_flags` | Runtime control flags (paused state); DB takes precedence over env var |
 | `github_status_updates` | Append-only audit log of every GitHub commit status publish attempt; one row per gate per run per attempt |
 | `repo_capability_profiles` | Active capability profile per repo (profile_name, commands, capabilities_json); upserted on each clone |
+| `deployment_profiles` | Per-repo/environment smoke test configuration; unique on (repo_slug, environment); seeded from `config/deployment_profiles.yaml` |
+| `deployment_validations` | One row per post-merge validation run (FK to workflow_runs); stores smoke_results_json, status, timing |
 
 **`workflow_runs` status flow:**
 ```
@@ -149,6 +160,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 **`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
 **`workflow_runs` Phase 13 columns:** `head_sha` (fetched from GitHub after PR creation), `github_statuses_published` (bool), `github_statuses_published_at` (timestamp)
 **`workflow_runs` Phase 15 columns:** `capability_profile_name`, `build_status`, `lint_status`, `dependency_install_status`
+**`workflow_runs` Phase 16 columns:** `deployment_validation_status`, `deployment_validation_summary`, `deployment_validation_completed_at`
 
 **`clarification_requests.status` values:** `PENDING` | `ANSWERED` | `CANCELLED` | `EXPIRED`
 **Clarification context keys:** `pre_planning` (epic), `pre_suggest` (story implementation), `pre_review` (review agents)
@@ -208,6 +220,14 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/admin/github/branch-protection/validate-required-checks` | Dry-run check for required `orchestrator/release-gate` context (body: repo_slug, branch) |
 | GET | `/debug/repo-capability-profiles` | List all capability profiles (filter: repo_slug) |
 | GET | `/debug/repo-capability-profiles/{repo_slug}` | Get active profile for one repo |
+| GET | `/debug/deployment-policy` | Deployment validation policy per capability profile (all or single) |
+| GET | `/debug/deployment-profiles` | List deployment profiles (filter: repo_slug) |
+| POST | `/debug/deployment-profiles` | Create deployment profile |
+| GET | `/debug/deployment-profiles/{repo_slug}` | Get profile for repo+env (query: environment) |
+| PUT | `/debug/deployment-profiles/{id}` | Update deployment profile fields |
+| GET | `/debug/deployment-validations` | List validations (filter: run_id, repo_slug, status, limit) |
+| GET | `/debug/workflow-runs/{run_id}/deployment-validation` | Latest deployment validation for a run |
+| POST | `/debug/workflow-runs/{run_id}/run-deployment-validation` | Admin re-run deployment validation (query: repo_slug, environment) |
 | GET | `/admin/ui/login` | Dashboard login page |
 | POST | `/admin/ui/login` | Submit credentials; sets `orchestrator_admin_session` cookie |
 | GET | `/admin/ui/logout` | Clear session cookie |
@@ -230,6 +250,8 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/admin/ui/control` | Runtime control flags and env vars |
 | POST | `/admin/ui/control/pause` | Pause orchestrator (CSRF-protected) |
 | POST | `/admin/ui/control/resume` | Resume orchestrator (CSRF-protected) |
+| GET | `/admin/ui/deployments` | Deployment profiles + recent validations list (filter: repo_slug, status, limit) |
+| POST | `/admin/ui/runs/{run_id}/run-deployment-validation` | Re-run deployment validation for a run (CSRF-protected) |
 
 ## Workflow Configuration
 
@@ -391,6 +413,7 @@ After `evaluate_release_decision()` stores its verdict, `publish_github_statuses
 | `orchestrator/test-quality-agent` | `test_quality_status` | `TEST_QUALITY_APPROVED` | `TESTS_WEAK` / `TESTS_BLOCKING` |
 | `orchestrator/architecture-agent` | `architecture_status` | `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` / `ARCHITECTURE_BLOCKED` |
 | `orchestrator/release-gate` | `release_decision` | `RELEASE_APPROVED` | `RELEASE_BLOCKED` / `RELEASE_SKIPPED` |
+| `orchestrator/deployment-validation` | `deployment_validation_status` | `PASSED` | `FAILED` / `ERROR` / `SKIPPED` |
 
 `None` values map to `pending`; unknown values map to `error`. All mapping logic lives in `app/github_status_mapper.py` as pure functions.
 
@@ -414,6 +437,22 @@ Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 | File count | — | `count > 3` |
 
 **Release feedback events:** `release_decision`, `release_blocking_gate_count`
+
+### Post-Merge Deployment Validation (Phase 16)
+
+`_run_post_merge_validation(run_id, issue_key, repo_slug, commit_sha, pr_number, environment)` in `workflows.py` is called after a successful merge. It is **non-fatal and observational** — a FAILED result is recorded but never retroactively alters `release_decision`.
+
+**Policy:** `_PROFILE_DEPLOYMENT_POLICY` in `workflows.py` — all profiles have `deployment_validation_required=False`. Exposes `get_deployment_policy_for_profile(profile_name)`.
+
+**Kill switch:** `DEPLOYMENT_VALIDATION_ENABLED=false` skips all post-merge validation.
+
+**Profile config:** `config/deployment_profiles.yaml` seeds `deployment_profiles` table on startup via `seed_deployment_profiles()`. YAML uses `ON CONFLICT DO UPDATE` — manual DB changes outside YAML-defined fields are preserved.
+
+**Smoke test types:** HTTP only (GET/POST). `expected_status` required; `expected_contains` optional. Response bodies capped at 500 chars; no secret headers in DB.
+
+**Telegram events:** `deployment_validation_passed` (status=COMPLETE), `deployment_validation_failed` (status=FAILED). `NOT_CONFIGURED` and `SKIPPED` are silent.
+
+**Feedback events (FeedbackTypeP16):** `deployment_validation_status`, `deployment_validation_passed`, `deployment_validation_failed`, `deployment_validation_error`, `deployment_smoke_failure_count`. Written by `record_execution_feedback()`. Memory snapshot includes deployment validation bullet in `execution_guidance`.
 
 ## Telegram Message Format
 

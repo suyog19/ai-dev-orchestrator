@@ -391,6 +391,56 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ON repo_capability_profiles (repo_slug)"
             )
 
+            # Phase 16 — Deployment Validation
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deployment_profiles (
+                    id                   SERIAL PRIMARY KEY,
+                    repo_slug            VARCHAR(200) NOT NULL,
+                    environment          VARCHAR(50)  NOT NULL,
+                    deployment_type      VARCHAR(100) NOT NULL,
+                    base_url             TEXT         NULL,
+                    healthcheck_path     TEXT         NULL,
+                    smoke_tests_json     TEXT         NULL,
+                    enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
+                    created_at           TIMESTAMP    NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_deployment_profiles_repo_env "
+                "ON deployment_profiles (repo_slug, environment)"
+            )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deployment_validations (
+                    id                      SERIAL PRIMARY KEY,
+                    run_id                  INTEGER      NOT NULL REFERENCES workflow_runs(id),
+                    repo_slug               VARCHAR(200) NOT NULL,
+                    environment             VARCHAR(50)  NOT NULL,
+                    commit_sha              VARCHAR(100) NULL,
+                    pr_number               INTEGER      NULL,
+                    deployment_profile_id   INTEGER      NULL,
+                    status                  VARCHAR(50)  NOT NULL,
+                    summary                 TEXT         NULL,
+                    smoke_results_json      TEXT         NULL,
+                    started_at              TIMESTAMP    NULL,
+                    completed_at            TIMESTAMP    NULL,
+                    created_at              TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deployment_validations_run_id "
+                "ON deployment_validations (run_id)"
+            )
+
+            # Phase 16 — workflow_runs deployment columns
+            for col_sql in [
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_status      VARCHAR(50)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_summary     TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS deployment_validation_completed_at TIMESTAMP   NULL",
+            ]:
+                cur.execute(col_sql)
+
             # Seed default control flags from env (only if not already set)
             import os as _os
             _defaults = {
@@ -417,6 +467,9 @@ def init_db(retries: int = 5, delay: int = 3):
         from app.repo_mapping import upsert_seed_mappings
         mappings = json.loads(seed_file.read_text())
         upsert_seed_mappings(mappings)
+
+    # Seed deployment profiles from config/deployment_profiles.yaml (Phase 16)
+    seed_deployment_profiles()
 
     logger.info("Database initialized — tables ready")
 
@@ -1292,6 +1345,21 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             release_row = cur.fetchone()
 
+            # --- Deployment Validation stats (Phase 16) ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_passed' AND feedback_value='true') AS dv_passed,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_failed' AND feedback_value='true') AS dv_failed,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_error'  AND feedback_value='true') AS dv_error,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='deployment_validation_status') AS dv_total
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            dv_stats_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -1401,6 +1469,22 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                         "release_skipped":  int(rel_skipped or 0),
                     })
 
+            # Phase 16: deployment validation summary
+            if dv_stats_row:
+                dv_passed, dv_failed, dv_error, dv_total = dv_stats_row
+                if int(dv_total or 0) > 0:
+                    exec_bullets.append(
+                        f"Deployment validation: {int(dv_passed or 0)} passed, "
+                        f"{int(dv_failed or 0)} failed, "
+                        f"{int(dv_error or 0)} error of {int(dv_total)} recent validations"
+                    )
+                    exec_evidence.update({
+                        "dv_passed": int(dv_passed or 0),
+                        "dv_failed": int(dv_failed or 0),
+                        "dv_error":  int(dv_error or 0),
+                        "dv_total":  int(dv_total or 0),
+                    })
+
             exec_summary = (
                 "\n".join(f"- {b}" for b in exec_bullets)
                 if exec_bullets else "No execution runs recorded yet."
@@ -1499,7 +1583,8 @@ def record_execution_feedback(run_id: int) -> int:
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
                        review_status, test_quality_status,
-                       architecture_status, release_decision
+                       architecture_status, release_decision,
+                       deployment_validation_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1510,7 +1595,8 @@ def record_execution_feedback(run_id: int) -> int:
             issue_key, status, test_status, retry_count, merge_status, \
                 files_changed_count, error_detail, current_step, \
                 review_status, test_quality_status, \
-                architecture_status, release_decision = row
+                architecture_status, release_decision, \
+                deployment_validation_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1649,6 +1735,36 @@ def record_execution_feedback(run_id: int) -> int:
                     _ev(FeedbackType.CLARIFICATION_CANCELLED, "true")
                 if any(s == "EXPIRED" for s in statuses):
                     _ev(FeedbackType.CLARIFICATION_EXPIRED, "true")
+
+            # Deployment validation signals (Phase 16)
+            if deployment_validation_status:
+                from app.feedback import FeedbackTypeP16, DeploymentValidationStatus as DVS
+                _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_STATUS, deployment_validation_status)
+                if deployment_validation_status == DVS.PASSED:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_PASSED, "true")
+                elif deployment_validation_status == DVS.FAILED:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_FAILED, "true")
+                    # Count failed smoke tests from the latest deployment_validations row
+                    try:
+                        cur.execute(
+                            """
+                            SELECT smoke_results_json FROM deployment_validations
+                            WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                            """,
+                            (run_id,),
+                        )
+                        dv_row = cur.fetchone()
+                        if dv_row and dv_row[0]:
+                            smoke_results = json.loads(dv_row[0])
+                            failed_count = sum(
+                                1 for r in smoke_results if r.get("status") != "PASSED"
+                            )
+                            if failed_count > 0:
+                                _ev(FeedbackTypeP16.DEPLOYMENT_SMOKE_FAILURE_COUNT, failed_count)
+                    except Exception:
+                        pass
+                elif deployment_validation_status == DVS.ERROR:
+                    _ev(FeedbackTypeP16.DEPLOYMENT_VALIDATION_ERROR, "true")
 
             if not events:
                 return 0
@@ -2960,6 +3076,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                        head_sha, files_changed_count, retry_count,
                        error_detail, created_at, started_at, completed_at, merged_at,
                        capability_profile_name, build_status, lint_status, dependency_install_status,
+                       deployment_validation_status, deployment_validation_summary,
+                       deployment_validation_completed_at,
                        (SELECT repo_slug FROM agent_reviews WHERE run_id = wr.id LIMIT 1) AS repo_slug
                 FROM workflow_runs wr WHERE wr.id = %s
                 """,
@@ -2978,6 +3096,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                 "head_sha", "files_changed_count", "retry_count",
                 "error_detail", "created_at", "started_at", "completed_at", "merged_at",
                 "capability_profile_name", "build_status", "lint_status", "dependency_install_status",
+                "deployment_validation_status", "deployment_validation_summary",
+                "deployment_validation_completed_at",
                 "repo_slug",
             ]
             run = {col: (val.isoformat() if hasattr(val, "isoformat") else val) for col, val in zip(cols, row)}
@@ -3071,6 +3191,24 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                         "created_at": r[3].isoformat() if r[3] else None,
                     })
             run["github_statuses"] = gh_statuses
+
+            # Deployment validation (Phase 16)
+            cur.execute(
+                """
+                SELECT id, environment, commit_sha, pr_number, status, summary,
+                       smoke_results_json, started_at, completed_at
+                FROM deployment_validations WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["deployment_validation"] = {
+                "id": r[0], "environment": r[1], "commit_sha": r[2],
+                "pr_number": r[3], "status": r[4], "summary": r[5],
+                "smoke_results": json.loads(r[6] or "[]"),
+                "started_at": r[7].isoformat() if r[7] else None,
+                "completed_at": r[8].isoformat() if r[8] else None,
+            } if r else None
 
     return run
 
@@ -3305,3 +3443,350 @@ def list_capability_profiles(repo_slug: str | None = None) -> list[dict]:
                 }
                 for r in rows
             ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Profile helpers
+# ---------------------------------------------------------------------------
+
+def upsert_deployment_profile(data: dict) -> int:
+    """Insert or update a deployment profile (unique on repo_slug + environment).
+
+    Returns the row id.
+    """
+    smoke_tests_json = json.dumps(data.get("smoke_tests") or [])
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO deployment_profiles
+                    (repo_slug, environment, deployment_type, base_url,
+                     healthcheck_path, smoke_tests_json, enabled, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (repo_slug, environment)
+                DO UPDATE SET
+                    deployment_type  = EXCLUDED.deployment_type,
+                    base_url         = EXCLUDED.base_url,
+                    healthcheck_path = EXCLUDED.healthcheck_path,
+                    smoke_tests_json = EXCLUDED.smoke_tests_json,
+                    enabled          = EXCLUDED.enabled,
+                    updated_at       = NOW()
+                RETURNING id
+                """,
+                (
+                    data["repo_slug"],
+                    data["environment"],
+                    data["deployment_type"],
+                    data.get("base_url"),
+                    data.get("healthcheck_path"),
+                    smoke_tests_json,
+                    data.get("enabled", True),
+                ),
+            )
+            return cur.fetchone()[0]
+
+
+def get_deployment_profile(repo_slug: str, environment: str = "dev") -> dict | None:
+    """Return the active deployment profile for a repo+environment, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, environment, deployment_type, base_url,
+                       healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                FROM deployment_profiles
+                WHERE repo_slug=%s AND environment=%s
+                ORDER BY id DESC LIMIT 1
+                """,
+                (repo_slug, environment),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "repo_slug": row[1], "environment": row[2],
+        "deployment_type": row[3], "base_url": row[4],
+        "healthcheck_path": row[5],
+        "smoke_tests": json.loads(row[6] or "[]"),
+        "enabled": row[7],
+        "created_at": row[8].isoformat() if row[8] else None,
+        "updated_at": row[9].isoformat() if row[9] else None,
+    }
+
+
+def list_deployment_profiles(repo_slug: str | None = None) -> list[dict]:
+    """List deployment profiles, optionally filtered by repo_slug."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if repo_slug:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, environment, deployment_type, base_url,
+                           healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                    FROM deployment_profiles WHERE repo_slug=%s ORDER BY id DESC
+                    """,
+                    (repo_slug,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, environment, deployment_type, base_url,
+                           healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
+                    FROM deployment_profiles ORDER BY id DESC LIMIT 200
+                    """
+                )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "repo_slug": r[1], "environment": r[2],
+            "deployment_type": r[3], "base_url": r[4],
+            "healthcheck_path": r[5],
+            "smoke_tests": json.loads(r[6] or "[]"),
+            "enabled": r[7],
+            "created_at": r[8].isoformat() if r[8] else None,
+            "updated_at": r[9].isoformat() if r[9] else None,
+        }
+        for r in rows
+    ]
+
+
+def update_deployment_profile_field(profile_id: int, **kwargs) -> None:
+    """Update specific fields on a deployment_profiles row."""
+    allowed = {"deployment_type", "base_url", "healthcheck_path", "smoke_tests_json", "enabled"}
+    sets = []
+    params = []
+    for k, v in kwargs.items():
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=%s")
+        params.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=NOW()")
+    params.append(profile_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE deployment_profiles SET {', '.join(sets)} WHERE id=%s",
+                params,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Validation helpers
+# ---------------------------------------------------------------------------
+
+def store_deployment_validation(
+    run_id: int,
+    repo_slug: str,
+    environment: str,
+    status: str,
+    summary: str | None = None,
+    smoke_results: list | None = None,
+    commit_sha: str | None = None,
+    pr_number: int | None = None,
+    deployment_profile_id: int | None = None,
+) -> int:
+    """Insert a deployment_validations row and update workflow_runs deployment fields.
+
+    Returns the new deployment_validations.id.
+    """
+    smoke_json = json.dumps(smoke_results or [])
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO deployment_validations
+                    (run_id, repo_slug, environment, commit_sha, pr_number,
+                     deployment_profile_id, status, summary, smoke_results_json,
+                     started_at, completed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id
+                """,
+                (
+                    run_id, repo_slug, environment, commit_sha, pr_number,
+                    deployment_profile_id, status, summary, smoke_json,
+                ),
+            )
+            validation_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET deployment_validation_status      = %s,
+                    deployment_validation_summary     = %s,
+                    deployment_validation_completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (status, summary, run_id),
+            )
+    logger.info(
+        "store_deployment_validation: run_id=%s validation_id=%s status=%s",
+        run_id, validation_id, status,
+    )
+    return validation_id
+
+
+def get_deployment_validation(run_id: int) -> dict | None:
+    """Return the latest deployment_validations row for a run, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, repo_slug, environment, commit_sha, pr_number,
+                       deployment_profile_id, status, summary, smoke_results_json,
+                       started_at, completed_at, created_at
+                FROM deployment_validations
+                WHERE run_id=%s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "run_id": row[1], "repo_slug": row[2], "environment": row[3],
+        "commit_sha": row[4], "pr_number": row[5], "deployment_profile_id": row[6],
+        "status": row[7], "summary": row[8],
+        "smoke_results": json.loads(row[9] or "[]"),
+        "started_at": row[10].isoformat() if row[10] else None,
+        "completed_at": row[11].isoformat() if row[11] else None,
+        "created_at": row[12].isoformat() if row[12] else None,
+    }
+
+
+def list_deployment_validations(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List deployment_validations rows, newest first."""
+    conditions: list[str] = []
+    params: list = []
+    if run_id:
+        conditions.append("run_id=%s")
+        params.append(run_id)
+    if repo_slug:
+        conditions.append("repo_slug=%s")
+        params.append(repo_slug)
+    if status:
+        conditions.append("status=%s")
+        params.append(status)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, repo_slug, environment, commit_sha, pr_number,
+                       deployment_profile_id, status, summary, smoke_results_json,
+                       started_at, completed_at, created_at
+                FROM deployment_validations
+                {where}
+                ORDER BY id DESC LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": r[0], "run_id": r[1], "repo_slug": r[2], "environment": r[3],
+            "commit_sha": r[4], "pr_number": r[5], "deployment_profile_id": r[6],
+            "status": r[7], "summary": r[8],
+            "smoke_results": json.loads(r[9] or "[]"),
+            "started_at": r[10].isoformat() if r[10] else None,
+            "completed_at": r[11].isoformat() if r[11] else None,
+            "created_at": r[12].isoformat() if r[12] else None,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Profile seeding
+# ---------------------------------------------------------------------------
+
+def seed_deployment_profiles() -> int:
+    """Idempotently seed deployment_profiles from config/deployment_profiles.yaml.
+
+    Uses ON CONFLICT (repo_slug, environment) DO UPDATE so manual DB changes
+    to fields NOT defined in the YAML are preserved. Returns the number of
+    profiles upserted (0 if file absent or empty).
+
+    Invalid YAML or missing required fields are logged as warnings; startup
+    is never aborted.
+    """
+    seed_file = Path(__file__).parent.parent / "config" / "deployment_profiles.yaml"
+    if not seed_file.exists():
+        return 0
+
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        # PyYAML is in requirements.txt; log and continue
+        logger.warning("seed_deployment_profiles: PyYAML not installed — skipping seed")
+        return 0
+
+    try:
+        content = yaml.safe_load(seed_file.read_text())
+    except Exception as exc:
+        logger.warning("seed_deployment_profiles: invalid YAML — %s", exc)
+        return 0
+
+    if not content or not isinstance(content, dict):
+        return 0
+
+    profiles = content.get("profiles") or []
+    if not profiles:
+        return 0
+
+    seeded = 0
+    for entry in profiles:
+        try:
+            repo_slug        = entry["repo_slug"]
+            environment      = entry.get("environment", "dev")
+            deployment_type  = entry["deployment_type"]
+        except KeyError as exc:
+            logger.warning("seed_deployment_profiles: missing required field %s in entry %s — skipping", exc, entry)
+            continue
+
+        smoke_tests = entry.get("smoke_tests") or []
+        smoke_json  = json.dumps(smoke_tests)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO deployment_profiles
+                            (repo_slug, environment, deployment_type, base_url,
+                             healthcheck_path, smoke_tests_json, enabled, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (repo_slug, environment)
+                        DO UPDATE SET
+                            deployment_type  = EXCLUDED.deployment_type,
+                            base_url         = EXCLUDED.base_url,
+                            healthcheck_path = EXCLUDED.healthcheck_path,
+                            smoke_tests_json = EXCLUDED.smoke_tests_json,
+                            enabled          = EXCLUDED.enabled,
+                            updated_at       = NOW()
+                        """,
+                        (
+                            repo_slug,
+                            environment,
+                            deployment_type,
+                            entry.get("base_url") or None,
+                            entry.get("healthcheck_path"),
+                            smoke_json,
+                            entry.get("enabled", True),
+                        ),
+                    )
+            seeded += 1
+        except Exception as exc:
+            logger.warning("seed_deployment_profiles: failed to seed %s/%s — %s", repo_slug, environment, exc)
+
+    if seeded:
+        logger.info("seed_deployment_profiles: seeded %d profile(s)", seeded)
+    return seeded

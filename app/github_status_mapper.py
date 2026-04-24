@@ -160,6 +160,47 @@ def map_architecture_status_to_github(architecture_status: str | None) -> dict:
             }
 
 
+def map_deployment_validation_to_github(deployment_validation_status: str | None) -> dict:
+    """Map workflow_runs.deployment_validation_status → GitHub commit status payload."""
+    match deployment_validation_status:
+        case "PASSED":
+            return {
+                "state": GitHubState.SUCCESS,
+                "description": "Deployment validation passed",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+        case "FAILED":
+            return {
+                "state": GitHubState.FAILURE,
+                "description": "Deployment validation failed: smoke tests did not pass",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+        case "ERROR":
+            return {
+                "state": GitHubState.ERROR,
+                "description": "Deployment validation encountered an error",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+        case "SKIPPED":
+            return {
+                "state": GitHubState.FAILURE,
+                "description": "Deployment validation skipped (profile disabled or no tests)",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+        case "NOT_CONFIGURED" | None:
+            return {
+                "state": GitHubState.PENDING,
+                "description": "No deployment profile configured",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+        case _:
+            return {
+                "state": GitHubState.ERROR,
+                "description": f"Unknown deployment validation status: {deployment_validation_status}",
+                "context": GitHubStatusContext.DEPLOYMENT_VALIDATION,
+            }
+
+
 def map_release_decision_to_github(release_decision: str | None) -> dict:
     """Map workflow_runs.release_decision → GitHub commit status payload."""
     match release_decision:

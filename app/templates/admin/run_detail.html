@@ -251,4 +251,86 @@
 </div>
 {% endif %}
 
+<!-- Deployment Validation (Phase 16) -->
+<div class="card">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+    <h2 style="margin:0;">Deployment Validation</h2>
+    <form method="post" action="/admin/ui/runs/{{ run.id }}/run-deployment-validation" style="margin:0;">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="btn btn-ghost btn-sm" title="Re-run deployment smoke tests">↻ Re-run Validation</button>
+    </form>
+  </div>
+  {% set dv = run.deployment_validation %}
+  {% set dv_status = run.deployment_validation_status %}
+  {% if dv %}
+    <div style="display:flex; gap:24px; flex-wrap:wrap; margin-bottom:12px;">
+      <div>
+        <span class="text-muted" style="font-size:12px;">Status</span><br>
+        {% if dv_status == 'PASSED' %}<span class="pill pill-green">PASSED</span>
+        {% elif dv_status == 'FAILED' %}<span class="pill pill-red">FAILED</span>
+        {% elif dv_status == 'ERROR' %}<span class="pill pill-red">ERROR</span>
+        {% elif dv_status == 'SKIPPED' %}<span class="pill pill-yellow">SKIPPED</span>
+        {% elif dv_status == 'NOT_CONFIGURED' %}<span class="pill pill-gray">NOT CONFIGURED</span>
+        {% elif dv_status %}<span class="pill pill-gray">{{ dv_status }}</span>
+        {% else %}<span class="text-muted">—</span>{% endif %}
+      </div>
+      <div>
+        <span class="text-muted" style="font-size:12px;">Environment</span><br>
+        <code>{{ dv.environment or '—' }}</code>
+      </div>
+      {% if dv.commit_sha %}
+      <div>
+        <span class="text-muted" style="font-size:12px;">Commit SHA</span><br>
+        <code>{{ dv.commit_sha[:8] }}</code>
+      </div>
+      {% endif %}
+      {% if dv.completed_at %}
+      <div>
+        <span class="text-muted" style="font-size:12px;">Completed</span><br>
+        {{ dv.completed_at[:16] }}
+      </div>
+      {% endif %}
+    </div>
+    {% if run.deployment_validation_summary %}
+    <p style="font-size:13px; margin-bottom:12px;">{{ run.deployment_validation_summary }}</p>
+    {% endif %}
+    {% if dv.smoke_results %}
+    <table style="width:100%; font-size:13px;">
+      <thead>
+        <tr>
+          <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Test</th>
+          <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Status</th>
+          <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">HTTP</th>
+          <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Duration</th>
+          <th style="text-align:left; padding:6px 8px; color:#6b7280; border-bottom:1px solid #e5e7eb;">Summary</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for sr in dv.smoke_results %}
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:6px 8px;"><code>{{ sr.name }}</code></td>
+          <td style="padding:6px 8px;">
+            {% if sr.status == 'PASSED' %}<span class="pill pill-green pill-sm">PASSED</span>
+            {% elif sr.status == 'FAILED' %}<span class="pill pill-red pill-sm">FAILED</span>
+            {% else %}<span class="pill pill-gray pill-sm">{{ sr.status }}</span>{% endif %}
+          </td>
+          <td style="padding:6px 8px;">{{ sr.status_code or '—' }}</td>
+          <td style="padding:6px 8px;">{{ sr.duration_ms }}ms</td>
+          <td style="padding:6px 8px; color:#6b7280;">{{ sr.summary }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  {% elif dv_status %}
+    <p class="text-muted">
+      {% if dv_status == 'NOT_CONFIGURED' %}No deployment profile is configured for this repo/environment.
+      {% elif dv_status == 'SKIPPED' %}Deployment validation was skipped.
+      {% else %}Status: {{ dv_status }}{% endif %}
+    </p>
+  {% else %}
+    <p class="text-muted">Not run — deployment validation only triggers after a successful merge.</p>
+  {% endif %}
+</div>
+
 {% endblock %}
