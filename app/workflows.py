@@ -382,6 +382,89 @@ def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     return f"## {label}\n- Tests not run (no supported test framework detected)\n"
 
 
+def evaluate_release_decision(
+    mapping: dict,
+    final_test_result: dict,
+    applied: dict,
+    review_status: str,
+    test_quality_status: str,
+    architecture_status: str,
+) -> dict:
+    """Evaluate all agent gates and return a unified release decision.
+
+    Returns a dict with keys:
+    - release_decision: RELEASE_APPROVED | RELEASE_SKIPPED | RELEASE_BLOCKED | RELEASE_ERROR
+    - can_auto_merge: bool
+    - reason: str
+    - blocking_gates: list[str]
+    - warnings: list[str]
+    """
+    blocking_gates = []
+    warnings = []
+
+    # Hard blocks — any one alone prevents auto-merge entirely
+    if final_test_result.get("status") == "FAILED":
+        blocking_gates.append("tests failed")
+    if review_status == ReviewStatus.BLOCKED:
+        blocking_gates.append("reviewer blocked")
+    if test_quality_status == TestQualityStatus.BLOCKING:
+        blocking_gates.append("test quality blocking")
+    if architecture_status == ArchitectureStatus.BLOCKED:
+        blocking_gates.append("architecture blocked")
+
+    if blocking_gates:
+        return {
+            "release_decision": ReleaseDecision.BLOCKED,
+            "can_auto_merge": False,
+            "reason": "Blocked by: " + "; ".join(blocking_gates),
+            "blocking_gates": blocking_gates,
+            "warnings": warnings,
+        }
+
+    # Soft skips — auto-merge disabled or agent concerns
+    skip_reasons = []
+    if not mapping.get("auto_merge_enabled"):
+        skip_reasons.append("auto_merge disabled for repo")
+    if final_test_result.get("status") not in ("PASSED",):
+        skip_reasons.append(f"tests {final_test_result.get('status', 'NOT_RUN')}")
+    if not applied.get("applied", False):
+        skip_reasons.append("fallback apply used")
+    if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
+        skip_reasons.append(f"{applied.get('count')} files > {MAX_FILES_FOR_AUTOMERGE} limit")
+    if review_status == ReviewStatus.NEEDS_CHANGES:
+        skip_reasons.append("reviewer needs changes")
+    elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
+        warnings.append(f"review status: {review_status}")
+        skip_reasons.append(f"review status: {review_status}")
+    if test_quality_status == TestQualityStatus.WEAK:
+        skip_reasons.append("test quality weak")
+    elif test_quality_status not in (TestQualityStatus.APPROVED,):
+        skip_reasons.append(f"test quality status: {test_quality_status}")
+    if architecture_status == ArchitectureStatus.NEEDS_REVIEW:
+        skip_reasons.append("architecture needs review")
+        warnings.append("architecture needs human review")
+    elif architecture_status not in (ArchitectureStatus.APPROVED,):
+        skip_reasons.append(f"architecture status: {architecture_status}")
+
+    if skip_reasons:
+        return {
+            "release_decision": ReleaseDecision.SKIPPED,
+            "can_auto_merge": False,
+            "reason": "; ".join(skip_reasons),
+            "blocking_gates": [],
+            "warnings": warnings,
+        }
+
+    # All gates passed
+    return {
+        "release_decision": ReleaseDecision.APPROVED,
+        "can_auto_merge": True,
+        "reason": "All release gates passed",
+        "blocking_gates": [],
+        "warnings": [],
+    }
+
+
 def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
     logger.info("story_implementation: starting %s (%s) — %s", issue_key, issue_type, summary)
 
@@ -826,22 +909,111 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             f"{issue_key}: Test Quality Agent error — {exc}",
         )
 
-    # --- Auto-merge policy ---
+    # --- Run Architecture Agent ---
+    update_run_step(run_id, "architecture_review")
+    arch_verdict: dict = {}
+    try:
+        arch_package = _build_architecture_review_package(
+            issue_key=issue_key,
+            summary=summary,
+            story_details=story_details,
+            mapping=mapping,
+            pr=pr,
+            final_changes=final_changes,
+            diff_block=diff_block,
+            final_test_result=final_test_result,
+            verdict=verdict,
+            tq_verdict=tq_verdict,
+            retry_count=review_retry_count,
+            execution_memory=execution_memory,
+            repo_analysis=analysis,
+        )
+        arch_verdict = review_architecture(**arch_package)
+        store_architecture_review(
+            run_id=run_id,
+            verdict=arch_verdict,
+            pr_number=pr["number"],
+            pr_url=pr["url"],
+            repo_slug=mapping["repo_slug"],
+            story_key=issue_key,
+        )
+        logger.info(
+            "story_implementation: architecture_review complete — status=%s risk=%s",
+            arch_verdict.get("architecture_status"), arch_verdict.get("risk_level"),
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_architecture_comment(arch_verdict))
+            logger.info("story_implementation: architecture comment posted to PR #%s", pr["number"])
+        except Exception as comment_exc:
+            logger.warning("story_implementation: architecture PR comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "architecture_review_completed",
+            arch_verdict.get("architecture_status", "UNKNOWN"),
+            (
+                f"{issue_key}: PR #{pr['number']}\n"
+                f"Architecture: {arch_verdict.get('architecture_status')}\n"
+                f"Risk: {arch_verdict.get('risk_level')}\n"
+                f"{arch_verdict.get('summary', '')}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("story_implementation: Architecture Agent failed — %s", exc)
+        arch_verdict = {
+            "architecture_status": ArchitectureStatus.ERROR,
+            "risk_level": "HIGH",
+            "summary": f"Architecture Agent error: {exc}",
+            "impact_areas": [],
+            "blocking_reasons": [str(exc)],
+            "recommendations": [],
+        }
+        try:
+            store_architecture_review(
+                run_id=run_id,
+                verdict=arch_verdict,
+                pr_number=pr["number"],
+                pr_url=pr["url"],
+                repo_slug=mapping["repo_slug"],
+                story_key=issue_key,
+            )
+        except Exception as db_exc:
+            logger.error("story_implementation: store_architecture_review failed — %s", db_exc)
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_architecture_comment(arch_verdict))
+        except Exception as comment_exc:
+            logger.warning("story_implementation: architecture error comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "architecture_review_error", "ERROR",
+            f"{issue_key}: Architecture Agent error — {exc}",
+        )
+
+    # --- Unified Release Gate ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
     review_status = verdict.get("review_status", ReviewStatus.ERROR)
     test_quality_status = tq_verdict.get("quality_status", TestQualityStatus.ERROR)
+    architecture_status = arch_verdict.get("architecture_status", ArchitectureStatus.ERROR)
 
-    auto_merge_ok = (
-        mapping.get("auto_merge_enabled")
-        and final_test_result["status"] == "PASSED"
-        and applied.get("applied", False)
-        and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
-        and review_status == ReviewStatus.APPROVED_BY_AI
-        and test_quality_status == TestQualityStatus.APPROVED
+    update_run_step(run_id, "release_gate")
+    release = evaluate_release_decision(
+        mapping=mapping,
+        final_test_result=final_test_result,
+        applied=applied,
+        review_status=review_status,
+        test_quality_status=test_quality_status,
+        architecture_status=architecture_status,
+    )
+    update_run_field(
+        run_id,
+        release_decision=release["release_decision"],
+        release_decision_reason=release["reason"],
+        release_decided_at=datetime.now(timezone.utc),
+    )
+    logger.info(
+        "story_implementation: release_gate — decision=%s reason=%s",
+        release["release_decision"], release["reason"],
     )
 
     update_run_step(run_id, "merge_check")
-    if auto_merge_ok:
+    if release["can_auto_merge"]:
         try:
             merge_pull_request(mapping["repo_slug"], pr["number"], pr_title)
             update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
@@ -851,46 +1023,28 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             update_run_field(run_id, merge_status="FAILED")
             send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
             logger.error("story_implementation: auto-merge failed — %s", exc)
-    elif review_status == ReviewStatus.BLOCKED:
-        blocking = "; ".join(verdict.get("blocking_reasons") or ["review blocked merge"])
-        update_run_field(run_id, merge_status="BLOCKED_BY_REVIEW")
+    elif release["release_decision"] == ReleaseDecision.BLOCKED:
+        blocking_gates = release.get("blocking_gates") or []
+        # Determine the most specific merge_status for observability
+        if review_status == ReviewStatus.BLOCKED:
+            merge_status_val = "BLOCKED_BY_REVIEW"
+        elif test_quality_status == TestQualityStatus.BLOCKING:
+            merge_status_val = "BLOCKED_BY_TEST_QUALITY"
+        elif architecture_status == ArchitectureStatus.BLOCKED:
+            merge_status_val = "BLOCKED_BY_ARCHITECTURE"
+        else:
+            merge_status_val = "BLOCKED_BY_RELEASE_GATE"
+        update_run_field(run_id, merge_status=merge_status_val)
         send_message(
-            "merge_blocked_by_review", "BLOCKED",
-            f"{issue_key}: PR #{pr['number']} merge blocked by Reviewer Agent\n"
-            f"Reasons: {blocking}",
+            "merge_blocked_by_release_gate", "BLOCKED",
+            f"{issue_key}: PR #{pr['number']} merge blocked\n"
+            f"Gates: {'; '.join(blocking_gates)}",
         )
-        logger.info("story_implementation: merge blocked by review — %s", blocking)
-    elif test_quality_status == TestQualityStatus.BLOCKING:
-        blocking = "; ".join(tq_verdict.get("missing_tests") or ["test quality blocked merge"])
-        update_run_field(run_id, merge_status="BLOCKED_BY_TEST_QUALITY")
-        send_message(
-            "merge_blocked_by_test_quality", "BLOCKED",
-            f"{issue_key}: PR #{pr['number']} merge blocked by Test Quality Agent\n"
-            f"Missing: {blocking}",
-        )
-        logger.info("story_implementation: merge blocked by test quality — %s", blocking)
+        logger.info("story_implementation: merge blocked — %s — %s", merge_status_val, blocking_gates)
     else:
-        reasons = []
-        if not mapping.get("auto_merge_enabled"):
-            reasons.append("auto_merge disabled for repo")
-        if final_test_result["status"] != "PASSED":
-            reasons.append(f"tests {final_test_result['status']}")
-        if not applied.get("applied", False):
-            reasons.append("fallback apply used")
-        if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
-            reasons.append(f"{applied.get('count')} files > {MAX_FILES_FOR_AUTOMERGE} limit")
-        if review_status == ReviewStatus.NEEDS_CHANGES:
-            reasons.append("review needs changes")
-        elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
-            reasons.append(f"review status: {review_status}")
-        if test_quality_status == TestQualityStatus.WEAK:
-            reasons.append("test quality weak")
-        elif test_quality_status not in (TestQualityStatus.APPROVED,):
-            reasons.append(f"test quality status: {test_quality_status}")
-        reason_str = "; ".join(reasons) if reasons else "conditions not met"
         update_run_field(run_id, merge_status="SKIPPED")
-        send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")
-        logger.info("story_implementation: auto-merge skipped — %s", reason_str)
+        send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({release['reason']})")
+        logger.info("story_implementation: auto-merge skipped — %s", release["reason"])
 
     update_run_step(run_id, "done")
 
