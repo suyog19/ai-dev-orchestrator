@@ -4018,7 +4018,7 @@ def count_completed_workflow_runs_for_repo(repo_slug: str) -> int:
                 """
                 SELECT COUNT(*) FROM workflow_runs wr
                 JOIN repo_mappings rm
-                  ON wr.issue_key LIKE rm.jira_project_key || '-%'
+                  ON wr.issue_key LIKE rm.jira_project_key || '-%%'
                 WHERE rm.repo_slug = %s
                   AND rm.is_active = TRUE
                   AND wr.workflow_type = 'story_implementation'
