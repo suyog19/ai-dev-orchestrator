@@ -5,7 +5,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality
 from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
@@ -18,8 +18,9 @@ from app.database import (
     record_planning_feedback, record_execution_feedback,
     get_planning_memory, get_execution_memory,
     store_agent_review,
+    store_test_quality_review,
 )
-from app.feedback import ReviewStatus
+from app.feedback import ReviewStatus, TestQualityStatus
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -624,9 +625,85 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         )
         verdict = error_verdict
 
+    # --- Run Test Quality Agent ---
+    update_run_step(run_id, "test_quality_review")
+    tq_verdict: dict = {}
+    try:
+        tq_package = _build_test_quality_package(
+            issue_key=issue_key,
+            summary=summary,
+            story_details=story_details,
+            mapping=mapping,
+            pr=pr,
+            final_changes=final_changes,
+            diff_block=diff_block,
+            final_test_result=final_test_result,
+            retry_count=review_retry_count,
+            execution_memory=execution_memory,
+        )
+        tq_verdict = review_test_quality(**tq_package)
+        store_test_quality_review(
+            run_id=run_id,
+            verdict=tq_verdict,
+            pr_number=pr["number"],
+            pr_url=pr["url"],
+            repo_slug=mapping["repo_slug"],
+            story_key=issue_key,
+        )
+        logger.info(
+            "story_implementation: test_quality complete — status=%s confidence=%s",
+            tq_verdict.get("quality_status"), tq_verdict.get("confidence_level"),
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_test_quality_comment(tq_verdict))
+            logger.info("story_implementation: test quality comment posted to PR #%s", pr["number"])
+        except Exception as comment_exc:
+            logger.warning("story_implementation: TQ PR comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "test_quality_completed",
+            tq_verdict.get("quality_status", "UNKNOWN"),
+            (
+                f"{issue_key}: PR #{pr['number']}\n"
+                f"Test Quality: {tq_verdict.get('quality_status')}\n"
+                f"Confidence: {tq_verdict.get('confidence_level')}\n"
+                f"{tq_verdict.get('summary', '')}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("story_implementation: Test Quality Agent failed — %s", exc)
+        tq_verdict = {
+            "quality_status": TestQualityStatus.ERROR,
+            "confidence_level": "LOW",
+            "summary": f"Test Quality Agent error: {exc}",
+            "coverage_findings": [],
+            "missing_tests": [str(exc)],
+            "suspicious_tests": [],
+            "recommendations": [],
+        }
+        try:
+            store_test_quality_review(
+                run_id=run_id,
+                verdict=tq_verdict,
+                pr_number=pr["number"],
+                pr_url=pr["url"],
+                repo_slug=mapping["repo_slug"],
+                story_key=issue_key,
+            )
+        except Exception as db_exc:
+            logger.error("story_implementation: store_test_quality_review failed — %s", db_exc)
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_test_quality_comment(tq_verdict))
+        except Exception as comment_exc:
+            logger.warning("story_implementation: TQ error comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "test_quality_error", "ERROR",
+            f"{issue_key}: Test Quality Agent error — {exc}",
+        )
+
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
     review_status = verdict.get("review_status", ReviewStatus.ERROR)
+    test_quality_status = tq_verdict.get("quality_status", TestQualityStatus.ERROR)
 
     auto_merge_ok = (
         mapping.get("auto_merge_enabled")
