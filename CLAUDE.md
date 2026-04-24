@@ -59,9 +59,9 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 
 **Key files:**
 - `app/main.py` — FastAPI app, all HTTP endpoints
-- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup; Phase 17 adds `_execute_onboarding()` path for `project_onboarding` jobs that manages `project_onboarding_runs` status independently
+- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup; `_execute_onboarding()` handles `project_onboarding` jobs and manages `project_onboarding_runs` status independently from `workflow_runs`
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: there is a stale one-argument `_is_test_file()` near the top of the file that is dead code (overridden by the profile-aware version further down); `_TEST_FILE_PATTERNS` defined alongside it is also unused
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output; Phase 17 adds `generate_onboarding_architecture_summary()` and `generate_onboarding_coding_conventions()` with forced tool_use for structured onboarding snapshots
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output; `generate_onboarding_architecture_summary()` and `generate_onboarding_coding_conventions()` use forced tool_use for structured onboarding snapshots
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
@@ -74,7 +74,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/jira_client.py` — Jira REST API v3 calls; `get_issue_details()` fetches story summary + ADF-parsed description + acceptance criteria for the Reviewer Agent
 - `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
 - `app/git_ops.py` — clone, commit, push
-- `app/repo_mapping.py` — CRUD for `repo_mappings` table
+- `app/repo_mapping.py` — CRUD for `repo_mappings` table; `upsert_seed_mappings()` runs on startup from `config/seed_mappings.json` — it respects rows where `is_active=false` (will not re-create deactivated mappings); deactivate via `DELETE /debug/repo-mappings/{id}`
 - `app/repo_profiler.py` — detects repo capability profile from cloned workspace (detection order: Gradle > Maven > Node > Python > Unknown); `detect_repo_capability_profile()`, `get_test/build/lint_command_for_profile()`
 - `app/command_runner.py` — `run_repo_command()`: safe, injection-proof command execution using `shlex.split()` (no `shell=True`); handles timeout/FileNotFoundError/OSError; output truncated at 4000 chars
 - `app/test_runner.py` — profile-aware test/build/lint runner: `run_tests()` (with dep install), `run_build()`, `run_lint()` all delegate to `run_repo_command()`
@@ -123,6 +123,13 @@ Telegram Webhook → POST /webhooks/telegram → APPROVE/REJECT/REGENERATE handl
 |---|---|---|
 | `Ready for Dev` (case-insensitive) | Story | `story_implementation` |
 | `Ready for Breakdown` (case-insensitive) | Epic | `epic_breakdown` |
+
+**Jira webhook filter note:** The Jira webhook registered on the dev/prod instance has a JQL filter (e.g. `project = "My Software Team"`). If a new project's key is not covered by the filter, its status-change events won't reach the orchestrator. To manually simulate a webhook for a new project while the filter is being updated:
+```bash
+curl -X POST "https://<orchestrator-url>/webhooks/jira?token=$JIRA_WEBHOOK_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"webhookEvent":"jira:issue_updated","issue_event_type_name":"issue_generic","changelog":{"items":[{"field":"status","fromString":"To Do","toString":"READY FOR DEV"}]},"issue":{"id":"<id>","key":"<KEY-N>","fields":{"summary":"...","status":{"name":"READY FOR DEV"},"issuetype":{"name":"Story"},"description":null}}}'
+```
 
 ## Data Model
 
@@ -596,14 +603,14 @@ Browser-based operations console at `/admin/ui`. Served as server-rendered HTML 
 
 **Template structure:** `app/templates/admin/base.html` is the sidebar layout; all pages `{% extends "admin/base.html" %}`. `is_paused()` is registered as a Jinja2 global so `base.html` can show the PAUSED banner without route changes.
 
-**New DB functions** (in `app/database.py`):
+**Dashboard DB functions** (in `app/database.py`):
 - `get_overview_stats()` — single-query aggregated dashboard stats
 - `list_workflow_runs_for_ui(status, workflow_type, issue_key, release_decision, limit)` — filterable runs list
 - `get_workflow_run_detail(run_id)` — full run + all agent reviews + clarification + GitHub statuses
 - `list_memory_snapshots(scope_type, scope_key)` — filterable memory listing
 - `list_feedback_events(source_type, repo_slug, limit)` — feedback log
 
-## Project Onboarding (Phase 17)
+## Project Onboarding
 
 `app/onboarding.py` — `run_project_onboarding(run_id, repo_slug, base_branch)`: 7-step pipeline executed by the worker's `_execute_onboarding()` path.
 
