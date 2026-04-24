@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Admin{% endblock %} — Orchestrator [{{ env_name }}]</title>
+  <link rel="stylesheet" href="/static/admin/admin.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="sidebar-header">
+        <span class="logo">Orchestrator</span>
+        <span class="env-badge env-{{ env_name | lower }}">{{ env_name }}</span>
+      </div>
+      <ul class="nav-links">
+        <li class="{{ 'active' if page == 'overview' else '' }}"><a href="/admin/ui/overview">Overview</a></li>
+        <li class="{{ 'active' if page == 'runs' else '' }}"><a href="/admin/ui/runs">Workflow Runs</a></li>
+        <li class="{{ 'active' if page == 'planning' else '' }}"><a href="/admin/ui/planning">Planning</a></li>
+        <li class="{{ 'active' if page == 'clarifications' else '' }}"><a href="/admin/ui/clarifications">Clarifications</a></li>
+        <li class="{{ 'active' if page == 'agents' else '' }}"><a href="/admin/ui/agents">Agent Reviews</a></li>
+        <li class="{{ 'active' if page == 'github' else '' }}"><a href="/admin/ui/github">GitHub</a></li>
+        <li class="{{ 'active' if page == 'memory' else '' }}"><a href="/admin/ui/memory">Memory</a></li>
+        <li class="{{ 'active' if page == 'security' else '' }}"><a href="/admin/ui/security">Security</a></li>
+        <li class="{{ 'active' if page == 'control' else '' }}"><a href="/admin/ui/control">Control</a></li>
+      </ul>
+      <div class="sidebar-footer">
+        <a href="/admin/ui/logout" class="logout-link">Logout</a>
+      </div>
+    </nav>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

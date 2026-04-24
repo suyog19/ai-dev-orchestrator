@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
@@ -24,6 +25,7 @@ from app.database import (
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
+from app.ui import router as ui_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
 from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill
@@ -48,7 +50,9 @@ logger = logging.getLogger("orchestrator")
 
 app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
 app.add_middleware(BaseHTTPMiddleware, dispatch=admin_key_middleware)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.include_router(webhooks_router)
+app.include_router(ui_router)
 
 
 @app.on_event("startup")
