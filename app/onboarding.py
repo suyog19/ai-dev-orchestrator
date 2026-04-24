@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import shutil
@@ -10,6 +11,7 @@ from app.repo_profiler import (
     get_build_command_for_profile,
     get_lint_command_for_profile,
 )
+from app.repo_scanner import scan_repo_structure
 from app.test_runner import run_tests, run_build, run_lint
 
 logger = logging.getLogger("orchestrator")
@@ -51,6 +53,7 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
       1. Clone repo (read-only)
       2. Detect capability profile
       3. Command validation dry-run (test / build / lint)
+      4. Repo structure scan (stored as structure_scan_json)
 
     Workspace is cleaned up in the finally block regardless of outcome.
     Status transitions are managed by the worker (_execute_onboarding).
@@ -143,6 +146,21 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
         logger.info(
             "Project onboarding command validation done: run_id=%s test=%s build=%s lint=%s",
             onboarding_run_id, test_result, build_result, lint_result,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 4: repo structure scan
+        # ------------------------------------------------------------------
+        update_onboarding_run(onboarding_run_id, current_step="structure_scan")
+        structure = scan_repo_structure(repo_path, profile_name=profile_name)
+        update_onboarding_run(
+            onboarding_run_id,
+            current_step="structure_scanned",
+            structure_scan_json=json.dumps(structure),
+        )
+        logger.info(
+            "Project onboarding structure scan done: run_id=%s total_files=%d dirs=%s",
+            onboarding_run_id, structure["total_files"], structure["top_level_dirs"][:5],
         )
 
     finally:

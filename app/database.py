@@ -469,6 +469,11 @@ def init_db(retries: int = 5, delay: int = 3):
                 "CREATE INDEX IF NOT EXISTS idx_onboarding_runs_repo_slug "
                 "ON project_onboarding_runs (repo_slug)"
             )
+            # Phase 17 Iteration 4 — add structure_scan_json column (idempotent)
+            cur.execute(
+                "ALTER TABLE project_onboarding_runs "
+                "ADD COLUMN IF NOT EXISTS structure_scan_json TEXT NULL"
+            )
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS project_knowledge_snapshots (
