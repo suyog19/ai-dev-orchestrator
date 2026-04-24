@@ -19,6 +19,7 @@ from app.database import (
     list_agent_reviews,
     list_test_quality_reviews,
     list_architecture_reviews,
+    list_security_events,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -701,3 +702,18 @@ def recompute_memory(scope_type: str, scope_key: str):
         status_code=400,
         detail=f"Unsupported scope_type '{scope_type}'. Use 'repo' or 'epic'.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin — Security events inspection
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/security-events")
+def get_security_events(
+    event_type: str | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List security audit events. Protected by admin key. Filter by event_type, source, status."""
+    return list_security_events(event_type=event_type, source=source, status=status, limit=limit)
