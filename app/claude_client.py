@@ -396,6 +396,85 @@ _BREAKDOWN_TOOL = {
     },
 }
 
+REVIEWER_PROMPT = (
+    "You are an independent code Reviewer Agent. Your job is to assess whether a PR is safe to merge.\n\n"
+    "You will receive:\n"
+    "- The Jira Story (key, summary, description, acceptance criteria)\n"
+    "- Repository and branch information\n"
+    "- The PR (number, title, body)\n"
+    "- Implementation details (changed files, unified diff, test results, retry count)\n"
+    "- Memory context (prior lessons from this repository)\n\n"
+    "Review across four dimensions:\n"
+    "1. Story alignment — Does the change address the Jira Story? Are acceptance criteria covered? Is scope appropriate?\n"
+    "2. Code quality — Is the implementation clean? Any obvious bugs or unsafe assumptions?\n"
+    "3. Test awareness — Were tests run? Did they pass? Are they relevant to the change?\n"
+    "4. Diff risk — Number and type of files changed, high-risk areas, potential side effects.\n\n"
+    "Verdict rules (strictly enforced):\n"
+    "- BLOCKED: tests failed, or the diff clearly contradicts the story intent\n"
+    "- NEEDS_CHANGES: implementation is plausible but incomplete, risky, or questionable\n"
+    "- APPROVED_BY_AI: story alignment, code risk, and test state are all acceptable\n\n"
+    "Call the submit_review tool only — do not respond with prose."
+)
+
+_REVIEW_TOOL = {
+    "name": "submit_review",
+    "description": "Submit a structured code review verdict for a PR.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "review_status": {
+                "type": "string",
+                "enum": ["APPROVED_BY_AI", "NEEDS_CHANGES", "BLOCKED"],
+                "description": (
+                    "Overall verdict. BLOCKED if tests failed or diff contradicts story. "
+                    "NEEDS_CHANGES if plausible but incomplete or risky. "
+                    "APPROVED_BY_AI only when story alignment, code risk, and test state are all acceptable."
+                ),
+            },
+            "risk_level": {
+                "type": "string",
+                "enum": ["LOW", "MEDIUM", "HIGH"],
+                "description": "Overall risk level of the change.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "1-3 sentences summarising the review verdict.",
+            },
+            "findings": {
+                "type": "array",
+                "description": "Individual findings from the review, one per concern.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "severity": {
+                            "type": "string",
+                            "enum": ["INFO", "WARNING", "CRITICAL"],
+                            "description": "INFO for observations, WARNING for concerns, CRITICAL for blockers.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["story_alignment", "code_quality", "test_awareness", "diff_risk"],
+                        },
+                        "message": {"type": "string"},
+                    },
+                    "required": ["severity", "category", "message"],
+                },
+            },
+            "blocking_reasons": {
+                "type": "array",
+                "description": "Explicit reasons this PR cannot merge. Empty list if APPROVED_BY_AI.",
+                "items": {"type": "string"},
+            },
+            "recommendations": {
+                "type": "array",
+                "description": "Non-blocking suggestions for improvement.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["review_status", "risk_level", "summary", "findings", "blocking_reasons", "recommendations"],
+    },
+}
+
 _CLIENT = anthropic.Anthropic(timeout=120.0)
 
 
@@ -643,3 +722,100 @@ def plan_epic_breakdown(issue_key: str, summary: str, memory_context: str = "") 
         result["items"] = items[:MAX_STORIES_PER_EPIC]
 
     return result
+
+
+def review_pr(
+    story_context: dict,
+    pr_context: dict,
+    diff: str,
+    test_result: dict,
+    memory_context: str = "",
+) -> dict:
+    """Run the Reviewer Agent against a PR and return a structured verdict.
+
+    story_context keys: key, summary, description, acceptance_criteria (list[str])
+    pr_context keys: number, url, title, repo_slug, base_branch, working_branch,
+                     files_changed (list[str]), commit_message, retry_count, files_changed_count
+    diff: unified diff string (truncated to 8 000 chars internally)
+    test_result keys: status, command, output_excerpt
+    memory_context: formatted bullet string from get_execution_memory()
+
+    Returns the submit_review tool input dict:
+    {
+        "review_status": "APPROVED_BY_AI" | "NEEDS_CHANGES" | "BLOCKED",
+        "risk_level":    "LOW" | "MEDIUM" | "HIGH",
+        "summary":       "...",
+        "findings":      [{"severity": ..., "category": ..., "message": ...}, ...],
+        "blocking_reasons": [...],
+        "recommendations":  [...],
+    }
+    Raises RuntimeError if Claude returns no tool_use block.
+    """
+    ac_lines = "\n".join(
+        f"  - {ac}" for ac in (story_context.get("acceptance_criteria") or [])
+    )
+    story_block = (
+        f"Story: {story_context.get('key', '')} — {story_context.get('summary', '')}\n"
+        f"Description: {story_context.get('description') or '(none)'}\n"
+        f"Acceptance criteria:\n{ac_lines or '  (none provided)'}"
+    )
+
+    files_list = "\n".join(f"  - {f}" for f in (pr_context.get("files_changed") or []))
+    output_excerpt = (test_result.get("output_excerpt") or "").strip()
+    output_lines = "\n".join(f"    {ln}" for ln in output_excerpt.splitlines()[-30:])
+    test_block = (
+        f"  Status: {test_result.get('status', 'NOT_RUN')}\n"
+        f"  Command: {test_result.get('command', '')}\n"
+        f"  Output (last 30 lines):\n{output_lines or '    (none)'}"
+    )
+
+    diff_trimmed = (diff or "").strip()
+    if len(diff_trimmed) > 8000:
+        diff_trimmed = diff_trimmed[:8000] + "\n... (diff truncated)"
+
+    memory_block = (
+        f"Prior lessons from this repository:\n{memory_context}\n\n"
+        if memory_context else ""
+    )
+
+    user_content = (
+        f"{story_block}\n\n"
+        f"Repository: {pr_context.get('repo_slug', '')}\n"
+        f"Base branch: {pr_context.get('base_branch', '')}\n"
+        f"Working branch: {pr_context.get('working_branch', '')}\n\n"
+        f"PR #{pr_context.get('number', '')} — {pr_context.get('title', '')}\n"
+        f"PR URL: {pr_context.get('url', '')}\n\n"
+        f"Changed files ({pr_context.get('files_changed_count', 0)}):\n"
+        f"{files_list or '  (none)'}\n\n"
+        f"Retry count: {pr_context.get('retry_count', 0)}\n"
+        f"Commit message: {pr_context.get('commit_message', '')}\n\n"
+        f"Test results:\n{test_block}\n\n"
+        f"Unified diff:\n```\n{diff_trimmed}\n```\n\n"
+        f"{memory_block}"
+        f"Review this PR and call submit_review with your structured verdict."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=[{
+            "type": "text",
+            "text": REVIEWER_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_REVIEW_TOOL],
+        tool_choice={"type": "tool", "name": "submit_review"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Claude review done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Reviewer Agent returned no tool_use block")
+
+    return tool_block.input
