@@ -94,12 +94,13 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | Table | Purpose |
 |---|---|
 | `workflow_events` | Raw Jira/Telegram webhook payloads |
-| `workflow_runs` | One row per workflow execution; tracks status, branch, PR, test/merge results |
+| `workflow_runs` | One row per workflow execution; tracks status, branch, PR, test/merge/review results |
 | `workflow_attempts` | Per-attempt records within a run (implement + optional fix) |
 | `repo_mappings` | Jira project key → repo slug + branch + auto-merge policy |
 | `planning_outputs` | Proposed Stories from epic_breakdown; one row per item per run |
 | `feedback_events` | Atomic signals written after each run completes (append-only) |
 | `memory_snapshots` | Derived and human-authored guidance; one row per (scope_type, scope_key, memory_kind) |
+| `agent_reviews` | One row per Reviewer Agent verdict; FK to `workflow_runs` |
 
 **`workflow_runs` status flow:**
 ```
@@ -140,6 +141,74 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/debug/memory` | List memory snapshots (filter: scope_type, scope_key) |
 | GET | `/debug/feedback-events` | List raw feedback events (filter: source_type, repo_slug, feedback_type, source_run_id) |
 | POST | `/debug/memory/recompute` | Force-refresh a derived snapshot (scope_type=repo\|epic) |
+| GET | `/debug/agent-reviews` | List Reviewer Agent verdicts (filter: run_id, repo_slug, review_status) |
+| GET | `/debug/workflow-runs/{run_id}/reviews` | All Reviewer Agent verdicts for one run |
+
+## Workflow Configuration
+
+### story_implementation
+
+| Setting | Value |
+|---|---|
+| Test command | `pytest -q` (after `pip install -r requirements.txt`) |
+| Max fix attempts | 1 (max 2 total coding passes per run) |
+| Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
+| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + PR created + `auto_merge_enabled=true` + ≤3 files changed |
+| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
+| Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
+
+File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-test files + up to 2 Python import dependencies + best test file (max 6 files total).
+
+### epic_breakdown
+
+| Setting | Value |
+|---|---|
+| Max Stories per Epic | 8 |
+| Output issue type | `Story` |
+| Approval commands | `APPROVE <run_id>` / `REJECT <run_id>` / `REGENERATE <run_id>` |
+| Idempotency guard | Blocks if the Epic already has Jira children |
+
+### Memory injection
+
+| Setting | Value |
+|---|---|
+| Max bullets injected | 5 |
+| Max chars injected | 1000 |
+| Scopes | `repo` (execution guidance), `epic` (planning guidance) |
+| Refresh | Triggered on every feedback write (`on_write`) |
+
+### Failure categories (defined in `app/feedback.py`)
+
+| Category | When applied |
+|---|---|
+| `test_failure` | Tests ran and failed |
+| `syntax_failure` | Python syntax/parse error in generated code |
+| `apply_validation_failure` | File apply guard rejected the change |
+| `jira_creation_failure` | Jira API error during child creation |
+| `merge_failure` | PR creation or auto-merge failed |
+| `duplicate_blocked` | Breakdown blocked by idempotency guard |
+| `approval_rejected` | User rejected a planning proposal |
+| `approval_regenerated` | User requested regeneration |
+| `worker_interrupted` | Run was RUNNING when worker restarted |
+| `unknown` | Error does not match any known pattern |
+
+### Phase 8 — Reviewer Agent (Phase 8+)
+
+**`review_status` values:** `APPROVED_BY_AI` | `NEEDS_CHANGES` | `BLOCKED` | `ERROR`
+**`risk_level` values:** `LOW` | `MEDIUM` | `HIGH`
+
+| Setting | Value |
+|---|---|
+| Review required | `true` — every `story_implementation` run triggers a review |
+| Review blocks merge | `true` — `APPROVED_BY_AI` required for auto-merge |
+| Reviewer Agent prompt | `REVIEWER_PROMPT` in `app/claude_client.py` |
+| Output format | Forced tool_use (`submit_review`) with required structured fields |
+| GitHub action | Top-level PR comment with emoji verdict summary |
+| Merge on `NEEDS_CHANGES` | `merge_status=SKIPPED` |
+| Merge on `BLOCKED` | `merge_status=BLOCKED_BY_REVIEW` |
+| Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
+
+**Review feedback events:** `review_status`, `review_risk_level`, `review_approved`, `review_needs_changes`, `review_blocked`
 
 ## Workflow Configuration
 

@@ -13,6 +13,7 @@ from app.database import (
     list_planning_runs, get_planning_run_detail,
     approve_planning_run, reject_planning_run, record_planning_feedback,
     generate_epic_outcome_rollup,
+    list_agent_reviews,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -361,6 +362,35 @@ def get_workflow_run(run_id: int):
         for r in attempt_rows
     ]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Agent review inspection
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/agent-reviews")
+def get_agent_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    review_status: str | None = None,
+    limit: int = 20,
+):
+    """List agent_reviews rows. Filter by run_id, repo_slug, or review_status."""
+    return list_agent_reviews(
+        run_id=run_id,
+        repo_slug=repo_slug,
+        review_status=review_status,
+        limit=limit,
+    )
+
+
+@app.get("/debug/workflow-runs/{run_id}/reviews")
+def get_workflow_run_reviews(run_id: int):
+    """Return all Reviewer Agent verdicts for a specific workflow run."""
+    reviews = list_agent_reviews(run_id=run_id)
+    if not reviews:
+        raise HTTPException(status_code=404, detail=f"No reviews found for run_id={run_id}")
+    return {"run_id": run_id, "reviews": reviews, "count": len(reviews)}
 
 
 # ---------------------------------------------------------------------------

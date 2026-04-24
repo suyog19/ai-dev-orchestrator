@@ -334,6 +334,70 @@ def update_run_field(run_id: int, **fields):
 
 
 # ---------------------------------------------------------------------------
+# Phase 8 — Reviewer Agent helpers
+# ---------------------------------------------------------------------------
+
+def store_agent_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist a Reviewer Agent verdict and update workflow_runs review fields.
+
+    Inserts one row into agent_reviews and sets review_status + review_completed_at
+    on the parent workflow_run. Returns the new agent_reviews.id.
+    """
+    from app.feedback import AgentName
+
+    review_status = verdict.get("review_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, review_status, risk_level, summary,
+                     findings_json, recommendations_json, blocking_reasons_json,
+                     model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.REVIEWER_AGENT,
+                    review_status,
+                    verdict.get("risk_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("findings") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    json.dumps(verdict.get("blocking_reasons") or []),
+                    model_used,
+                ),
+            )
+            review_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET review_status = %s, review_completed_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+                """,
+                (review_status, run_id),
+            )
+
+    logger.info(
+        "store_agent_review: run_id=%s review_id=%s status=%s",
+        run_id, review_id, review_status,
+    )
+    return review_id
+
+
+# ---------------------------------------------------------------------------
 # Phase 6 — planning helpers
 # ---------------------------------------------------------------------------
 
@@ -877,7 +941,8 @@ def record_execution_feedback(run_id: int) -> int:
             cur.execute(
                 """
                 SELECT issue_key, status, test_status, retry_count,
-                       merge_status, files_changed_count, error_detail, current_step
+                       merge_status, files_changed_count, error_detail, current_step,
+                       review_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -886,7 +951,7 @@ def record_execution_feedback(run_id: int) -> int:
             if not row:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
-                files_changed_count, error_detail, current_step = row
+                files_changed_count, error_detail, current_step, review_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -935,6 +1000,26 @@ def record_execution_feedback(run_id: int) -> int:
                 _ev(FeedbackType.MERGE_STATUS, merge_status)
             if files_changed_count is not None:
                 _ev(FeedbackType.FILES_CHANGED_COUNT, files_changed_count)
+
+            # Review signals (Phase 8)
+            if review_status:
+                from app.feedback import ReviewStatus
+                _ev(FeedbackType.REVIEW_STATUS, review_status)
+                if review_status == ReviewStatus.APPROVED_BY_AI:
+                    _ev(FeedbackType.REVIEW_APPROVED, "true")
+                elif review_status == ReviewStatus.NEEDS_CHANGES:
+                    _ev(FeedbackType.REVIEW_NEEDS_CHANGES, "true")
+                elif review_status == ReviewStatus.BLOCKED:
+                    _ev(FeedbackType.REVIEW_BLOCKED, "true")
+
+                # Look up risk_level from agent_reviews for this run
+                cur.execute(
+                    "SELECT risk_level FROM agent_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                )
+                ar = cur.fetchone()
+                if ar and ar[0]:
+                    _ev(FeedbackType.REVIEW_RISK_LEVEL, ar[0])
 
             if not events:
                 return 0
@@ -1406,3 +1491,66 @@ def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
         "created_at":  created_at.isoformat(),
         "updated_at":  updated_at.isoformat(),
     }
+
+
+def list_agent_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    review_status: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return agent_reviews rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    if repo_slug is not None:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    if review_status is not None:
+        conditions.append("review_status = %s")
+        params.append(review_status)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, pr_number, pr_url, repo_slug, story_key,
+                       agent_name, review_status, risk_level, summary,
+                       findings_json, recommendations_json, blocking_reasons_json,
+                       model_used, created_at, updated_at
+                FROM agent_reviews
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":                  r[0],
+            "run_id":              r[1],
+            "pr_number":           r[2],
+            "pr_url":              r[3],
+            "repo_slug":           r[4],
+            "story_key":           r[5],
+            "agent_name":          r[6],
+            "review_status":       r[7],
+            "risk_level":          r[8],
+            "summary":             r[9],
+            "findings":            json.loads(r[10]) if r[10] else [],
+            "recommendations":     json.loads(r[11]) if r[11] else [],
+            "blocking_reasons":    json.loads(r[12]) if r[12] else [],
+            "model_used":          r[13],
+            "created_at":          r[14].isoformat() if r[14] else None,
+            "updated_at":          r[15].isoformat() if r[15] else None,
+        }
+        for r in rows
+    ]

@@ -3,9 +3,10 @@ import logging
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr
+from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
 from app.database import (
@@ -16,7 +17,9 @@ from app.database import (
     get_created_children_for_epic, store_planning_metadata,
     record_planning_feedback, record_execution_feedback,
     get_planning_memory, get_execution_memory,
+    store_agent_review,
 )
+from app.feedback import ReviewStatus
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -24,6 +27,90 @@ AI_LABEL_COLOR = "6f42c1"  # purple
 MAX_FILES_FOR_AUTOMERGE = 3
 
 logger = logging.getLogger("worker")
+
+
+def _build_review_package(
+    issue_key: str,
+    summary: str,
+    story_details: dict,
+    mapping: dict,
+    branch: str,
+    pr: dict,
+    commit_message: str,
+    final_changes: list,
+    diff_block: str,
+    final_test_result: dict,
+    retry_count: int,
+    execution_memory: str,
+) -> dict:
+    """Assemble the full context package the Reviewer Agent will need.
+
+    Returns a dict with keys: story_context, pr_context, diff, test_result, memory_context.
+    Structured to unpack directly into review_pr(**package) in Iteration 3.
+    No Claude call, no DB write, no secrets included.
+    """
+    files_changed = [ch.get("file", "") for ch in final_changes if ch.get("file")]
+    output = (final_test_result.get("output") or "").strip()
+    output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
+
+    return {
+        "story_context": {
+            "key": issue_key,
+            "summary": summary,
+            "description": story_details.get("description"),
+            "acceptance_criteria": story_details.get("acceptance_criteria") or [],
+        },
+        "pr_context": {
+            "number": pr["number"],
+            "url": pr["url"],
+            "title": pr.get("title", ""),
+            "repo_slug": mapping["repo_slug"],
+            "base_branch": mapping["base_branch"],
+            "working_branch": branch,
+            "files_changed": files_changed,
+            "files_changed_count": len(files_changed),
+            "commit_message": commit_message,
+            "retry_count": retry_count,
+        },
+        "diff": diff_block,
+        "test_result": {
+            "status": final_test_result["status"],
+            "command": final_test_result.get("command", ""),
+            "output_excerpt": output_excerpt,
+        },
+        "memory_context": execution_memory,
+    }
+
+
+def _format_review_comment(verdict: dict) -> str:
+    """Render a Reviewer Agent verdict as a GitHub PR comment in markdown."""
+    status = verdict.get("review_status", "UNKNOWN")
+    risk = verdict.get("risk_level", "UNKNOWN")
+    summary = verdict.get("summary", "")
+    findings = verdict.get("findings") or []
+    blocking = verdict.get("blocking_reasons") or []
+    recommendations = verdict.get("recommendations") or []
+
+    status_emoji = {"APPROVED_BY_AI": "✅", "NEEDS_CHANGES": "⚠️", "BLOCKED": "🚫", "ERROR": "❌"}.get(status, "❓")
+
+    findings_lines = "\n".join(
+        f"- [{f.get('severity', 'INFO')}] **{f.get('category', '')}**: {f.get('message', '')}"
+        for f in findings
+    ) or "_None_"
+
+    blocking_lines = "\n".join(f"- {r}" for r in blocking) or "_None_"
+    rec_lines = "\n".join(f"- {r}" for r in recommendations) or "_None_"
+
+    return (
+        f"## {status_emoji} Reviewer Agent Verdict: `{status}`\n\n"
+        f"**Risk:** {risk}\n\n"
+        f"### Summary\n{summary}\n\n"
+        f"### Findings\n{findings_lines}\n\n"
+        f"### Blocking Reasons\n{blocking_lines}\n\n"
+        f"### Recommendations\n{rec_lines}\n\n"
+        f"---\n"
+        f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Reviewer Agent_"
+    )
 
 
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
@@ -326,13 +413,111 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
 
+    # --- Build review input package (Reviewer Agent wired in Iteration 3) ---
+    update_run_step(run_id, "building_review_package")
+    story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("story_implementation: get_issue_details failed (non-fatal) — %s", exc)
+
+    review_retry_count = 1 if fix_result else 0
+    review_package = _build_review_package(
+        issue_key=issue_key,
+        summary=summary,
+        story_details=story_details,
+        mapping=mapping,
+        branch=branch,
+        pr=pr,
+        commit_message=commit_message,
+        final_changes=final_changes,
+        diff_block=diff_block,
+        final_test_result=final_test_result,
+        retry_count=review_retry_count,
+        execution_memory=execution_memory,
+    )
+    logger.info(
+        "story_implementation: review_package assembled — story=%s pr=#%s files=%s test=%s ac_items=%d",
+        issue_key,
+        review_package["pr_context"]["number"],
+        review_package["pr_context"]["files_changed"],
+        review_package["test_result"]["status"],
+        len(review_package["story_context"]["acceptance_criteria"]),
+    )
+
+    # --- Run Reviewer Agent ---
+    update_run_step(run_id, "reviewing")
+    verdict: dict = {}
+    try:
+        verdict = review_pr(**review_package)
+        store_agent_review(
+            run_id=run_id,
+            verdict=verdict,
+            pr_number=pr["number"],
+            pr_url=pr["url"],
+            repo_slug=mapping["repo_slug"],
+            story_key=issue_key,
+        )
+        logger.info(
+            "story_implementation: review complete — status=%s risk=%s",
+            verdict.get("review_status"), verdict.get("risk_level"),
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_review_comment(verdict))
+            logger.info("story_implementation: review comment posted to PR #%s", pr["number"])
+        except Exception as comment_exc:
+            logger.warning("story_implementation: PR comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "review_completed",
+            verdict.get("review_status", "UNKNOWN"),
+            (
+                f"{issue_key}: PR #{pr['number']}\n"
+                f"Verdict: {verdict.get('review_status')}\n"
+                f"Risk: {verdict.get('risk_level')}\n"
+                f"{verdict.get('summary', '')}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("story_implementation: Reviewer Agent failed — %s", exc)
+        error_verdict = {
+            "review_status": ReviewStatus.ERROR,
+            "risk_level": "HIGH",
+            "summary": f"Reviewer Agent error: {exc}",
+            "findings": [],
+            "blocking_reasons": [str(exc)],
+            "recommendations": [],
+        }
+        try:
+            store_agent_review(
+                run_id=run_id,
+                verdict=error_verdict,
+                pr_number=pr["number"],
+                pr_url=pr["url"],
+                repo_slug=mapping["repo_slug"],
+                story_key=issue_key,
+            )
+        except Exception as db_exc:
+            logger.error("story_implementation: store_agent_review failed — %s", db_exc)
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_review_comment(error_verdict))
+        except Exception as comment_exc:
+            logger.warning("story_implementation: error PR comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "review_error", "ERROR",
+            f"{issue_key}: Reviewer Agent error — {exc}",
+        )
+        verdict = error_verdict
+
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
+    review_status = verdict.get("review_status", ReviewStatus.ERROR)
+
     auto_merge_ok = (
         mapping.get("auto_merge_enabled")
         and final_test_result["status"] == "PASSED"
         and applied.get("applied", False)
         and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
+        and review_status == ReviewStatus.APPROVED_BY_AI
     )
 
     update_run_step(run_id, "merge_check")
@@ -346,6 +531,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             update_run_field(run_id, merge_status="FAILED")
             send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
             logger.error("story_implementation: auto-merge failed — %s", exc)
+    elif review_status == ReviewStatus.BLOCKED:
+        blocking = "; ".join(verdict.get("blocking_reasons") or ["review blocked merge"])
+        update_run_field(run_id, merge_status="BLOCKED_BY_REVIEW")
+        send_message(
+            "merge_blocked_by_review", "BLOCKED",
+            f"{issue_key}: PR #{pr['number']} merge blocked by Reviewer Agent\n"
+            f"Reasons: {blocking}",
+        )
+        logger.info("story_implementation: merge blocked by review — %s", blocking)
     else:
         reasons = []
         if not mapping.get("auto_merge_enabled"):
@@ -356,6 +550,10 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             reasons.append("fallback apply used")
         if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
             reasons.append(f"{applied.get('count')} files > {MAX_FILES_FOR_AUTOMERGE} limit")
+        if review_status == ReviewStatus.NEEDS_CHANGES:
+            reasons.append("review needs changes")
+        elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
+            reasons.append(f"review status: {review_status}")
         reason_str = "; ".join(reasons) if reasons else "conditions not met"
         update_run_field(run_id, merge_status="SKIPPED")
         send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")

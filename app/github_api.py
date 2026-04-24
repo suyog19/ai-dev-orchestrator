@@ -107,6 +107,25 @@ def add_label_to_pr(repo_name: str, pr_number: int, label_name: str) -> None:
     logger.info("Label '%s' applied to PR #%s", label_name, pr_number)
 
 
+def post_pr_comment(repo_name: str, pr_number: int, body: str) -> dict:
+    """Post a top-level comment on a PR (uses the issues comments endpoint).
+
+    Returns the created comment dict with at least 'id' and 'html_url'.
+    Raises on HTTP errors.
+    """
+    slug = _normalize_slug(repo_name)
+    response = requests.post(
+        f"{GITHUB_API}/repos/{slug}/issues/{pr_number}/comments",
+        json={"body": body},
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    logger.info("PR #%s comment posted — id=%s", pr_number, data.get("id"))
+    return {"id": data["id"], "html_url": data["html_url"]}
+
+
 def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:
     """Squash-merge a PR. Returns {"sha": str, "merged": bool, "message": str}.
 
