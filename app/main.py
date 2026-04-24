@@ -1317,12 +1317,24 @@ def list_project_knowledge(repo_slug: str):
 
 
 @app.post("/debug/project-knowledge/{repo_slug:path}/refresh", status_code=200)
-def refresh_project_knowledge(repo_slug: str):
-    """Placeholder: trigger knowledge snapshot refresh for a repo (implemented in later iterations)."""
-    return {
-        "repo_slug": repo_slug,
-        "message": "Knowledge refresh not yet implemented — will be available after Iteration 5.",
-    }
+def refresh_project_knowledge(repo_slug: str, base_branch: str = "main"):
+    """Re-run knowledge snapshot generation for an already-onboarded repo.
+
+    Clones the repo, re-runs structure scan, architecture, coding conventions,
+    and deployment check. Updates existing snapshots in place (upsert).
+    Does not re-detect capability profile or re-run command validation.
+    Runs synchronously — may take 60-120 seconds for large repos.
+    """
+    from app.onboarding import run_knowledge_refresh
+    repo_slug = repo_slug.strip()
+    if not repo_slug or "/" not in repo_slug:
+        raise HTTPException(status_code=422, detail="repo_slug must be in 'owner/repo' format")
+    try:
+        result = run_knowledge_refresh(repo_slug=repo_slug, base_branch=base_branch)
+        return result
+    except Exception as exc:
+        logger.error("Knowledge refresh failed for %s: %s", repo_slug, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

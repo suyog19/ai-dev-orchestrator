@@ -440,3 +440,111 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
                 logger.info("Onboarding workspace cleaned up: %s", work_dir)
             except Exception as exc:
                 logger.warning("Onboarding workspace cleanup failed: %s", exc)
+
+
+def run_knowledge_refresh(repo_slug: str, base_branch: str = "main") -> dict:
+    """Refresh project knowledge snapshots for an already-onboarded repo.
+
+    Re-runs steps 4-7 of the onboarding pipeline (structure scan, architecture,
+    coding conventions, deployment check). Does NOT re-detect capability profile
+    or re-run command validation.
+
+    Returns a summary dict with updated snapshot kinds and timestamps.
+    Does NOT use project_onboarding_runs — runs inline and returns immediately.
+    """
+    import uuid
+    run_id = f"refresh-{uuid.uuid4().hex[:8]}"
+    work_dir = f"/tmp/refresh/{run_id}"
+
+    try:
+        from app.database import get_active_capability_profile
+        profile = get_active_capability_profile(repo_slug)
+        profile_name = profile["profile_name"] if profile else "generic_unknown"
+
+        logger.info("Knowledge refresh started: repo_slug=%s branch=%s", repo_slug, base_branch)
+
+        # Clone
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+        if not github_token:
+            raise RuntimeError("GITHUB_TOKEN env var is not set")
+        os.makedirs(work_dir, exist_ok=True)
+        repo_path = os.path.join(work_dir, "repo")
+        clone_url = f"https://{github_token}@github.com/{repo_slug}.git"
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", "--branch", base_branch, clone_url, repo_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
+
+        # Structure scan
+        structure = scan_repo_structure(repo_path, profile_name=profile_name)
+
+        # Architecture summary
+        arch = generate_onboarding_architecture_summary(
+            repo_path=repo_path, repo_slug=repo_slug,
+            structure_scan=structure, profile=profile or {},
+        )
+        arch_summary = arch.get("architecture_summary", "")
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug, snapshot_kind="architecture",
+            summary=arch_summary, details=arch,
+            source_files=structure.get("routing_files", []) + structure.get("config_files", []),
+        )
+
+        # Open questions
+        open_questions = arch.get("open_questions", [])
+        if open_questions:
+            upsert_knowledge_snapshot(
+                repo_slug=repo_slug, snapshot_kind="open_questions",
+                summary="\n".join(f"- {q}" for q in open_questions),
+                details={"open_questions": open_questions},
+                source_files=None,
+            )
+
+        # Coding conventions
+        conventions = generate_onboarding_coding_conventions(
+            repo_path=repo_path, repo_slug=repo_slug,
+            structure_scan=structure, profile=profile or {},
+        )
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug, snapshot_kind="coding_conventions",
+            summary=conventions.get("summary", ""), details=conventions,
+            source_files=structure.get("routing_files", []) + structure.get("test_files", []),
+        )
+
+        # Deployment check
+        deploy_status, deploy_notes = _check_deployment_profile(
+            repo_slug=repo_slug, structure_scan=structure, environment="dev",
+        )
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug, snapshot_kind="deployment",
+            summary=deploy_notes["summary"], details=deploy_notes,
+            source_files=structure.get("deploy_files", []),
+        )
+
+        # Makefile recommendation (re-generate if still generic_unknown)
+        if profile_name == "generic_unknown":
+            try:
+                _generate_makefile_recommendation(repo_slug, structure)
+            except Exception as exc:
+                logger.warning("Makefile recommendation failed during refresh: %s", exc)
+
+        logger.info("Knowledge refresh completed for %s", repo_slug)
+        return {
+            "repo_slug": repo_slug,
+            "refreshed_snapshots": [
+                "architecture", "open_questions", "coding_conventions",
+                "deployment", "makefile_recommendation",
+            ] if profile_name == "generic_unknown" else [
+                "architecture", "open_questions", "coding_conventions", "deployment",
+            ],
+            "status": "COMPLETED",
+        }
+
+    finally:
+        if os.path.isdir(work_dir):
+            try:
+                shutil.rmtree(work_dir)
+            except Exception:
+                pass
