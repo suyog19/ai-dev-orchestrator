@@ -1018,6 +1018,34 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             tq_row = cur.fetchone()
 
+            # --- Architecture Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_approved'      AND feedback_value='true') AS arch_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_needs_review'  AND feedback_value='true') AS arch_needs_review,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_blocked'       AND feedback_value='true') AS arch_blocked
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            arch_row = cur.fetchone()
+
+            # --- Release Gate stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_APPROVED') AS rel_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_BLOCKED')  AS rel_blocked,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_SKIPPED')  AS rel_skipped
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            release_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -1095,6 +1123,36 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                         "tq_approved":  int(tq_approved or 0),
                         "tq_weak":      int(tq_weak or 0),
                         "tq_blocking":  int(tq_blocking or 0),
+                    })
+
+            if arch_row:
+                arch_approved, arch_needs_review, arch_blocked = arch_row
+                arch_total = (arch_approved or 0) + (arch_needs_review or 0) + (arch_blocked or 0)
+                if int(arch_total) > 0:
+                    exec_bullets.append(
+                        f"Architecture Agent: {int(arch_approved or 0)} approved, "
+                        f"{int(arch_needs_review or 0)} needs-review, "
+                        f"{int(arch_blocked or 0)} blocked of {int(arch_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "arch_approved":     int(arch_approved or 0),
+                        "arch_needs_review": int(arch_needs_review or 0),
+                        "arch_blocked":      int(arch_blocked or 0),
+                    })
+
+            if release_row:
+                rel_approved, rel_blocked, rel_skipped = release_row
+                rel_total = (rel_approved or 0) + (rel_blocked or 0) + (rel_skipped or 0)
+                if int(rel_total) > 0:
+                    exec_bullets.append(
+                        f"Release Gate: {int(rel_approved or 0)} approved, "
+                        f"{int(rel_blocked or 0)} blocked, "
+                        f"{int(rel_skipped or 0)} skipped of {int(rel_total)} decisions"
+                    )
+                    exec_evidence.update({
+                        "release_approved": int(rel_approved or 0),
+                        "release_blocked":  int(rel_blocked or 0),
+                        "release_skipped":  int(rel_skipped or 0),
                     })
 
             exec_summary = (
@@ -1194,7 +1252,8 @@ def record_execution_feedback(run_id: int) -> int:
                 """
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
-                       review_status, test_quality_status
+                       review_status, test_quality_status,
+                       architecture_status, release_decision
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1204,7 +1263,8 @@ def record_execution_feedback(run_id: int) -> int:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
                 files_changed_count, error_detail, current_step, \
-                review_status, test_quality_status = row
+                review_status, test_quality_status, \
+                architecture_status, release_decision = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1302,6 +1362,29 @@ def record_execution_feedback(run_id: int) -> int:
                         _ev(FeedbackType.SUSPICIOUS_TEST_COUNT, len(json.loads(tqr[2] or "[]")))
                     except Exception:
                         pass
+
+            # Architecture signals (Phase 10)
+            if architecture_status:
+                from app.feedback import ArchitectureStatus
+                _ev(FeedbackType.ARCHITECTURE_STATUS, architecture_status)
+                if architecture_status == ArchitectureStatus.APPROVED:
+                    _ev(FeedbackType.ARCHITECTURE_APPROVED, "true")
+                elif architecture_status == ArchitectureStatus.NEEDS_REVIEW:
+                    _ev(FeedbackType.ARCHITECTURE_NEEDS_REVIEW, "true")
+                elif architecture_status == ArchitectureStatus.BLOCKED:
+                    _ev(FeedbackType.ARCHITECTURE_BLOCKED, "true")
+
+                cur.execute(
+                    "SELECT risk_level FROM agent_architecture_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                )
+                ar_row = cur.fetchone()
+                if ar_row and ar_row[0]:
+                    _ev(FeedbackType.ARCHITECTURE_RISK_LEVEL, ar_row[0])
+
+            # Release Gate signals (Phase 10)
+            if release_decision:
+                _ev(FeedbackType.RELEASE_DECISION, release_decision)
 
             if not events:
                 return 0
