@@ -2622,6 +2622,33 @@ def list_clarifications(status: str | None = None, run_id: int | None = None, li
 # Phase 13 — GitHub commit status helpers
 # ---------------------------------------------------------------------------
 
+def get_run_verdicts(run_id: int) -> dict | None:
+    """Return all verdict fields needed for GitHub status publishing."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT test_status, review_status, test_quality_status,
+                       architecture_status, release_decision, head_sha,
+                       pr_url, issue_key
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "test_status":          row[0],
+        "review_status":        row[1],
+        "test_quality_status":  row[2],
+        "architecture_status":  row[3],
+        "release_decision":     row[4],
+        "head_sha":             row[5],
+        "pr_url":               row[6],
+        "issue_key":            row[7],
+    }
+
 def record_github_status_update(
     run_id: int,
     repo_slug: str,

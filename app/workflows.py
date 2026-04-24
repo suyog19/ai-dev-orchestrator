@@ -657,6 +657,20 @@ def _story_review_and_release(
         release_decided_at=datetime.now(timezone.utc),
     )
 
+    # --- Publish GitHub commit statuses (Phase 13) ---
+    update_run_step(run_id, "publishing_github_statuses")
+    try:
+        from app.github_status_publisher import publish_github_statuses_for_run
+        ensure_github_writes_allowed("status", mapping["repo_slug"], run_id)
+        pub_result = publish_github_statuses_for_run(run_id, mapping["repo_slug"], pr_number)
+        if pub_result["failed"] > 0:
+            send_message(
+                "github_status_publish_failed", "WARNING",
+                f"{issue_key}: {pub_result['failed']} GitHub statuses failed — {'; '.join(pub_result['errors'][:2])}",
+            )
+    except Exception as exc:
+        logger.error("_story_review_and_release: github status publish error (non-fatal) — %s", exc)
+
     update_run_step(run_id, "merge_check")
     if release["can_auto_merge"]:
         try:
@@ -1326,6 +1340,26 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         "story_implementation: release_gate — decision=%s reason=%s",
         release["release_decision"], release["reason"],
     )
+
+    # --- Publish GitHub commit statuses (Phase 13) ---
+    update_run_step(run_id, "publishing_github_statuses")
+    try:
+        from app.github_status_publisher import publish_github_statuses_for_run
+        ensure_github_writes_allowed("status", mapping["repo_slug"], run_id)
+        pub_result = publish_github_statuses_for_run(run_id, mapping["repo_slug"], pr["number"])
+        if pub_result["skipped"]:
+            logger.warning("story_implementation: github status publish skipped — %s", pub_result["errors"])
+        elif pub_result["failed"] > 0:
+            send_message(
+                "github_status_publish_failed", "WARNING",
+                f"{issue_key}: {pub_result['failed']}/{pub_result['published'] + pub_result['failed']} "
+                f"GitHub statuses failed — {'; '.join(pub_result['errors'][:2])}",
+            )
+        else:
+            logger.info("story_implementation: %d GitHub statuses published", pub_result["published"])
+    except Exception as exc:
+        logger.error("story_implementation: github status publish error (non-fatal) — %s", exc)
+        send_message("github_status_publish_failed", "WARNING", f"{issue_key}: GitHub status publish error — {exc}")
 
     update_run_step(run_id, "merge_check")
     if release["can_auto_merge"]:
