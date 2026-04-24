@@ -547,6 +547,21 @@ def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     return f"## {label}\n- Tests not run (no supported test framework detected)\n"
 
 
+# Phase 15 — per-profile release gate policies
+# allow_auto_merge: if False, auto-merge is always skipped regardless of agent verdicts
+# require_tests:    if True, NOT_RUN tests = skip; if False, NOT_RUN is acceptable
+# require_build:    if True, NOT_RUN build = skip; FAILED is always a hard block regardless
+# require_lint:     if True, NOT_RUN lint = skip; FAILED is always a soft skip regardless
+_PROFILE_RELEASE_POLICY: dict[str, dict] = {
+    "python_fastapi":  {"allow_auto_merge": True,  "require_tests": True,  "require_build": False, "require_lint": False},
+    "java_maven":      {"allow_auto_merge": False, "require_tests": True,  "require_build": True,  "require_lint": False},
+    "java_gradle":     {"allow_auto_merge": False, "require_tests": True,  "require_build": True,  "require_lint": False},
+    "node_react":      {"allow_auto_merge": False, "require_tests": False, "require_build": True,  "require_lint": False},
+    "generic_unknown": {"allow_auto_merge": False, "require_tests": False, "require_build": False, "require_lint": False},
+}
+_DEFAULT_PROFILE_POLICY: dict = {"allow_auto_merge": True, "require_tests": True, "require_build": False, "require_lint": False}
+
+
 def evaluate_release_decision(
     mapping: dict,
     final_test_result: dict,
@@ -567,6 +582,9 @@ def evaluate_release_decision(
     - blocking_gates: list[str]
     - warnings: list[str]
     """
+    profile_name = (capability_profile or {}).get("profile_name") if capability_profile else None
+    policy = _PROFILE_RELEASE_POLICY.get(profile_name, _DEFAULT_PROFILE_POLICY)
+
     blocking_gates = []
     warnings = []
 
@@ -579,7 +597,6 @@ def evaluate_release_decision(
         blocking_gates.append("test quality blocking")
     if architecture_status == ArchitectureStatus.BLOCKED:
         blocking_gates.append("architecture blocked")
-    # Phase 15: build failure is a hard block
     if build_status == "FAILED":
         blocking_gates.append("build failed")
 
@@ -596,8 +613,19 @@ def evaluate_release_decision(
     skip_reasons = []
     if not mapping.get("auto_merge_enabled"):
         skip_reasons.append("auto_merge disabled for repo")
-    if final_test_result.get("status") not in ("PASSED",):
-        skip_reasons.append(f"tests {final_test_result.get('status', 'NOT_RUN')}")
+    # Phase 15: profile policy — no auto-merge for Java/Node/unknown stacks
+    if not policy["allow_auto_merge"] and profile_name:
+        skip_reasons.append(f"profile policy: no auto-merge for {profile_name}")
+        warnings.append(f"auto-merge disabled by profile policy ({profile_name})")
+
+    # Tests: profile controls whether NOT_RUN is acceptable
+    test_status = final_test_result.get("status", "NOT_RUN")
+    if test_status not in ("PASSED",):
+        if test_status == "NOT_RUN" and not policy["require_tests"]:
+            pass  # tests not required for this profile — NOT_RUN is acceptable
+        else:
+            skip_reasons.append(f"tests {test_status}")
+
     if not applied.get("applied", False):
         skip_reasons.append("fallback apply used")
     if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
@@ -616,7 +644,10 @@ def evaluate_release_decision(
         warnings.append("architecture needs human review")
     elif architecture_status not in (ArchitectureStatus.APPROVED,):
         skip_reasons.append(f"architecture status: {architecture_status}")
-    # Phase 15: lint failure is a soft skip (RELEASE_SKIPPED, not RELEASE_BLOCKED)
+    # Phase 15: build NOT_RUN when profile requires build
+    if policy["require_build"] and build_status == "NOT_RUN" and profile_name:
+        skip_reasons.append(f"build NOT_RUN (required for {profile_name})")
+    # Phase 15: lint failure is a soft skip
     if lint_status == "FAILED":
         skip_reasons.append("lint failed")
 
@@ -1516,6 +1547,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         architecture_status=architecture_status,
         build_status=_build_status,
         lint_status=_lint_status,
+        capability_profile=capability_profile,
     )
     update_run_field(
         run_id,
