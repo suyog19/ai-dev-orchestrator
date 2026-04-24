@@ -20,6 +20,8 @@ docker compose down                   # stop everything
 
 Verify with: `curl http://localhost:8000/healthz` → `{"status": "ok"}`
 
+PostgreSQL is exposed on host port **5433** (internal 5432) when running via docker-compose. Redis on 6379. The `worker` service runs as a separate container (`python -m app.worker`) — it shares the same Dockerfile as `app`.
+
 No test suite or linting config exists for this repo itself (the orchestrator). Tests run against the *target* sandbox repo (`suyog19/sandbox-fastapi-app`) as part of `story_implementation`.
 
 ## Environment Variables
@@ -70,6 +72,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/test_runner.py` — runs `pytest -q` in a cloned workspace
 - `app/telegram.py` — `send_message(event_type, status, detail)` used by all workflow steps for Telegram notifications
 - `app/queue.py` — Redis queue enqueue/dequeue
+- `app/clarification.py` — clarification loop: detects vagueness/ambiguity, sends Telegram questions, suspends runs, resumes on answer
 
 **Event flow:**
 ```
@@ -414,6 +417,16 @@ docker compose up -d --force-recreate
 ```bash
 docker exec <container-name> env | grep <VAR_NAME>
 ```
+
+## CI/CD
+
+Two GitHub Actions workflows (`.github/workflows/`):
+- `deploy-dev.yml` — triggers on push to `dev` → copies `/home/ubuntu/.env.orchestrator` → `.env` → `docker compose up -d --build` → hits `/healthz`
+- `deploy-main.yml` — same but triggers on push to `main` and targets the prod self-hosted runner
+
+Both workflows use self-hosted runners (see `self-hosted-dev` / `self-hosted-prod` labels in the Environment Model table). The health check hitting `/healthz` is the deploy success signal — the deploy fails if the container is unhealthy.
+
+**Key dependency versions** (from `requirements.txt`): `anthropic==0.52.0`, `fastapi==0.115.12`, `redis==5.2.1`, `psycopg2-binary==2.9.10`. The anthropic SDK version determines which API features are available — check compatibility before upgrading.
 
 ## Working Style
 
