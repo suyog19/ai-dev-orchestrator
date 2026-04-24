@@ -71,6 +71,33 @@
       <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Started</td><td>{{ run.started_at or '—' }}</td></tr>
       <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Completed</td><td>{{ run.completed_at or '—' }}</td></tr>
       {% if run.merged_at %}<tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Merged</td><td>{{ run.merged_at }}</td></tr>{% endif %}
+      {% if run.capability_profile_name %}
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Capability Profile</td><td><code>{{ run.capability_profile_name }}</code></td></tr>
+      {% endif %}
+      {% if run.dependency_install_status %}
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Dep Install</td><td>
+        {% if run.dependency_install_status == 'PASSED' %}<span class="pill pill-green" style="font-size:10px;">{{ run.dependency_install_status }}</span>
+        {% elif run.dependency_install_status == 'FAILED' %}<span class="pill pill-red" style="font-size:10px;">{{ run.dependency_install_status }}</span>
+        {% elif run.dependency_install_status == 'NOT_RUN' %}<span class="pill pill-gray" style="font-size:10px;">{{ run.dependency_install_status }}</span>
+        {% else %}<span class="pill pill-yellow" style="font-size:10px;">{{ run.dependency_install_status }}</span>{% endif %}
+      </td></tr>
+      {% endif %}
+      {% if run.build_status %}
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Build</td><td>
+        {% if run.build_status == 'PASSED' %}<span class="pill pill-green" style="font-size:10px;">{{ run.build_status }}</span>
+        {% elif run.build_status == 'FAILED' %}<span class="pill pill-red" style="font-size:10px;">{{ run.build_status }}</span>
+        {% elif run.build_status == 'NOT_RUN' %}<span class="pill pill-gray" style="font-size:10px;">{{ run.build_status }}</span>
+        {% else %}<span class="pill pill-yellow" style="font-size:10px;">{{ run.build_status }}</span>{% endif %}
+      </td></tr>
+      {% endif %}
+      {% if run.lint_status %}
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Lint</td><td>
+        {% if run.lint_status == 'PASSED' %}<span class="pill pill-green" style="font-size:10px;">{{ run.lint_status }}</span>
+        {% elif run.lint_status == 'FAILED' %}<span class="pill pill-red" style="font-size:10px;">{{ run.lint_status }}</span>
+        {% elif run.lint_status == 'NOT_RUN' %}<span class="pill pill-gray" style="font-size:10px;">{{ run.lint_status }}</span>
+        {% else %}<span class="pill pill-yellow" style="font-size:10px;">{{ run.lint_status }}</span>{% endif %}
+      </td></tr>
+      {% endif %}
     </tbody>
   </table>
 </div>

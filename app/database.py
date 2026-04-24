@@ -2958,7 +2958,8 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                        release_decision, release_decision_reason, merge_status,
                        github_statuses_published, github_statuses_published_at,
                        head_sha, files_changed_count, retry_count,
-                       error_detail, created_at, started_at, completed_at, merged_at
+                       error_detail, created_at, started_at, completed_at, merged_at,
+                       capability_profile_name, build_status, lint_status, dependency_install_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -2975,6 +2976,7 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
                 "github_statuses_published", "github_statuses_published_at",
                 "head_sha", "files_changed_count", "retry_count",
                 "error_detail", "created_at", "started_at", "completed_at", "merged_at",
+                "capability_profile_name", "build_status", "lint_status", "dependency_install_status",
             ]
             run = {col: (val.isoformat() if hasattr(val, "isoformat") else val) for col, val in zip(cols, row)}
 

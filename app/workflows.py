@@ -22,7 +22,9 @@ from app.database import (
     store_architecture_review,
     get_active_clarification,
     get_run_state,
+    upsert_capability_profile,
 )
+from app.repo_profiler import detect_repo_capability_profile
 from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision, ClarificationContextKey
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
@@ -748,6 +750,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     telegram_summary = format_telegram_summary(issue_key, mapping["repo_slug"], analysis)
     send_message("repo_analysis", "COMPLETE", telegram_summary)
     logger.info("story_implementation: analysis sent to Telegram")
+
+    # Phase 15 — detect and persist capability profile (non-fatal)
+    capability_profile: dict = {}
+    try:
+        capability_profile = detect_repo_capability_profile(repo_path, mapping["repo_slug"])
+        upsert_capability_profile(mapping["repo_slug"], capability_profile)
+        update_run_field(run_id, capability_profile_name=capability_profile.get("profile_name"))
+        logger.info(
+            "story_implementation: capability profile=%s for %s",
+            capability_profile.get("profile_name"), mapping["repo_slug"],
+        )
+    except Exception as prof_exc:
+        logger.warning("story_implementation: profile detection failed (non-fatal): %s", prof_exc)
 
     update_run_step(run_id, "summarizing")
     claude_summary = summarize_repo(repo_path, mapping["repo_slug"], analysis)
