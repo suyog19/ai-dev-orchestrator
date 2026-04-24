@@ -1,7 +1,6 @@
 [
   {
     "jira_project_key": "KAN",
-    "issue_type": "Story",
     "repo_slug": "suyog19/suyogjoshi-com",
     "base_branch": "main",
     "auto_merge_enabled": false,
