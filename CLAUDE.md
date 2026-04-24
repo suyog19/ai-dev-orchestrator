@@ -44,7 +44,7 @@ Copy `.env.example` to `.env` and fill in secrets. All values are required unles
 | `PUBLIC_BASE_URL` | Public URL of this service (used when registering Telegram webhook) |
 | `JIRA_CUSTOM_FIELD_EPIC_LINK` | Jira epic link custom field ID (default: `customfield_10014`) |
 | `ADMIN_API_KEY` | Shared secret protecting all `/debug/*` and `/admin/*` endpoints |
-| `JIRA_WEBHOOK_SECRET` | Query param token for Jira webhook validation (optional but recommended) |
+| `JIRA_WEBHOOK_SECRET` | Query param token for Jira webhook validation (optional but recommended) — when set, the Jira webhook URL **must** include `?token=<value>` or all events will be rejected 401 |
 | `ALLOW_GITHUB_WRITES` | `true`/`false` — global GitHub write kill switch (default: `true`) |
 | `ALLOW_AUTO_MERGE` | `true`/`false` — auto-merge kill switch (default: `true`) |
 | `ORCHESTRATOR_PAUSED` | `true`/`false` — bootstrap pause state (DB flag takes precedence once set) |
@@ -494,7 +494,9 @@ Two separate VMs. Never share a VM between dev and prod.
 | Environment | VM IP | Branch | Runner label | Domain |
 |---|---|---|---|---|
 | Dev | `65.2.140.4` | `dev` | `self-hosted-dev` | `dev.orchestrator.suyogjoshi.com` |
-| Prod | `13.234.33.241` | `main` | `self-hosted-prod` | `orchestrator.suyogjoshi.com` |
+| Prod | `13.206.186.168` | `main` | `self-hosted-prod` | `orchestrator.suyogjoshi.com` |
+
+> **Prod IP is not an Elastic IP** — it changes on every instance stop/start. After a stop/start: update DNS A record, re-register Telegram webhook (`GET /debug/telegram/set-webhook`), and update the Jira webhook URL in the Jira admin panel to include `?token=<JIRA_WEBHOOK_SECRET>`.
 
 ## Security Layer
 
@@ -568,10 +570,10 @@ docker exec <container-name> env | grep <VAR_NAME>
 ## CI/CD
 
 Two GitHub Actions workflows (`.github/workflows/`):
-- `deploy-dev.yml` — triggers on push to `dev` → copies `/home/ubuntu/.env.orchestrator` → `.env` → `docker compose up -d --build` → hits `/healthz`
+- `deploy-dev.yml` — triggers on push to `dev` → copies `/home/ubuntu/.env.orchestrator` → `.env` → prunes Docker builder cache → `docker compose up -d --build` → hits `/healthz`
 - `deploy-main.yml` — same but triggers on push to `main` and targets the prod self-hosted runner
 
-Both workflows use self-hosted runners (see `self-hosted-dev` / `self-hosted-prod` labels in the Environment Model table). The health check hitting `/healthz` is the deploy success signal — the deploy fails if the container is unhealthy.
+Both workflows run `docker builder prune -f` before the build to prevent disk exhaustion from accumulated layer cache (typically reclaims 700MB–1.4GB per deploy). Both workflows use self-hosted runners (see `self-hosted-dev` / `self-hosted-prod` labels in the Environment Model table). The health check hitting `/healthz` is the deploy success signal — the deploy fails if the container is unhealthy.
 
 **Key dependency versions** (from `requirements.txt`): `anthropic==0.52.0`, `fastapi==0.115.12`, `redis==5.2.1`, `psycopg2-binary==2.9.10`. The anthropic SDK version determines which API features are available — check compatibility before upgrading.
 
