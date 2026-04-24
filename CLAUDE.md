@@ -41,6 +41,11 @@ Copy `.env.example` to `.env` and fill in secrets. All values are required unles
 | `ENV_NAME` | `DEV` or `PROD` — prepended to all Telegram messages |
 | `PUBLIC_BASE_URL` | Public URL of this service (used when registering Telegram webhook) |
 | `JIRA_CUSTOM_FIELD_EPIC_LINK` | Jira epic link custom field ID (default: `customfield_10014`) |
+| `ADMIN_API_KEY` | Shared secret protecting all `/debug/*` and `/admin/*` endpoints |
+| `JIRA_WEBHOOK_SECRET` | Query param token for Jira webhook validation (optional but recommended) |
+| `ALLOW_GITHUB_WRITES` | `true`/`false` — global GitHub write kill switch (default: `true`) |
+| `ALLOW_AUTO_MERGE` | `true`/`false` — auto-merge kill switch (default: `true`) |
+| `ORCHESTRATOR_PAUSED` | `true`/`false` — bootstrap pause state (DB flag takes precedence once set) |
 
 ## Architecture
 
@@ -164,6 +169,11 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/debug/architecture-reviews` | List Architecture Agent verdicts (filter: run_id, repo_slug, architecture_status) |
 | GET | `/debug/workflow-runs/{run_id}/architecture` | All Architecture Agent verdicts for one run |
 | GET | `/debug/workflow-runs/{run_id}/release-decision` | Release Gate decision + all agent statuses for one run |
+| GET | `/admin/security-events` | List security audit events (filter: event_type, source, status) |
+| GET | `/admin/control-status` | Current runtime control flags (paused state) |
+| POST | `/admin/pause` | Pause orchestrator — blocks Jira dispatch + Telegram commands |
+| POST | `/admin/resume` | Resume orchestrator |
+| GET | `/admin/github/branch-protection` | Audit branch protection for a repo (query: repo_slug, branch) |
 
 ## Workflow Configuration
 
@@ -305,6 +315,49 @@ Two separate VMs. Never share a VM between dev and prod.
 |---|---|---|---|---|
 | Dev | `65.2.140.4` | `dev` | `self-hosted-dev` | `dev.orchestrator.suyogjoshi.com` |
 | Prod | `13.234.33.241` | `main` | `self-hosted-prod` | `orchestrator.suyogjoshi.com` |
+
+## Security Layer (Phase 11)
+
+**`app/security.py`** is the central security module.
+
+### Admin Key Auth
+
+All `/debug/*` and `/admin/*` paths are protected by `X-Orchestrator-Admin-Key` header middleware (`admin_key_middleware` registered via `BaseHTTPMiddleware`). Auth failures are recorded as `admin_auth_failed` security events. Successful mutating calls (POST/PUT/DELETE/PATCH) are recorded as `admin_auth_success`.
+
+### GitHub Write Guard
+
+`ensure_github_writes_allowed(action, repo_slug, run_id)` in `app/security.py` — call before any GitHub write. Raises `RuntimeError` (caught by existing workflow try/except) when:
+- Orchestrator is paused (DB flag checked first, env var fallback)
+- `ALLOW_GITHUB_WRITES=false`
+- `ALLOW_AUTO_MERGE=false` (for `merge_pr` action only)
+
+Wired in `app/workflows.py` before `commit_and_push` (push), `create_pull_request` (create_pr), `merge_pull_request` (merge_pr).
+
+### Rate Limiting
+
+Redis sliding-window rate limiting in `check_rate_limit(path, identifier)`:
+
+| Endpoint | Limit |
+|---|---|
+| `/webhooks/jira` | 30 req/min (global) |
+| `/webhooks/telegram` | 10 req/min (per chat_id) |
+| Admin mutating calls | 20 req/min (per client IP) |
+
+Returns `True` (allow) or `False` (deny). Fails open on Redis errors. Returns 429 for admin endpoints, 200/ok for Telegram (Telegram requires 200 on all responses).
+
+### Control Flags
+
+`control_flags` table in DB — `is_paused()` checks DB then env var fallback. Seeded from `ORCHESTRATOR_PAUSED` env var at startup (ON CONFLICT DO NOTHING — DB takes precedence after first set).
+
+### Security Events
+
+`security_events` table — append-only audit log. `record_security_event(event_type, source, actor, endpoint, method, status, details)` in `app/database.py`. Event types: `admin_auth_failed`, `admin_auth_success`, `webhook_rejected`, `telegram_rejected`, `github_write_blocked`, `automation_paused_jira_blocked`, `automation_paused_telegram_blocked`.
+
+### Docs
+
+- `docs/security/endpoint-inventory.md` — all endpoints with auth requirements
+- `docs/security/token-permissions.md` — minimum permission scopes for all secrets
+- `docs/runbooks/orchestrator-ops.md` — operational runbook (pause, rotate secrets, recover stale runs)
 
 ## Two-File `.env` Rule — CRITICAL
 
