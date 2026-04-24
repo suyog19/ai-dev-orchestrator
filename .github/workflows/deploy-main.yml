@@ -15,6 +15,9 @@ jobs:
       - name: Copy .env from VM
         run: cp /home/ubuntu/.env.orchestrator .env
 
+      - name: Free disk space
+        run: docker builder prune -f
+
       - name: Build and restart stack
         run: docker compose up -d --build
 
