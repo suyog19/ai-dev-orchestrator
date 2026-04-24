@@ -15,6 +15,8 @@ logger = logging.getLogger("orchestrator.security")
 
 ADMIN_KEY_HEADER = "X-Orchestrator-Admin-Key"
 _PROTECTED_PREFIXES = ("/debug/", "/admin/")
+# UI routes use cookie-based auth handled in route handlers, not header middleware
+_UI_EXEMPT_PREFIX = "/admin/ui"
 
 # Methods that mutate state — auth success for these is logged
 _MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
@@ -25,7 +27,9 @@ def _get_admin_key() -> str:
 
 
 def is_admin_protected(path: str) -> bool:
-    """Return True if the path requires admin key auth."""
+    """Return True if the path requires admin key header auth."""
+    if path.startswith(_UI_EXEMPT_PREFIX):
+        return False
     for prefix in _PROTECTED_PREFIXES:
         if path.startswith(prefix):
             return True

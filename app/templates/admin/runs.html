@@ -1,0 +1,169 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Workflow Runs{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Workflow Runs</h1>
+  <p class="subtitle">{{ runs|length }} runs shown</p>
+</div>
+
+<!-- Filters -->
+<div class="card" style="margin-bottom:16px;">
+  <form method="get" action="/admin/ui/runs" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <div class="form-group" style="margin:0; min-width:140px;">
+      <label>Status</label>
+      <select name="status">
+        <option value="">All</option>
+        {% for s in ['RUNNING','COMPLETED','FAILED','QUEUED','RECEIVED','WAITING_FOR_APPROVAL'] %}
+        <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group" style="margin:0; min-width:160px;">
+      <label>Workflow Type</label>
+      <select name="workflow_type">
+        <option value="">All</option>
+        <option value="story_implementation" {% if filters.workflow_type == 'story_implementation' %}selected{% endif %}>story_implementation</option>
+        <option value="epic_breakdown" {% if filters.workflow_type == 'epic_breakdown' %}selected{% endif %}>epic_breakdown</option>
+      </select>
+    </div>
+    <div class="form-group" style="margin:0; min-width:130px;">
+      <label>Issue Key</label>
+      <input type="text" name="issue_key" value="{{ filters.issue_key }}" placeholder="e.g. PROJ-42">
+    </div>
+    <div class="form-group" style="margin:0; min-width:160px;">
+      <label>Release Decision</label>
+      <select name="release_decision">
+        <option value="">All</option>
+        {% for rd in ['RELEASE_APPROVED','RELEASE_BLOCKED','RELEASE_SKIPPED'] %}
+        <option value="{{ rd }}" {% if filters.release_decision == rd %}selected{% endif %}>{{ rd }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group" style="margin:0; min-width:80px;">
+      <label>Limit</label>
+      <select name="limit">
+        {% for n in [20, 30, 50, 100] %}
+        <option value="{{ n }}" {% if filters.limit == n %}selected{% endif %}>{{ n }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div style="padding-bottom:1px;">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/admin/ui/runs" class="btn btn-ghost btn-sm" style="margin-left:4px;">Reset</a>
+    </div>
+  </form>
+</div>
+
+{% if runs %}
+<div class="card" style="padding:0;">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Issue</th>
+          <th>Type</th>
+          <th>Status</th>
+          <th>Step</th>
+          <th>Tests</th>
+          <th>Review</th>
+          <th>TQ</th>
+          <th>Arch</th>
+          <th>Release</th>
+          <th>Merge</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td><a href="/admin/ui/runs/{{ run.id }}"><strong>{{ run.id }}</strong></a></td>
+          <td><code>{{ run.issue_key or '—' }}</code></td>
+          <td style="font-size:11px;">{{ run.workflow_type or '—' }}</td>
+          <td>
+            {% if run.status == 'COMPLETED' %}
+              <span class="pill pill-green">{{ run.status }}</span>
+            {% elif run.status == 'FAILED' %}
+              <span class="pill pill-red">{{ run.status }}</span>
+            {% elif run.status in ('RUNNING', 'QUEUED') %}
+              <span class="pill pill-yellow">{{ run.status }}</span>
+            {% else %}
+              <span class="pill pill-gray">{{ run.status }}</span>
+            {% endif %}
+          </td>
+          <td style="font-size:11px; max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ run.current_step or '' }}">
+            {{ run.current_step or '—' }}
+          </td>
+          <td>
+            {% if run.test_status == 'PASSED' %}
+              <span class="pill pill-green">{{ run.test_status }}</span>
+            {% elif run.test_status == 'FAILED' %}
+              <span class="pill pill-red">{{ run.test_status }}</span>
+            {% elif run.test_status %}
+              <span class="pill pill-gray">{{ run.test_status }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td style="font-size:11px;">
+            {% if run.review_status == 'APPROVED_BY_AI' %}
+              <span class="pill pill-green" style="font-size:10px;">✓</span>
+            {% elif run.review_status in ('BLOCKED',) %}
+              <span class="pill pill-red" style="font-size:10px;">✗</span>
+            {% elif run.review_status %}
+              <span class="pill pill-yellow" style="font-size:10px;">~</span>
+            {% else %}—{% endif %}
+          </td>
+          <td style="font-size:11px;">
+            {% if run.test_quality_status == 'TEST_QUALITY_APPROVED' %}
+              <span class="pill pill-green" style="font-size:10px;">✓</span>
+            {% elif run.test_quality_status == 'TESTS_BLOCKING' %}
+              <span class="pill pill-red" style="font-size:10px;">✗</span>
+            {% elif run.test_quality_status %}
+              <span class="pill pill-yellow" style="font-size:10px;">~</span>
+            {% else %}—{% endif %}
+          </td>
+          <td style="font-size:11px;">
+            {% if run.architecture_status == 'ARCHITECTURE_APPROVED' %}
+              <span class="pill pill-green" style="font-size:10px;">✓</span>
+            {% elif run.architecture_status == 'ARCHITECTURE_BLOCKED' %}
+              <span class="pill pill-red" style="font-size:10px;">✗</span>
+            {% elif run.architecture_status %}
+              <span class="pill pill-yellow" style="font-size:10px;">~</span>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if run.release_decision == 'RELEASE_APPROVED' %}
+              <span class="pill pill-green" style="font-size:10px;">APPROVED</span>
+            {% elif run.release_decision == 'RELEASE_BLOCKED' %}
+              <span class="pill pill-red" style="font-size:10px;">BLOCKED</span>
+            {% elif run.release_decision == 'RELEASE_SKIPPED' %}
+              <span class="pill pill-yellow" style="font-size:10px;">SKIPPED</span>
+            {% elif run.release_decision %}
+              <span class="pill pill-gray" style="font-size:10px;">{{ run.release_decision }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td style="font-size:11px;">
+            {% if run.merge_status == 'MERGED' %}
+              <span class="pill pill-green" style="font-size:10px;">MERGED</span>
+            {% elif run.merge_status and 'BLOCKED' in run.merge_status %}
+              <span class="pill pill-red" style="font-size:10px;">BLOCKED</span>
+            {% elif run.merge_status %}
+              <span class="pill pill-gray" style="font-size:10px;">{{ run.merge_status }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td class="text-muted" style="font-size:11px; white-space:nowrap;">
+            {{ (run.created_at or '')[:16] }}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="placeholder-message">
+  <p>No workflow runs match the current filters.</p>
+</div>
+{% endif %}
+{% endblock %}

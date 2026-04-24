@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login — Orchestrator [{{ env_name }}]</title>
+  <link rel="stylesheet" href="/static/admin/admin.css">
+</head>
+<body class="login-page">
+  <div class="login-box">
+    <h1>Orchestrator Admin</h1>
+    <p class="env-label">
+      <span class="env-badge env-{{ env_name | lower }}">{{ env_name }}</span>
+    </p>
+    {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/admin/ui/login">
+      <input type="hidden" name="next" value="{{ next }}">
+      <div class="form-group">
+        <label for="admin_key">Admin Key</label>
+        <input
+          type="password"
+          id="admin_key"
+          name="admin_key"
+          placeholder="Enter admin key"
+          required
+          autofocus
+        >
+      </div>
+      <button type="submit" class="btn btn-primary">Login</button>
+    </form>
+  </div>
+</body>
+</html>

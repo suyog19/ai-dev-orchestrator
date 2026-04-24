@@ -1,0 +1,111 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Memory{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Memory Snapshots</h1>
+  <p class="subtitle">Guidance derived from run history and manual notes</p>
+</div>
+
+<!-- Filter -->
+<div class="card" style="margin-bottom:16px;">
+  <form method="get" action="/admin/ui/memory" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <div class="form-group" style="margin:0; min-width:120px;">
+      <label>Scope Type</label>
+      <select name="scope_type">
+        <option value="">All</option>
+        <option value="repo" {% if filters.scope_type == 'repo' %}selected{% endif %}>repo</option>
+        <option value="epic" {% if filters.scope_type == 'epic' %}selected{% endif %}>epic</option>
+      </select>
+    </div>
+    <div class="form-group" style="margin:0; min-width:200px;">
+      <label>Scope Key</label>
+      <input type="text" name="scope_key" value="{{ filters.scope_key }}" placeholder="e.g. owner/repo or EPIC-1">
+    </div>
+    <div style="padding-bottom:1px;">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/admin/ui/memory" class="btn btn-ghost btn-sm" style="margin-left:4px;">Reset</a>
+    </div>
+  </form>
+</div>
+
+<!-- Snapshots -->
+{% if snapshots %}
+<div class="card">
+  <h2>Memory Snapshots ({{ snapshots|length }})</h2>
+  {% for snap in snapshots %}
+  <div style="border: 1px solid #e5e7eb; border-radius:4px; padding:12px; margin-bottom:12px;">
+    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+      <span class="pill pill-blue" style="font-size:11px;">{{ snap.scope_type }}</span>
+      <code>{{ snap.scope_key }}</code>
+      <span class="pill {% if snap.source == 'human' %}pill-yellow{% else %}pill-gray{% endif %}" style="font-size:10px;">
+        {{ snap.memory_kind }}
+        {% if snap.source == 'human' %}(manual){% endif %}
+      </span>
+      <span class="text-muted" style="font-size:11px;">Updated: {{ (snap.updated_at or '')[:16] }}</span>
+    </div>
+    {% if snap.summary %}
+    <pre style="font-size:12px; white-space:pre-wrap; word-break:break-word; background:#f9fafb; padding:8px; border-radius:4px; margin:0;">{{ snap.summary[:800] }}</pre>
+    {% else %}
+    <p class="text-muted" style="font-size:12px;">No summary.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="placeholder-message"><p>No memory snapshots match the current filters.</p></div>
+{% endif %}
+
+<!-- Add manual note -->
+<div class="card">
+  <h2>Add Manual Memory Note</h2>
+  <form method="post" action="/admin/ui/memory/note">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+      <div class="form-group" style="margin:0; min-width:120px;">
+        <label>Scope Type</label>
+        <select name="scope_type">
+          <option value="repo">repo</option>
+          <option value="epic">epic</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0; min-width:200px;">
+        <label>Scope Key</label>
+        <input type="text" name="scope_key" placeholder="owner/repo or EPIC-1" required>
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:10px;">
+      <label>Note</label>
+      <textarea name="content" rows="4" placeholder="Guidance for the orchestrator..." required></textarea>
+    </div>
+    <button type="submit" class="btn btn-primary btn-sm">Save Note</button>
+  </form>
+</div>
+
+<!-- Recent feedback events -->
+<div class="card">
+  <h2>Recent Feedback Events ({{ feedback|length }})</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Type</th><th>Repo</th><th>Run</th><th>Value</th><th>When</th></tr>
+      </thead>
+      <tbody>
+        {% for ev in feedback %}
+        <tr>
+          <td>{{ ev.id }}</td>
+          <td style="font-size:11px;"><code>{{ ev.feedback_type }}</code></td>
+          <td style="font-size:11px;"><code>{{ ev.repo_slug or '—' }}</code></td>
+          <td>{% if ev.source_run_id %}<a href="/admin/ui/runs/{{ ev.source_run_id }}">#{{ ev.source_run_id }}</a>{% else %}—{% endif %}</td>
+          <td style="font-size:11px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            {{ ev.value | string | truncate(60) if ev.value is not none else '—' }}
+          </td>
+          <td class="text-muted" style="font-size:11px;">{{ (ev.created_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

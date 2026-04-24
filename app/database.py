@@ -1860,7 +1860,7 @@ def get_planning_run_detail(run_id: int) -> dict | None:
                 "confidence", "description", "acceptance_criteria",
                 "rationale", "dependency_notes", "risk_notes",
             ]
-            result["items"] = [dict(zip(item_cols, r)) for r in cur.fetchall()]
+            result["proposals"] = [dict(zip(item_cols, r)) for r in cur.fetchall()]
     return result
 
 
@@ -2030,6 +2030,88 @@ def get_execution_memory(repo_slug: str) -> str:
         block = block[:MEMORY_MAX_CHARS].rsplit("\n", 1)[0]
 
     return block
+
+
+def list_memory_snapshots(scope_type: str | None = None, scope_key: str | None = None) -> list[dict]:
+    """Return memory_snapshots rows, optionally filtered."""
+    conditions = []
+    params: list = []
+    if scope_type:
+        conditions.append("scope_type = %s")
+        params.append(scope_type)
+    if scope_key:
+        conditions.append("scope_key = %s")
+        params.append(scope_key)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, scope_type, scope_key, memory_kind, source,
+                       summary, evidence_json, created_at, updated_at
+                FROM memory_snapshots
+                {where}
+                ORDER BY scope_type, scope_key, memory_kind
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":          r[0],
+            "scope_type":  r[1],
+            "scope_key":   r[2],
+            "memory_kind": r[3],
+            "source":      r[4],
+            "summary":     r[5],
+            "evidence":    json.loads(r[6]) if r[6] else None,
+            "created_at":  r[7].isoformat() if r[7] else None,
+            "updated_at":  r[8].isoformat() if r[8] else None,
+        }
+        for r in rows
+    ]
+
+
+def list_feedback_events(
+    source_type: str | None = None,
+    repo_slug: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return feedback_events rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+    if source_type:
+        conditions.append("source_type = %s")
+        params.append(source_type)
+    if repo_slug:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(min(limit, 200))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, source_type, source_run_id, repo_slug, feedback_type, feedback_value, created_at
+                FROM feedback_events
+                {where}
+                ORDER BY id DESC LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":           r[0],
+            "source_type":  r[1],
+            "source_run_id": r[2],
+            "repo_slug":    r[3],
+            "feedback_type": r[4],
+            "value":        r[5],
+            "created_at":   r[6].isoformat() if r[6] else None,
+        }
+        for r in rows
+    ]
 
 
 def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
@@ -2774,3 +2856,298 @@ def list_github_status_updates(run_id: int) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def list_workflow_runs_for_ui(
+    status: str | None = None,
+    workflow_type: str | None = None,
+    issue_key: str | None = None,
+    release_decision: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return workflow runs for the admin UI runs list, newest first."""
+    conditions = []
+    params: list = []
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if workflow_type:
+        conditions.append("workflow_type = %s")
+        params.append(workflow_type)
+    if issue_key:
+        conditions.append("issue_key ILIKE %s")
+        params.append(f"%{issue_key}%")
+    if release_decision:
+        conditions.append("release_decision = %s")
+        params.append(release_decision)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(min(limit, 100))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, issue_key, workflow_type, status, current_step,
+                       working_branch, pr_url, test_status, review_status,
+                       test_quality_status, architecture_status, release_decision,
+                       merge_status, github_statuses_published, created_at, completed_at,
+                       left(error_detail, 200) AS error_detail
+                FROM workflow_runs
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    cols = [
+        "id", "issue_key", "workflow_type", "status", "current_step",
+        "working_branch", "pr_url", "test_status", "review_status",
+        "test_quality_status", "architecture_status", "release_decision",
+        "merge_status", "github_statuses_published", "created_at", "completed_at",
+        "error_detail",
+    ]
+    return [
+        {col: (val.isoformat() if hasattr(val, "isoformat") else val) for col, val in zip(cols, row)}
+        for row in rows
+    ]
+
+
+def get_workflow_run_detail(run_id: int) -> dict | None:
+    """Return full detail for a single run including agent reviews and clarifications."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, status, current_step,
+                       working_branch, pr_url, test_status, review_status, review_summary,
+                       test_quality_status, test_quality_summary,
+                       architecture_status, architecture_summary,
+                       release_decision, release_decision_reason, merge_status,
+                       github_statuses_published, github_statuses_published_at,
+                       head_sha, files_changed_count, retry_count,
+                       error_detail, created_at, started_at, completed_at, merged_at
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [
+                "id", "issue_key", "workflow_type", "status", "current_step",
+                "working_branch", "pr_url", "test_status", "review_status", "review_summary",
+                "test_quality_status", "test_quality_summary",
+                "architecture_status", "architecture_summary",
+                "release_decision", "release_decision_reason", "merge_status",
+                "github_statuses_published", "github_statuses_published_at",
+                "head_sha", "files_changed_count", "retry_count",
+                "error_detail", "created_at", "started_at", "completed_at", "merged_at",
+            ]
+            run = {col: (val.isoformat() if hasattr(val, "isoformat") else val) for col, val in zip(cols, row)}
+
+            # Agent reviews
+            cur.execute(
+                """
+                SELECT review_status, risk_level, summary,
+                       blocking_reasons_json, recommendations_json, created_at
+                FROM agent_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["agent_review"] = {
+                "review_status": r[0], "risk_level": r[1], "summary": r[2],
+                "blocking_reasons": json.loads(r[3]) if r[3] else [],
+                "recommendations": json.loads(r[4]) if r[4] else [],
+                "created_at": r[5].isoformat() if r[5] else None,
+            } if r else None
+
+            # Test quality review
+            cur.execute(
+                """
+                SELECT quality_status, confidence_level, summary,
+                       missing_tests_json, suspicious_tests_json, recommendations_json, created_at
+                FROM agent_test_quality_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["tq_review"] = {
+                "quality_status": r[0], "confidence_level": r[1], "summary": r[2],
+                "missing_tests": json.loads(r[3]) if r[3] else [],
+                "suspicious_tests": json.loads(r[4]) if r[4] else [],
+                "recommendations": json.loads(r[5]) if r[5] else [],
+                "created_at": r[6].isoformat() if r[6] else None,
+            } if r else None
+
+            # Architecture review
+            cur.execute(
+                """
+                SELECT architecture_status, risk_level, summary,
+                       blocking_reasons_json, recommendations_json, created_at
+                FROM agent_architecture_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["arch_review"] = {
+                "architecture_status": r[0], "risk_level": r[1], "summary": r[2],
+                "blocking_reasons": json.loads(r[3]) if r[3] else [],
+                "recommendations": json.loads(r[4]) if r[4] else [],
+                "created_at": r[5].isoformat() if r[5] else None,
+            } if r else None
+
+            # Active clarification
+            cur.execute(
+                """
+                SELECT id, context_key, question, options_json, status, created_at, expires_at
+                FROM clarification_requests WHERE run_id = %s AND status = 'PENDING'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            r = cur.fetchone()
+            run["active_clarification"] = {
+                "id": r[0], "context_key": r[1], "question_text": r[2],
+                "options": json.loads(r[3]) if r[3] else [],
+                "status": r[4],
+                "created_at": r[5].isoformat() if r[5] else None,
+                "expires_at": r[6].isoformat() if r[6] else None,
+            } if r else None
+
+            # GitHub statuses
+            cur.execute(
+                """
+                SELECT context, state, description, created_at
+                FROM github_status_updates WHERE run_id = %s
+                ORDER BY context, created_at DESC
+                """,
+                (run_id,),
+            )
+            seen = set()
+            gh_statuses = []
+            for r in cur.fetchall():
+                if r[0] not in seen:
+                    seen.add(r[0])
+                    gh_statuses.append({
+                        "context": r[0], "state": r[1], "description": r[2],
+                        "created_at": r[3].isoformat() if r[3] else None,
+                    })
+            run["github_statuses"] = gh_statuses
+
+    return run
+
+
+def get_overview_stats() -> dict:
+    """Aggregate stats for the admin overview page in a single DB round-trip."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Pending clarifications count
+            cur.execute("SELECT COUNT(*) FROM clarification_requests WHERE status = 'PENDING'")
+            pending_clarifications = cur.fetchone()[0]
+
+            # Recent FAILED runs (last 5)
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, status, current_step, error_detail, created_at
+                FROM workflow_runs
+                WHERE status = 'FAILED'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            failed_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "workflow_type": r[2],
+                    "status": r[3], "current_step": r[4],
+                    "error_detail": (r[5] or "")[:200],
+                    "created_at": r[6].isoformat() if r[6] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Recent RELEASE_BLOCKED runs (last 5)
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, release_decision,
+                       review_status, test_quality_status, architecture_status, created_at
+                FROM workflow_runs
+                WHERE release_decision = 'RELEASE_BLOCKED'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            blocked_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "workflow_type": r[2],
+                    "release_decision": r[3], "review_status": r[4],
+                    "test_quality_status": r[5], "architecture_status": r[6],
+                    "created_at": r[7].isoformat() if r[7] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # RUNNING runs (stale detection)
+            cur.execute(
+                """
+                SELECT id, issue_key, current_step, started_at
+                FROM workflow_runs WHERE status = 'RUNNING'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            running_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "current_step": r[2],
+                    "started_at": r[3].isoformat() if r[3] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Total run counts
+            cur.execute(
+                """
+                SELECT status, COUNT(*) FROM workflow_runs
+                GROUP BY status
+                """
+            )
+            run_counts = {r[0]: r[1] for r in cur.fetchall()}
+
+            # Recent security events (last 10, excluding routine auth successes)
+            cur.execute(
+                """
+                SELECT id, event_type, source, actor, endpoint, status, created_at
+                FROM security_events
+                WHERE event_type != 'admin_auth_success'
+                ORDER BY id DESC LIMIT 10
+                """
+            )
+            security_events = [
+                {
+                    "id": r[0], "event_type": r[1], "source": r[2],
+                    "actor": r[3], "endpoint": r[4], "status": r[5],
+                    "created_at": r[6].isoformat() if r[6] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Last GitHub status publish
+            cur.execute(
+                """
+                SELECT run_id, repo_slug, state, created_at
+                FROM github_status_updates
+                ORDER BY id DESC LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            last_github_publish = {
+                "run_id": row[0], "repo_slug": row[1],
+                "state": row[2], "created_at": row[3].isoformat() if row[3] else None,
+            } if row else None
+
+    return {
+        "pending_clarifications": pending_clarifications,
+        "failed_runs": failed_runs,
+        "blocked_runs": blocked_runs,
+        "running_runs": running_runs,
+        "run_counts": run_counts,
+        "security_events": security_events,
+        "last_github_publish": last_github_publish,
+    }
