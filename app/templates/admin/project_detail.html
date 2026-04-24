@@ -6,6 +6,128 @@
   <p class="subtitle"><a href="/admin/ui/projects">← Projects</a></p>
 </div>
 
+<!-- Activation Status Section -->
+<section>
+  <h2>Project Activation Status</h2>
+  <table>
+    <tr>
+      <th>Onboarding</th>
+      <td>
+        {% if onboarding_completed %}
+          <span class="badge badge-completed">COMPLETED</span>
+        {% elif runs %}
+          <span class="badge badge-{{ runs[0].status | lower }}">{{ runs[0].status }}</span>
+        {% else %}
+          <span class="badge badge-pending">NOT STARTED</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>Jira Mapping</th>
+      <td>
+        {% if active_mapping %}
+          <span class="badge badge-completed">ACTIVE</span>
+          — <strong>{{ active_mapping.jira_project_key }}</strong>
+          (id={{ active_mapping.id }}, auto_merge={{ "on" if active_mapping.auto_merge_enabled else "off" }})
+        {% else %}
+          <span class="badge badge-failed">NOT CONFIGURED</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>Capability Profile</th>
+      <td>
+        {% if capability_profile %}
+          {{ capability_profile.profile_name }}
+          {% if capability_profile.profile_name == "generic_unknown" %}
+            <span class="text-muted" style="font-size:0.85em">— no test/build/lint commands</span>
+          {% endif %}
+        {% else %}
+          <span class="text-muted">Not detected — run onboarding first</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>Deployment Profile</th>
+      <td>
+        {% if deployment_profile %}
+          {{ "Enabled" if deployment_profile.enabled else "Disabled" }}
+          {% if deployment_profile.base_url %}
+            — <code>{{ deployment_profile.base_url }}</code>
+          {% else %}
+            <span class="text-muted" style="font-size:0.85em">— no base_url set</span>
+          {% endif %}
+        {% else %}
+          <span class="text-muted">Not configured</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>Branch Protection</th>
+      <td>
+        <a href="/admin/github/branch-protection?repo_slug={{ repo_slug }}&branch=main" target="_blank">Check via API →</a>
+        <span class="text-muted" style="font-size:0.85em">Requires orchestrator/release-gate as required check</span>
+      </td>
+    </tr>
+    <tr>
+      <th>Recommended Action</th>
+      <td>
+        {% if not onboarding_completed %}
+          Run <code>POST /admin/project-onboarding/start</code> to begin onboarding.
+        {% elif not active_mapping %}
+          Use the form below to activate this project with a Jira mapping.
+        {% elif capability_profile and capability_profile.profile_name == "generic_unknown" %}
+          Add <code>config/repo_command_hints.yaml</code> entry to enable test validation.
+        {% else %}
+          Project is ready — create a Jira Epic to start using the orchestrator.
+        {% endif %}
+      </td>
+    </tr>
+  </table>
+
+  {% if onboarding_completed %}
+  {% if activation_result %}
+  <div class="alert {{ 'alert-success' if activation_result.activated else 'alert-warning' }}" style="margin-top:12px;padding:12px;border-radius:4px;background:{{ '#d4edda' if activation_result.activated else '#fff3cd' }};border:1px solid {{ '#c3e6cb' if activation_result.activated else '#ffc107' }}">
+    <strong>{{ "Activation successful" if activation_result.activated else "Activation incomplete" }}</strong>
+    {% if activation_result.recommendations %}
+    <ul style="margin:8px 0 0 16px">
+      {% for r in activation_result.recommendations %}<li>{{ r }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <details style="margin-top:16px" {{ "open" if not active_mapping else "" }}>
+    <summary style="cursor:pointer;font-weight:600;color:#4a6cf7">Activate / Update Project Mapping</summary>
+    <form method="POST" action="/admin/ui/projects/{{ repo_slug }}/activate" style="margin-top:12px;max-width:480px">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <div style="margin-bottom:10px">
+        <label style="display:block;margin-bottom:4px;font-weight:600">Jira Project Key</label>
+        <input type="text" name="jira_project_key" value="{{ active_mapping.jira_project_key if active_mapping else '' }}"
+               placeholder="e.g. KAN" required style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px">
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="display:block;margin-bottom:4px;font-weight:600">Base Branch</label>
+        <input type="text" name="base_branch" value="{{ active_mapping.base_branch if active_mapping else 'main' }}"
+               style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px">
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="display:block;margin-bottom:4px;font-weight:600">Environment</label>
+        <input type="text" name="environment" value="dev"
+               style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px">
+      </div>
+      <div style="margin-bottom:16px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" name="auto_merge" value="true" {{ "checked" if active_mapping and active_mapping.auto_merge_enabled else "" }}>
+          <span>Enable auto-merge (disabled by default for safety)</span>
+        </label>
+      </div>
+      <button type="submit" class="btn btn-primary">Activate Project</button>
+    </form>
+  </details>
+  {% endif %}
+</section>
+
 {% if latest_run %}
 <section>
   <h2>Latest Onboarding Run #{{ latest_run.id }}</h2>
