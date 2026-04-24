@@ -134,6 +134,9 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 **`workflow_runs.architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR` (NULL until arch review completes)
 **`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
 
+**`clarification_requests.status` values:** `PENDING` | `ANSWERED` | `CANCELLED` | `EXPIRED`
+**Clarification context keys:** `pre_planning` (epic), `pre_suggest` (story implementation), `pre_review` (review agents)
+
 **`memory_snapshots` kinds:** `planning_guidance`, `execution_guidance`, `manual_note`
 **`memory_snapshots` scopes:** `repo` (scope_key = repo_slug), `epic` (scope_key = epic_key)
 
@@ -172,6 +175,11 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/debug/architecture-reviews` | List Architecture Agent verdicts (filter: run_id, repo_slug, architecture_status) |
 | GET | `/debug/workflow-runs/{run_id}/architecture` | All Architecture Agent verdicts for one run |
 | GET | `/debug/workflow-runs/{run_id}/release-decision` | Release Gate decision + all agent statuses for one run |
+| GET | `/debug/clarifications` | List clarifications (filter: status, run_id, limit) |
+| GET | `/debug/clarifications/{id}` | Single clarification detail |
+| POST | `/debug/clarifications/{id}/answer` | Admin answer + resume workflow |
+| POST | `/debug/clarifications/{id}/cancel` | Admin cancel + fail workflow |
+| POST | `/debug/clarifications/{id}/resend` | Resend Telegram question |
 | GET | `/admin/security-events` | List security audit events (filter: event_type, source, status) |
 | GET | `/admin/control-status` | Current runtime control flags (paused state) |
 | POST | `/admin/pause` | Pause orchestrator — blocks Jira dispatch + Telegram commands |
@@ -201,6 +209,26 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Output issue type | `Story` |
 | Approval commands | `APPROVE <run_id>` / `REJECT <run_id>` / `REGENERATE <run_id>` |
 | Idempotency guard | Blocks if the Epic already has Jira children |
+
+### Clarification Loop (Phase 12)
+
+`app/clarification.py` is the core module.
+
+| Setting | Value |
+|---|---|
+| Enabled by default | `CLARIFICATION_ENABLED=True` in `app/feedback.py` |
+| Timeout | `CLARIFICATION_TIMEOUT_HOURS=24` (configurable per request) |
+| Control flag | `clarification_enabled` in `control_flags` table |
+| Telegram commands | `ANSWER <id> <text>` / `CANCEL <id>` / `CLARIFY <id>` |
+| Vagueness trigger (Epic) | Summary < 4 words OR no description OR description < 50 chars |
+| Ambiguity trigger (Story) | No acceptance criteria AND no description |
+| Review agent trigger | Agent returns `needs_clarification=true` in tool output |
+| Periodic expiry | Worker loop: every ~720 iterations (~1 hour) + startup |
+
+**Resume paths by context key:**
+- `pre_planning`: Epic re-runs from start; clarification answer injected into planning memory
+- `pre_suggest`: Story re-runs from start; clarification answer injected into suggestion memory
+- `pre_review`: Skip-to-review via `_story_review_and_release()` using `pr_url` from DB + GitHub diff
 
 ### Memory injection
 
