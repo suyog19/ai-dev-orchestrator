@@ -1424,3 +1424,213 @@ def create_jira_mapping_for_repo(repo_slug: str, body: JiraMappingBody):
         "capability_profile": profile,
         "recommendations": recommendations,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 18 Iteration 1 — Project activation workflow
+# ---------------------------------------------------------------------------
+
+class ProjectActivationBody(BaseModel):
+    jira_project_key: str
+    base_branch: str = "main"
+    environment: str = "dev"
+    auto_merge: bool = False
+
+
+@app.post("/admin/project-onboarding/{repo_slug:path}/activate", status_code=200)
+def activate_project(repo_slug: str, body: ProjectActivationBody):
+    """Activate an onboarded repo as a fully managed project.
+
+    Steps:
+    1. Verify onboarding completed for this repo.
+    2. Verify capability profile exists.
+    3. Create or update Jira repo mapping.
+    4. Verify mapping health.
+    5. Check branch protection.
+    6. Check deployment profile.
+    7. Return full activation report.
+
+    Requires X-Orchestrator-Admin-Key header.
+    """
+    from app.repo_mapping import get_all_mappings, add_mapping, update_mapping
+    from app.database import (
+        list_onboarding_runs,
+        get_active_capability_profile,
+        get_deployment_profile,
+        list_knowledge_snapshots,
+    )
+    from app.github_api import get_branch_protection
+
+    repo_slug = repo_slug.strip()
+    jira_key = body.jira_project_key.strip().upper()
+
+    if not repo_slug or "/" not in repo_slug:
+        raise HTTPException(status_code=422, detail="repo_slug must be in 'owner/repo' format")
+    if not jira_key:
+        raise HTTPException(status_code=422, detail="jira_project_key is required")
+
+    report: dict = {
+        "repo_slug": repo_slug,
+        "jira_project_key": jira_key,
+        "base_branch": body.base_branch,
+        "environment": body.environment,
+        "auto_merge": body.auto_merge,
+        "steps": {},
+        "recommendations": [],
+        "activated": False,
+    }
+
+    # --- Step 1: verify onboarding completed ---
+    runs = list_onboarding_runs(repo_slug=repo_slug, limit=5)
+    completed_run = next((r for r in runs if r["status"] == "COMPLETED"), None)
+    if not completed_run:
+        report["steps"]["onboarding"] = {
+            "ok": False,
+            "detail": "No completed onboarding run found. Run POST /admin/project-onboarding/start first.",
+        }
+        report["recommendations"].append("Complete project onboarding before activating.")
+        return report
+    report["steps"]["onboarding"] = {
+        "ok": True,
+        "run_id": completed_run["id"],
+        "completed_at": completed_run.get("completed_at"),
+        "profile_name": completed_run.get("capability_profile_name"),
+    }
+
+    # --- Step 2: verify capability profile exists ---
+    profile = get_active_capability_profile(repo_slug)
+    if not profile:
+        report["steps"]["capability_profile"] = {
+            "ok": False,
+            "detail": "No capability profile found. Re-run onboarding.",
+        }
+        report["recommendations"].append("No capability profile — re-run onboarding.")
+    else:
+        profile_name = profile["profile_name"]
+        report["steps"]["capability_profile"] = {
+            "ok": True,
+            "profile_name": profile_name,
+            "test_command": profile.get("test_command"),
+            "build_command": profile.get("build_command"),
+            "lint_command": profile.get("lint_command"),
+        }
+        if profile_name == "generic_unknown":
+            report["recommendations"].append(
+                "Profile is generic_unknown — add config/repo_command_hints.yaml to enable test/build/lint validation."
+            )
+
+    # --- Step 3: create or update Jira repo mapping ---
+    all_mappings = get_all_mappings()
+    existing = next(
+        (m for m in all_mappings
+         if m["jira_project_key"] == jira_key
+         and m["repo_slug"] == repo_slug
+         and m["is_active"]),
+        None,
+    )
+    if existing:
+        mapping = update_mapping(
+            existing["id"],
+            base_branch=body.base_branch,
+            auto_merge_enabled=body.auto_merge,
+        )
+        mapping_created = False
+    else:
+        mapping = add_mapping(
+            jira_project_key=jira_key,
+            repo_slug=repo_slug,
+            base_branch=body.base_branch,
+            auto_merge_enabled=body.auto_merge,
+            notes="Created via project activation (Phase 18)",
+        )
+        mapping_created = True
+
+    # --- Step 4: verify mapping health ---
+    mapping_ok = bool(mapping and mapping.get("is_active") and mapping.get("repo_slug"))
+    report["steps"]["mapping"] = {
+        "ok": mapping_ok,
+        "created": mapping_created,
+        "mapping_id": mapping["id"] if mapping else None,
+        "auto_merge_enabled": mapping.get("auto_merge_enabled") if mapping else None,
+    }
+    if mapping and mapping.get("auto_merge_enabled"):
+        report["recommendations"].append(
+            "auto_merge is enabled — ensure all agents approve reliably before enabling this."
+        )
+
+    # --- Step 5: check branch protection ---
+    branch_protection_ok = False
+    try:
+        bp = get_branch_protection(repo_slug, body.base_branch)
+        release_gate_required = bp.get("orchestrator_check_status", {}).get("release_gate_required", False)
+        branch_protection_ok = bp.get("protected", False) and release_gate_required
+        report["steps"]["branch_protection"] = {
+            "ok": branch_protection_ok,
+            "protected": bp.get("protected", False),
+            "release_gate_required": release_gate_required,
+            "warnings": bp.get("warnings", []),
+        }
+        if not release_gate_required:
+            report["recommendations"].append(
+                "Add orchestrator/release-gate as a required check in branch protection "
+                "(see docs/security/github-required-checks.md)."
+            )
+    except Exception as exc:
+        report["steps"]["branch_protection"] = {"ok": False, "detail": str(exc)}
+        report["recommendations"].append("Could not fetch branch protection — check GitHub token permissions.")
+
+    # --- Step 6: check deployment profile ---
+    deploy_profile = get_deployment_profile(repo_slug, body.environment)
+    if deploy_profile:
+        deploy_enabled = deploy_profile.get("enabled", False)
+        has_base_url = bool(deploy_profile.get("base_url"))
+        report["steps"]["deployment_profile"] = {
+            "ok": True,
+            "enabled": deploy_enabled,
+            "has_base_url": has_base_url,
+            "profile_id": deploy_profile.get("id"),
+        }
+        if deploy_enabled and not has_base_url:
+            report["recommendations"].append(
+                "Deployment profile is enabled but has no base_url — smoke tests will fail."
+            )
+        if not deploy_enabled:
+            report["recommendations"].append(
+                "Deployment validation is disabled (intentional or draft). "
+                "Set base_url and enable when a stable URL is available."
+            )
+    else:
+        report["steps"]["deployment_profile"] = {
+            "ok": False,
+            "detail": f"No deployment profile for environment='{body.environment}'. "
+                      "Create via POST /debug/deployment-profiles or run onboarding again.",
+        }
+        report["recommendations"].append(
+            f"No deployment profile for '{body.environment}' — deployment validation will be skipped."
+        )
+
+    # --- Knowledge snapshots summary ---
+    try:
+        snaps = list_knowledge_snapshots(repo_slug)
+        snap_kinds = [s["snapshot_kind"] for s in snaps]
+        report["steps"]["knowledge_snapshots"] = {
+            "ok": len(snaps) > 0,
+            "kinds": snap_kinds,
+            "count": len(snaps),
+        }
+        if "architecture" not in snap_kinds:
+            report["recommendations"].append("No architecture snapshot — re-run onboarding.")
+        if "coding_conventions" not in snap_kinds:
+            report["recommendations"].append("No coding conventions snapshot — re-run onboarding.")
+    except Exception as exc:
+        report["steps"]["knowledge_snapshots"] = {"ok": False, "detail": str(exc)}
+
+    # --- Final activated flag: onboarding + profile + active mapping minimum ---
+    profile_ok = report["steps"].get("capability_profile", {}).get("ok", False)
+    report["activated"] = bool(completed_run and profile_ok and mapping_ok)
+
+    logger.info(
+        "Project activation: repo=%s jira=%s activated=%s",
+        repo_slug, jira_key, report["activated"],
+    )
+    return report
