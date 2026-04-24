@@ -1260,3 +1260,160 @@ def review_architecture(
         raise RuntimeError("Architecture Agent returned no tool_use block")
 
     return tool_block.input
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — Onboarding architecture summary
+# ---------------------------------------------------------------------------
+
+_ONBOARDING_ARCHITECTURE_PROMPT = (
+    "You are a technical analyst performing a project onboarding scan. "
+    "You will be given a repo structure scan, detected capability profile, and key file contents. "
+    "Your job is to produce a concise, accurate architecture summary that will be used to inform "
+    "future AI-assisted code changes. Be specific. Flag genuine uncertainty as open questions — "
+    "do not invent certainty. Avoid generic boilerplate."
+)
+
+_ONBOARDING_ARCHITECTURE_TOOL = {
+    "name": "submit_architecture_snapshot",
+    "description": "Submit a structured architecture snapshot for a project onboarding scan.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "architecture_summary": {
+                "type": "string",
+                "description": "3-5 sentence summary of what the project does, its tech stack, and overall design",
+            },
+            "main_modules": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Key directories or modules (e.g. 'app/routes — FastAPI route handlers')",
+            },
+            "entry_points": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Main entry point files or commands",
+            },
+            "data_flow": {
+                "type": "string",
+                "description": "Brief description of how data moves through the system",
+            },
+            "test_strategy": {
+                "type": "string",
+                "description": "Observed test approach (framework, coverage style, test types)",
+            },
+            "deployment_notes": {
+                "type": "string",
+                "description": "Observed deployment files or configuration (Dockerfile, CI, hosting)",
+            },
+            "risks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Potential risks or concerns for automated changes (e.g. no tests, complex auth)",
+            },
+            "open_questions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Things that are unclear or need human confirmation before AI changes",
+            },
+        },
+        "required": [
+            "architecture_summary", "main_modules", "entry_points",
+            "data_flow", "test_strategy", "deployment_notes", "risks", "open_questions",
+        ],
+    },
+}
+
+
+def generate_onboarding_architecture_summary(
+    repo_path: str,
+    repo_slug: str,
+    structure_scan: dict,
+    profile: dict,
+) -> dict:
+    """Ask Claude to produce a structured architecture snapshot for project onboarding.
+
+    Args:
+        repo_path:      Path to cloned repo workspace.
+        repo_slug:      Owner/repo identifier for context.
+        structure_scan: Output of scan_repo_structure().
+        profile:        Output of detect_repo_capability_profile().
+
+    Returns the submit_architecture_snapshot tool input dict.
+    Raises RuntimeError if Claude returns no tool_use block.
+    """
+    primary_language = profile.get("primary_language", "unknown")
+
+    # Collect key file contents — README + entry points
+    key_files = _collect_key_files(repo_path, primary_language.capitalize())
+
+    # Also read package/build/config files
+    config_candidates = structure_scan.get("config_files", [])
+    for rel_path in config_candidates[:4]:
+        full = os.path.join(repo_path, rel_path)
+        content = _read_truncated(full, max_lines=60)
+        if content and not any(r == rel_path for r, _ in key_files):
+            key_files.append((rel_path, content))
+
+    file_sections = ""
+    for rel_path, content in key_files[:6]:
+        file_sections += f"\n--- {rel_path} ---\n{content}\n"
+
+    # Format structure scan for prompt
+    def _fmt_list(lst: list) -> str:
+        return ", ".join(lst[:10]) if lst else "(none)"
+
+    structure_block = (
+        f"Top-level dirs: {_fmt_list(structure_scan.get('top_level_dirs', []))}\n"
+        f"Config files: {_fmt_list(structure_scan.get('config_files', []))}\n"
+        f"Deploy files: {_fmt_list(structure_scan.get('deploy_files', []))}\n"
+        f"Routing/API files: {_fmt_list(structure_scan.get('routing_files', []))}\n"
+        f"Model files: {_fmt_list(structure_scan.get('model_files', []))}\n"
+        f"Service files: {_fmt_list(structure_scan.get('service_files', []))}\n"
+        f"Test files (sample): {_fmt_list(structure_scan.get('test_files', []))}\n"
+        f"Total files: {structure_scan.get('total_files', 0)}, "
+        f"source: {structure_scan.get('source_file_count', 0)}, "
+        f"tests: {structure_scan.get('test_file_count', 0)}"
+    )
+
+    profile_block = (
+        f"Profile: {profile.get('profile_name', 'unknown')}\n"
+        f"Language: {profile.get('primary_language', 'unknown')}, "
+        f"Framework: {profile.get('framework', 'unknown')}\n"
+        f"Test command: {profile.get('test_command') or '(none)'}\n"
+        f"Build command: {profile.get('build_command') or '(none)'}\n"
+        f"Lint command: {profile.get('lint_command') or '(none)'}"
+    )
+
+    user_content = (
+        f"Repo: {repo_slug}\n\n"
+        f"Capability profile:\n{profile_block}\n\n"
+        f"Repo structure:\n{structure_block}\n\n"
+        f"Key file contents:{file_sections}\n\n"
+        f"Call submit_architecture_snapshot with your structured analysis."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=[{
+            "type": "text",
+            "text": _ONBOARDING_ARCHITECTURE_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_ONBOARDING_ARCHITECTURE_TOOL],
+        tool_choice={"type": "tool", "name": "submit_architecture_snapshot"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Onboarding architecture summary done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Architecture summary returned no tool_use block")
+
+    return tool_block.input

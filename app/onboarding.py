@@ -4,7 +4,8 @@ import os
 import shutil
 import subprocess
 
-from app.database import update_onboarding_run, upsert_capability_profile
+from app.claude_client import generate_onboarding_architecture_summary
+from app.database import update_onboarding_run, upsert_capability_profile, upsert_knowledge_snapshot
 from app.repo_profiler import (
     detect_repo_capability_profile,
     get_test_command_for_profile,
@@ -54,6 +55,7 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
       2. Detect capability profile
       3. Command validation dry-run (test / build / lint)
       4. Repo structure scan (stored as structure_scan_json)
+      5. Architecture summary via Claude (stored as knowledge snapshot)
 
     Workspace is cleaned up in the finally block regardless of outcome.
     Status transitions are managed by the worker (_execute_onboarding).
@@ -161,6 +163,47 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
         logger.info(
             "Project onboarding structure scan done: run_id=%s total_files=%d dirs=%s",
             onboarding_run_id, structure["total_files"], structure["top_level_dirs"][:5],
+        )
+
+        # ------------------------------------------------------------------
+        # Step 5: architecture summary via Claude
+        # ------------------------------------------------------------------
+        update_onboarding_run(onboarding_run_id, current_step="architecture_summary")
+        arch = generate_onboarding_architecture_summary(
+            repo_path=repo_path,
+            repo_slug=repo_slug,
+            structure_scan=structure,
+            profile=profile,
+        )
+
+        arch_summary = arch.get("architecture_summary", "")
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug,
+            snapshot_kind="architecture",
+            summary=arch_summary,
+            details=json.dumps(arch),
+            source_files=json.dumps(structure.get("routing_files", []) + structure.get("config_files", [])),
+        )
+
+        # Also persist open_questions as a separate snapshot if any
+        open_questions = arch.get("open_questions", [])
+        if open_questions:
+            upsert_knowledge_snapshot(
+                repo_slug=repo_slug,
+                snapshot_kind="open_questions",
+                summary="\n".join(f"- {q}" for q in open_questions),
+                details=json.dumps({"open_questions": open_questions}),
+                source_files=None,
+            )
+
+        update_onboarding_run(
+            onboarding_run_id,
+            current_step="architecture_summarized",
+            architecture_summary=arch_summary,
+        )
+        logger.info(
+            "Project onboarding architecture summary done: run_id=%s (%d chars, %d open questions)",
+            onboarding_run_id, len(arch_summary), len(open_questions),
         )
 
     finally:
