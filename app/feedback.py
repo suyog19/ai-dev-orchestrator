@@ -50,6 +50,25 @@ class FeedbackType:
     # Release Gate signals (Phase 10)
     RELEASE_DECISION            = "release_decision"
     RELEASE_BLOCKING_GATE_COUNT = "release_blocking_gate_count"
+    # Clarification signals (Phase 12)
+    CLARIFICATION_REQUESTED     = "clarification_requested"
+    CLARIFICATION_ANSWERED      = "clarification_answered"
+    CLARIFICATION_CANCELLED     = "clarification_cancelled"
+    CLARIFICATION_EXPIRED       = "clarification_expired"
+    CLARIFICATION_COUNT         = "clarification_count"
+
+
+class ClarificationStatus:
+    PENDING   = "PENDING"
+    ANSWERED  = "ANSWERED"
+    CANCELLED = "CANCELLED"
+    EXPIRED   = "EXPIRED"
+
+
+class ClarificationContextKey:
+    PRE_PLANNING    = "pre_planning"
+    PRE_SUGGEST     = "pre_suggest"
+    PRE_REVIEW      = "pre_review"
 
 
 class FailureCategory:
@@ -62,6 +81,8 @@ class FailureCategory:
     APPROVAL_REJECTED           = "approval_rejected"
     APPROVAL_REGENERATED        = "approval_regenerated"
     WORKER_INTERRUPTED          = "worker_interrupted"
+    CLARIFICATION_TIMEOUT       = "clarification_timeout"
+    CLARIFICATION_CANCELLED     = "clarification_cancelled"
     UNKNOWN                     = "unknown"
 
 
@@ -143,6 +164,10 @@ TEST_QUALITY_BLOCKS_MERGE = True  # TEST_QUALITY_APPROVED required for auto-merg
 # Phase 10 config
 ARCHITECTURE_REVIEW_REQUIRED     = True  # every story_implementation run triggers architecture review
 ARCHITECTURE_REVIEW_BLOCKS_MERGE = True  # ARCHITECTURE_APPROVED required for auto-merge
+
+# Phase 12 — Clarification config
+CLARIFICATION_ENABLED        = True   # master switch; set False to disable all clarification checkpoints
+CLARIFICATION_TIMEOUT_HOURS  = 24     # hours before a PENDING clarification expires
 
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5

@@ -111,6 +111,10 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision           VARCHAR(30)  NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision_reason    TEXT         NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decided_at         TIMESTAMP    NULL",
+                # Phase 12 — Clarification loop
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS waiting_for_clarification  BOOLEAN      NOT NULL DEFAULT FALSE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS active_clarification_id    INTEGER      NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS summary                    TEXT         NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -305,6 +309,31 @@ def init_db(retries: int = 5, delay: int = 3):
                     updated_at TIMESTAMP    NOT NULL DEFAULT NOW()
                 )
             """)
+            # Phase 12 — Clarification requests
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clarification_requests (
+                    id                  SERIAL PRIMARY KEY,
+                    run_id              INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    workflow_type       VARCHAR(100)  NULL,
+                    issue_key           VARCHAR(100)  NULL,
+                    repo_slug           VARCHAR(200)  NULL,
+                    context_key         VARCHAR(50)   NULL,
+                    question            TEXT          NOT NULL,
+                    context_summary     TEXT          NULL,
+                    options_json        TEXT          NULL,
+                    status              VARCHAR(40)   NOT NULL DEFAULT 'PENDING',
+                    answer_text         TEXT          NULL,
+                    answered_at         TIMESTAMP     NULL,
+                    telegram_message_id VARCHAR(100)  NULL,
+                    created_at          TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    expires_at          TIMESTAMP     NULL
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clarification_run_id "
+                "ON clarification_requests (run_id)"
+            )
+
             # Seed default control flags from env (only if not already set)
             import os as _os
             _defaults = {
@@ -313,6 +342,7 @@ def init_db(retries: int = 5, delay: int = 3):
                 "allow_telegram_commands": _os.environ.get("ALLOW_TELEGRAM_COMMANDS", "true"),
                 "allow_github_writes":     _os.environ.get("ALLOW_GITHUB_WRITES", "true"),
                 "allow_auto_merge":        _os.environ.get("ALLOW_AUTO_MERGE", "true"),
+                "clarification_enabled":   _os.environ.get("CLARIFICATION_ENABLED", "true"),
             }
             for k, v in _defaults.items():
                 cur.execute(

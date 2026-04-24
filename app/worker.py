@@ -87,7 +87,7 @@ def _execute(job: dict):
             with conn.cursor() as cur:
                 cur.execute("SELECT status FROM workflow_runs WHERE id=%s", (run_id,))
                 row = cur.fetchone()
-        if row and row[0] in ("FAILED", "WAITING_FOR_APPROVAL"):
+        if row and row[0] in ("FAILED", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER_INPUT"):
             logger.info(
                 "Workflow handler set terminal status %s (run_id=%s) — not overwriting with COMPLETED",
                 row[0], run_id,
