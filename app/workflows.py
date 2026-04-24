@@ -124,19 +124,34 @@ def _format_review_comment(verdict: dict) -> str:
 _TEST_FILE_PATTERNS = ("tests/", "test_", "_test.py", "/test")
 
 def _is_test_file(path: str) -> bool:
-    """Return True if a file path looks like a test file."""
-    return any(p in path for p in _TEST_FILE_PATTERNS)
+    """Return True if a file path looks like a test file (legacy — no profile context)."""
+    return any(p in path for p in _PYTHON_TEST_PATTERNS)
 
 
-_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", ".skip(", "skipTest(")
+# Phase 10 (Python) + Phase 15 (Java/Node) skip patterns
+_PYTHON_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", "skipTest(")
+_JAVA_SKIP_PATTERNS   = ("@Disabled", "@Ignore", "@IgnoreRest")
+_NODE_SKIP_PATTERNS   = ("it.skip(", "test.skip(", "describe.skip(", "xit(", "xdescribe(", "xtest(", ".todo(")
+_SKIP_PATTERNS = _PYTHON_SKIP_PATTERNS + _JAVA_SKIP_PATTERNS + _NODE_SKIP_PATTERNS
 
-def _detect_skipped_tests(diff: str, test_output: str) -> bool:
-    """Return True if skipped tests are detected in the diff or test output."""
+
+def _detect_skipped_tests(diff: str, test_output: str, profile_name: str | None = None) -> bool:
+    """Return True if skipped tests are detected in the diff or test output.
+
+    Uses profile-aware patterns: adds Java (@Disabled/@Ignore) and Node (it.skip, xtest, etc.)
+    patterns on top of the base Python patterns. The 'skipped' keyword check is preserved
+    for test runner output that already reports skipped counts.
+    """
     combined = (diff or "") + (test_output or "")
-    lower = combined.lower()
-    if "skipped" in lower:
+    if profile_name in ("java_maven", "java_gradle"):
+        patterns = _PYTHON_SKIP_PATTERNS + _JAVA_SKIP_PATTERNS
+    elif profile_name == "node_react":
+        patterns = _PYTHON_SKIP_PATTERNS + _NODE_SKIP_PATTERNS
+    else:
+        patterns = _PYTHON_SKIP_PATTERNS
+    if "skipped" in combined.lower():
         return True
-    return any(p in combined for p in _SKIP_PATTERNS)
+    return any(p in combined for p in patterns)
 
 
 def _build_test_quality_package(
@@ -163,7 +178,7 @@ def _build_test_quality_package(
 
     output = (final_test_result.get("output") or "").strip()
     output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
-    skipped = _detect_skipped_tests(diff_block, output)
+    skipped = _detect_skipped_tests(diff_block, output, profile_name)
 
     return {
         "story_context": {
