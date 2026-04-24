@@ -21,9 +21,11 @@ from app.database import (
     store_test_quality_review,
     store_architecture_review,
 )
-from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision
+from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision, ClarificationContextKey
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
+from app.clarification import pause_for_clarification, ClarificationRequested, is_clarification_enabled
+from app.database import get_active_clarification
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -357,6 +359,48 @@ def _format_architecture_comment(verdict: dict) -> str:
     )
 
 
+def _check_epic_vagueness(summary: str, description: str | None) -> str | None:
+    """Return a clarification question if the Epic is too vague for safe decomposition, else None."""
+    summary_words = (summary or "").split()
+    desc = (description or "").strip()
+
+    if len(summary_words) < 4 and not desc:
+        return (
+            f"The Epic summary '{summary}' is very short and has no description. "
+            f"What is the detailed scope and expected outcomes? "
+            f"Options: 1. Describe the full goal  2. List key deliverables  3. Specify target users and success criteria"
+        )
+
+    if not desc or len(desc) < 50:
+        return (
+            f"The Epic '{summary}' has no detailed description or acceptance criteria. "
+            f"What are the expected deliverables and how should completion be measured?"
+        )
+
+    return None
+
+
+def _check_story_ambiguity(summary: str, story_details: dict) -> str | None:
+    """Return a clarification question if the Story is too ambiguous for safe implementation, else None."""
+    description = (story_details.get("description") or "").strip()
+    acceptance_criteria = story_details.get("acceptance_criteria") or []
+    summary_words = (summary or "").split()
+
+    if len(summary_words) < 4 and not description and not acceptance_criteria:
+        return (
+            f"Story '{summary}' has a very short summary and no description or acceptance criteria. "
+            f"What specific change should be made and what is the expected behaviour after implementation?"
+        )
+
+    if not acceptance_criteria and not description:
+        return (
+            f"Story '{summary}' has no acceptance criteria or description. "
+            f"What is the expected behaviour after implementation, and how should it be tested?"
+        )
+
+    return None
+
+
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     status = test_result["status"]
     output = (test_result.get("output") or "").strip()
@@ -509,8 +553,54 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
 
+    # --- Fetch story details early for clarification check ---
+    early_story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        early_story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("story_implementation: early get_issue_details failed (non-fatal) — %s", exc)
+
+    # --- Resume detection: inject answered clarification into suggestion context ---
+    clarification_answer_text: str | None = None
+    try:
+        active_clar = get_active_clarification(run_id)
+        if active_clar and active_clar["status"] == "ANSWERED":
+            clarification_answer_text = active_clar.get("answer_text")
+            logger.info(
+                "story_implementation: resumed with answered clarification %s — injecting answer",
+                active_clar["id"],
+            )
+            send_message(
+                "clarification_resumed", "RUNNING",
+                f"{issue_key}: resuming with clarification answer — {clarification_answer_text}",
+            )
+    except Exception as exc:
+        logger.warning("story_implementation: clarification resume check failed (non-fatal) — %s", exc)
+
+    # --- Clarification checkpoint: pause if Story is too ambiguous ---
+    if clarification_answer_text is None and is_clarification_enabled():
+        vague_question = _check_story_ambiguity(summary, early_story_details)
+        if vague_question:
+            logger.info("story_implementation: Story ambiguous — pausing for clarification (run_id=%s)", run_id)
+            pause_for_clarification(
+                run_id=run_id,
+                question=vague_question,
+                context_key=ClarificationContextKey.PRE_SUGGEST,
+                context_summary=f"Story {issue_key}: {summary}",
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
+
+    # Inject clarification answer into memory context for Developer Agent
+    suggest_memory = execution_memory
+    if clarification_answer_text:
+        answer_note = f"User clarification for this story: {clarification_answer_text}"
+        suggest_memory = f"{suggest_memory}\n\n{answer_note}" if suggest_memory else answer_note
+
     update_run_step(run_id, "suggesting")
-    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=execution_memory)
+    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=suggest_memory)
     changes = suggestion_result.get("changes", [])
     suggestion_summary = suggestion_result.get("summary", "")
     files_str = ", ".join(c.get("file", "") for c in changes)
@@ -1101,10 +1191,56 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     except Exception as mem_exc:
         logger.warning("epic_breakdown: get_planning_memory failed (non-fatal): %s", mem_exc)
 
+    # --- Fetch Epic details for vagueness check ---
+    epic_description: str | None = None
+    try:
+        epic_details = get_issue_details(issue_key)
+        epic_description = epic_details.get("description")
+    except Exception as exc:
+        logger.warning("epic_breakdown: get_issue_details failed (non-fatal) — %s", exc)
+
+    # --- Resume detection: inject answered clarification into planning context ---
+    clarification_answer_text: str | None = None
+    try:
+        active_clar = get_active_clarification(run_id)
+        if active_clar and active_clar["status"] == "ANSWERED":
+            clarification_answer_text = active_clar.get("answer_text")
+            logger.info(
+                "epic_breakdown: resumed with answered clarification %s — injecting answer",
+                active_clar["id"],
+            )
+            send_message(
+                "clarification_resumed", "RUNNING",
+                f"{issue_key}: resuming epic planning with clarification answer — {clarification_answer_text}",
+            )
+    except Exception as exc:
+        logger.warning("epic_breakdown: clarification resume check failed (non-fatal) — %s", exc)
+
+    # --- Clarification checkpoint: pause if Epic is too vague ---
+    if clarification_answer_text is None and is_clarification_enabled():
+        vague_question = _check_epic_vagueness(summary, epic_description)
+        if vague_question:
+            logger.info("epic_breakdown: Epic vague — pausing for clarification (run_id=%s)", run_id)
+            pause_for_clarification(
+                run_id=run_id,
+                question=vague_question,
+                context_key=ClarificationContextKey.PRE_PLANNING,
+                context_summary=f"Epic {issue_key}: {summary}",
+                workflow_type="epic_breakdown",
+                issue_key=issue_key,
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
+
+    # Inject clarification answer into memory context for planning prompt
+    plan_memory = memory_context
+    if clarification_answer_text:
+        answer_note = f"User clarification for this epic: {clarification_answer_text}"
+        plan_memory = f"{plan_memory}\n\n{answer_note}" if plan_memory else answer_note
+
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")
     try:
-        plan = plan_epic_breakdown(issue_key, summary, memory_context=memory_context)
+        plan = plan_epic_breakdown(issue_key, summary, memory_context=plan_memory)
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")
