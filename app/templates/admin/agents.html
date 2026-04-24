@@ -1,0 +1,96 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Agent Reviews{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Agent Reviews</h1>
+  <p class="subtitle">{{ reviews|length }} results</p>
+</div>
+
+<!-- Agent type tabs -->
+<div style="display:flex; gap:4px; margin-bottom:16px;">
+  <a href="/admin/ui/agents?agent_type=reviewer" class="btn btn-sm {% if agent_type == 'reviewer' %}btn-primary{% else %}btn-ghost{% endif %}">Reviewer</a>
+  <a href="/admin/ui/agents?agent_type=test_quality" class="btn btn-sm {% if agent_type == 'test_quality' %}btn-primary{% else %}btn-ghost{% endif %}">Test Quality</a>
+  <a href="/admin/ui/agents?agent_type=architecture" class="btn btn-sm {% if agent_type == 'architecture' %}btn-primary{% else %}btn-ghost{% endif %}">Architecture</a>
+</div>
+
+<!-- Filters -->
+<div class="card" style="margin-bottom:16px;">
+  <form method="get" action="/admin/ui/agents" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+    <input type="hidden" name="agent_type" value="{{ agent_type }}">
+    <div class="form-group" style="margin:0; min-width:130px;">
+      <label>Run ID</label>
+      <input type="number" name="run_id_filter" value="{{ filters.run_id or '' }}" placeholder="e.g. 42">
+    </div>
+    <div class="form-group" style="margin:0; min-width:200px;">
+      <label>Repo Slug</label>
+      <input type="text" name="repo_slug" value="{{ filters.repo_slug }}" placeholder="owner/repo">
+    </div>
+    <div class="form-group" style="margin:0; min-width:140px;">
+      <label>Status</label>
+      <input type="text" name="status" value="{{ filters.status }}" placeholder="e.g. BLOCKED">
+    </div>
+    <div class="form-group" style="margin:0; min-width:80px;">
+      <label>Limit</label>
+      <select name="limit">
+        {% for n in [20, 50, 100] %}<option value="{{ n }}" {% if filters.limit == n %}selected{% endif %}>{{ n }}</option>{% endfor %}
+      </select>
+    </div>
+    <div style="padding-bottom:1px;">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/admin/ui/agents?agent_type={{ agent_type }}" class="btn btn-ghost btn-sm" style="margin-left:4px;">Reset</a>
+    </div>
+  </form>
+</div>
+
+{% if reviews %}
+<div class="card" style="padding:0;">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th>
+          <th>Repo</th>
+          <th>Issue</th>
+          <th>Status</th>
+          <th>Risk/Confidence</th>
+          <th>Summary</th>
+          <th>PR</th>
+          <th>When</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in reviews %}
+        <tr>
+          <td><a href="/admin/ui/runs/{{ r.run_id }}">#{{ r.run_id }}</a></td>
+          <td style="font-size:11px;"><code>{{ r.repo_slug or '—' }}</code></td>
+          <td style="font-size:11px;"><code>{{ r.story_key or '—' }}</code></td>
+          <td>
+            {% set s = r.review_status or r.quality_status or r.architecture_status or '' %}
+            {% if 'APPROVED' in s %}<span class="pill pill-green" style="font-size:10px;">{{ s }}</span>
+            {% elif 'BLOCKED' in s %}<span class="pill pill-red" style="font-size:10px;">{{ s }}</span>
+            {% elif 'WEAK' in s or 'NEEDS' in s %}<span class="pill pill-yellow" style="font-size:10px;">{{ s }}</span>
+            {% elif s %}<span class="pill pill-gray" style="font-size:10px;">{{ s }}</span>
+            {% else %}—{% endif %}
+          </td>
+          <td style="font-size:11px;">{{ r.risk_level or r.confidence_level or '—' }}</td>
+          <td style="font-size:12px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="{{ r.summary or '' }}">
+            {{ (r.summary or '—')[:100] }}
+          </td>
+          <td>
+            {% if r.pr_url %}<a href="{{ r.pr_url }}" target="_blank" rel="noopener" style="font-size:11px;">PR</a>{% else %}—{% endif %}
+          </td>
+          <td class="text-muted" style="font-size:11px; white-space:nowrap;">{{ (r.created_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="placeholder-message">
+  <p>No {{ agent_type }} reviews match the current filters.</p>
+</div>
+{% endif %}
+{% endblock %}

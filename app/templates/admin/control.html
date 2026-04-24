@@ -1,0 +1,123 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Control{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Control</h1>
+  <p class="subtitle">Runtime flags and automation controls</p>
+</div>
+
+{% if paused %}
+<div class="alert alert-error" style="font-size:14px; font-weight:600;">
+  ORCHESTRATOR IS PAUSED — Jira webhooks and Telegram commands are blocked.
+</div>
+{% else %}
+<div class="alert alert-success">
+  Orchestrator is running normally.
+</div>
+{% endif %}
+
+<!-- Current flags -->
+<div class="card-grid">
+  <div class="stat-card">
+    <div class="stat-label">Orchestrator</div>
+    <div style="margin-top:8px;">
+      {% if paused %}<span class="pill pill-red">PAUSED</span>{% else %}<span class="pill pill-green">RUNNING</span>{% endif %}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">GitHub Writes</div>
+    <div style="margin-top:8px;">
+      {% if github_writes %}<span class="pill pill-green">ENABLED</span>{% else %}<span class="pill pill-red">DISABLED</span>{% endif %}
+    </div>
+    <div class="text-muted" style="font-size:11px; margin-top:4px;">via ALLOW_GITHUB_WRITES env</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Auto-Merge</div>
+    <div style="margin-top:8px;">
+      {% if auto_merge %}<span class="pill pill-green">ENABLED</span>{% else %}<span class="pill pill-yellow">DISABLED</span>{% endif %}
+    </div>
+    <div class="text-muted" style="font-size:11px; margin-top:4px;">via ALLOW_AUTO_MERGE env</div>
+  </div>
+</div>
+
+<!-- Pause / Resume -->
+<div class="card">
+  <h2>Pause / Resume Orchestrator</h2>
+  <p style="font-size:13px; color:#6b7280; margin-bottom:16px;">
+    Pausing blocks all new Jira webhook triggers and Telegram approval commands.
+    Running workflows are not interrupted — only new ones are blocked.
+  </p>
+  <div style="display:flex; gap:12px; flex-wrap:wrap;">
+    <form method="post" action="/admin/ui/control/pause"
+          onsubmit="return confirm('Pause the orchestrator? New workflows will be blocked.')">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="btn btn-danger btn-sm" {% if paused %}disabled{% endif %}>Pause Orchestrator</button>
+    </form>
+    <form method="post" action="/admin/ui/control/resume"
+          onsubmit="return confirm('Resume the orchestrator? This will allow new workflows again.')">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="btn btn-primary btn-sm" {% if not paused %}disabled{% endif %}>Resume Orchestrator</button>
+    </form>
+  </div>
+</div>
+
+<!-- All control flags from DB -->
+{% if flags %}
+<div class="card">
+  <h2>All Control Flags</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Key</th><th>Value</th><th>Updated At</th></tr>
+      </thead>
+      <tbody>
+        {% for key, info in flags.items() | sort %}
+        <tr>
+          <td><code>{{ key }}</code></td>
+          <td>
+            {% if info.value in ('true', 'false') %}
+              {% if info.value == 'true' %}
+                <span class="pill pill-{% if 'paused' in key %}red{% else %}green{% endif %}">{{ info.value }}</span>
+              {% else %}
+                <span class="pill pill-{% if 'paused' in key %}green{% else %}gray{% endif %}">{{ info.value }}</span>
+              {% endif %}
+            {% else %}
+              <code>{{ info.value }}</code>
+            {% endif %}
+          </td>
+          <td class="text-muted" style="font-size:11px;">{{ (info.updated_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Environment variables note -->
+<div class="card">
+  <h2>Environment Variables</h2>
+  <p style="font-size:13px; color:#6b7280;">
+    The following flags are controlled via environment variables on the VM and require a redeploy to change.
+    They cannot be changed from this UI.
+  </p>
+  <table style="width:auto; margin-top:12px;">
+    <tbody>
+      <tr>
+        <td style="padding:4px 16px 4px 0; color:#6b7280;">ALLOW_GITHUB_WRITES</td>
+        <td><code>{{ 'true' if github_writes else 'false' }}</code></td>
+      </tr>
+      <tr>
+        <td style="padding:4px 16px 4px 0; color:#6b7280;">ALLOW_AUTO_MERGE</td>
+        <td><code>{{ 'true' if auto_merge else 'false' }}</code></td>
+      </tr>
+      <tr>
+        <td style="padding:4px 16px 4px 0; color:#6b7280;">ENV_NAME</td>
+        <td><code>{{ env_name }}</code></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -22,11 +22,15 @@ from app.ui_auth import (
     _LoginRedirect,
 )
 from app.database import (
-    get_overview_stats, get_all_control_flags,
+    get_overview_stats, get_all_control_flags, set_control_flag,
     list_workflow_runs_for_ui, get_workflow_run_detail,
     list_planning_runs, get_planning_run_detail,
     list_clarifications,
     mark_clarification_answered, mark_clarification_cancelled,
+    list_agent_reviews, list_test_quality_reviews, list_architecture_reviews,
+    list_github_status_updates, list_security_events,
+    list_memory_snapshots, list_feedback_events, add_manual_memory,
+    record_security_event, is_paused,
 )
 
 logger = logging.getLogger("orchestrator.ui")
@@ -379,3 +383,281 @@ async def ui_resend_clarification(
     if msg_id:
         update_clarification_telegram_id(clar_id, msg_id)
     return RedirectResponse(url="/admin/ui/clarifications", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Agent reviews page (Iteration 6)
+# ---------------------------------------------------------------------------
+
+@router.get("/agents", response_class=HTMLResponse)
+def agents_page(
+    request: Request,
+    agent_type: str = "reviewer",
+    status: str = "",
+    repo_slug: str = "",
+    run_id_filter: int | None = None,
+    limit: int = 20,
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    run_id_arg = run_id_filter if run_id_filter else None
+    repo_arg = repo_slug or None
+    status_arg = status or None
+
+    if agent_type == "test_quality":
+        reviews = list_test_quality_reviews(run_id=run_id_arg, repo_slug=repo_arg,
+                                             quality_status=status_arg, limit=limit)
+    elif agent_type == "architecture":
+        reviews = list_architecture_reviews(run_id=run_id_arg, repo_slug=repo_arg,
+                                             architecture_status=status_arg, limit=limit)
+    else:
+        agent_type = "reviewer"
+        reviews = list_agent_reviews(run_id=run_id_arg, repo_slug=repo_arg,
+                                      review_status=status_arg, limit=limit)
+
+    return templates.TemplateResponse("admin/agents.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "agents",
+        "agent_type": agent_type,
+        "reviews": reviews,
+        "filters": {"status": status, "repo_slug": repo_slug,
+                    "run_id": run_id_filter, "limit": limit},
+    })
+
+
+# ---------------------------------------------------------------------------
+# GitHub statuses page (Iteration 7)
+# ---------------------------------------------------------------------------
+
+@router.get("/github", response_class=HTMLResponse)
+def github_page(request: Request, run_id_filter: int | None = None):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    statuses = list_github_status_updates(run_id_filter) if run_id_filter else []
+    return templates.TemplateResponse("admin/github.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "github",
+        "statuses": statuses,
+        "run_id_filter": run_id_filter or "",
+    })
+
+
+@router.post("/github/republish", response_class=HTMLResponse)
+async def ui_republish_github_statuses(
+    request: Request,
+    run_id: int = Form(...),
+    repo_slug_val: str = Form(alias="repo_slug"),
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "github", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.github_status_publisher import publish_github_statuses_for_run
+    result = publish_github_statuses_for_run(run_id, repo_slug_val)
+    return RedirectResponse(url=f"/admin/ui/github?run_id_filter={run_id}", status_code=302)
+
+
+@router.post("/github/validate", response_class=HTMLResponse)
+async def ui_validate_branch_protection(
+    request: Request,
+    repo_slug_val: str = Form(alias="repo_slug"),
+    branch: str = Form(default="main"),
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "github", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.github_api import get_branch_protection
+    result = get_branch_protection(repo_slug_val, branch)
+    return templates.TemplateResponse("admin/github.html", {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": "github",
+        "statuses": [],
+        "run_id_filter": "",
+        "branch_protection_result": result,
+        "branch_protection_repo": repo_slug_val,
+        "branch_protection_branch": branch,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Memory page (Iteration 8)
+# ---------------------------------------------------------------------------
+
+@router.get("/memory", response_class=HTMLResponse)
+def memory_page(request: Request, scope_type: str = "", scope_key: str = ""):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    snapshots = list_memory_snapshots(scope_type=scope_type or None, scope_key=scope_key or None)
+    feedback = list_feedback_events(limit=30)
+    return templates.TemplateResponse("admin/memory.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "memory",
+        "snapshots": snapshots,
+        "feedback": feedback,
+        "filters": {"scope_type": scope_type, "scope_key": scope_key},
+    })
+
+
+@router.post("/memory/note", response_class=HTMLResponse)
+async def ui_add_memory_note(
+    request: Request,
+    scope_type: str = Form(...),
+    scope_key: str = Form(...),
+    content: str = Form(...),
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "memory", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    if content.strip():
+        add_manual_memory(scope_type, scope_key, content.strip())
+    return RedirectResponse(url="/admin/ui/memory", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Security page (Iteration 9)
+# ---------------------------------------------------------------------------
+
+@router.get("/security", response_class=HTMLResponse)
+def security_page(
+    request: Request,
+    event_type: str = "",
+    source: str = "",
+    status: str = "",
+    limit: int = 50,
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    events = list_security_events(
+        event_type=event_type or None,
+        source=source or None,
+        status=status or None,
+        limit=limit,
+    )
+    return templates.TemplateResponse("admin/security.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "security",
+        "events": events,
+        "filters": {"event_type": event_type, "source": source, "status": status, "limit": limit},
+    })
+
+
+# ---------------------------------------------------------------------------
+# Control page (Iteration 10)
+# ---------------------------------------------------------------------------
+
+@router.get("/control", response_class=HTMLResponse)
+def control_page(request: Request):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    flags = get_all_control_flags()
+    paused = is_paused()
+    github_writes = os.environ.get("ALLOW_GITHUB_WRITES", "true").lower() == "true"
+    auto_merge = os.environ.get("ALLOW_AUTO_MERGE", "true").lower() == "true"
+    return templates.TemplateResponse("admin/control.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "control",
+        "flags": flags,
+        "paused": paused,
+        "github_writes": github_writes,
+        "auto_merge": auto_merge,
+    })
+
+
+@router.post("/control/pause", response_class=HTMLResponse)
+async def ui_pause(request: Request, csrf_submitted: str = Form(alias="csrf")):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "control", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    set_control_flag("orchestrator_paused", "true")
+    record_security_event("automation_paused_jira_blocked", "ui",
+                          actor=request.client.host if request.client else "unknown",
+                          endpoint="/admin/ui/control/pause", method="POST",
+                          status="PAUSED")
+    return RedirectResponse(url="/admin/ui/control", status_code=302)
+
+
+@router.post("/control/resume", response_class=HTMLResponse)
+async def ui_resume(request: Request, csrf_submitted: str = Form(alias="csrf")):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "control", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    set_control_flag("orchestrator_paused", "false")
+    record_security_event("automation_paused_jira_blocked", "ui",
+                          actor=request.client.host if request.client else "unknown",
+                          endpoint="/admin/ui/control/resume", method="POST",
+                          status="RESUMED")
+    return RedirectResponse(url="/admin/ui/control", status_code=302)

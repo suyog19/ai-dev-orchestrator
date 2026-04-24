@@ -2032,6 +2032,88 @@ def get_execution_memory(repo_slug: str) -> str:
     return block
 
 
+def list_memory_snapshots(scope_type: str | None = None, scope_key: str | None = None) -> list[dict]:
+    """Return memory_snapshots rows, optionally filtered."""
+    conditions = []
+    params: list = []
+    if scope_type:
+        conditions.append("scope_type = %s")
+        params.append(scope_type)
+    if scope_key:
+        conditions.append("scope_key = %s")
+        params.append(scope_key)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, scope_type, scope_key, memory_kind, source,
+                       summary, evidence_json, created_at, updated_at
+                FROM memory_snapshots
+                {where}
+                ORDER BY scope_type, scope_key, memory_kind
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":          r[0],
+            "scope_type":  r[1],
+            "scope_key":   r[2],
+            "memory_kind": r[3],
+            "source":      r[4],
+            "summary":     r[5],
+            "evidence":    json.loads(r[6]) if r[6] else None,
+            "created_at":  r[7].isoformat() if r[7] else None,
+            "updated_at":  r[8].isoformat() if r[8] else None,
+        }
+        for r in rows
+    ]
+
+
+def list_feedback_events(
+    source_type: str | None = None,
+    repo_slug: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return feedback_events rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+    if source_type:
+        conditions.append("source_type = %s")
+        params.append(source_type)
+    if repo_slug:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(min(limit, 200))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, source_type, source_run_id, repo_slug, feedback_type, value_json, created_at
+                FROM feedback_events
+                {where}
+                ORDER BY id DESC LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":           r[0],
+            "source_type":  r[1],
+            "source_run_id": r[2],
+            "repo_slug":    r[3],
+            "feedback_type": r[4],
+            "value":        json.loads(r[5]) if r[5] else None,
+            "created_at":   r[6].isoformat() if r[6] else None,
+        }
+        for r in rows
+    ]
+
+
 def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
     """Upsert a human-authored memory note for the given scope.
 

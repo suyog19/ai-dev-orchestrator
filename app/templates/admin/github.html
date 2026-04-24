@@ -1,0 +1,117 @@
+{% extends "admin/base.html" %}
+
+{% block title %}GitHub Statuses{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>GitHub Statuses</h1>
+  <p class="subtitle">Commit status publishing and branch protection</p>
+</div>
+
+<!-- Look up statuses for a run -->
+<div class="card">
+  <h2>Inspect Run Statuses</h2>
+  <form method="get" action="/admin/ui/github" style="display:flex; gap:8px; align-items:flex-end;">
+    <div class="form-group" style="margin:0; min-width:140px;">
+      <label>Run ID</label>
+      <input type="number" name="run_id_filter" value="{{ run_id_filter }}" placeholder="e.g. 42" required>
+    </div>
+    <button type="submit" class="btn btn-primary btn-sm" style="margin-bottom:1px;">Load</button>
+  </form>
+</div>
+
+<!-- Statuses for this run -->
+{% if run_id_filter %}
+<div class="card">
+  <h2>GitHub Statuses for Run #{{ run_id_filter }}</h2>
+  {% if statuses %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Context</th><th>State</th><th>Description</th><th>Published</th></tr>
+      </thead>
+      <tbody>
+        {% for gs in statuses %}
+        <tr>
+          <td><code style="font-size:12px;">{{ gs.context }}</code></td>
+          <td>
+            {% if gs.state == 'success' %}<span class="pill pill-green">{{ gs.state }}</span>
+            {% elif gs.state == 'failure' %}<span class="pill pill-red">{{ gs.state }}</span>
+            {% elif gs.state == 'pending' %}<span class="pill pill-yellow">{{ gs.state }}</span>
+            {% else %}<span class="pill pill-gray">{{ gs.state }}</span>{% endif %}
+          </td>
+          <td style="font-size:12px;">{{ gs.description or '—' }}</td>
+          <td class="text-muted" style="font-size:11px;">{{ (gs.created_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <!-- Republish form -->
+  <div style="margin-top:16px;">
+    <form method="post" action="/admin/ui/github/republish"
+          onsubmit="return confirm('Republish GitHub statuses for this run?')">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="run_id" value="{{ run_id_filter }}">
+      <div style="display:flex; gap:8px; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:220px;">
+          <label>Repo Slug</label>
+          <input type="text" name="repo_slug" value="{{ statuses[0].repo_slug if statuses else '' }}" placeholder="owner/repo" required>
+        </div>
+        <button type="submit" class="btn btn-warning btn-sm" style="margin-bottom:1px;">Republish Statuses</button>
+      </div>
+    </form>
+  </div>
+  {% else %}
+  <p class="text-muted">No statuses found for run #{{ run_id_filter }}.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Branch protection validation -->
+<div class="card">
+  <h2>Branch Protection Check</h2>
+  <form method="post" action="/admin/ui/github/validate"
+        onsubmit="return confirm('Check branch protection?')">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+      <div class="form-group" style="margin:0; min-width:220px;">
+        <label>Repo Slug</label>
+        <input type="text" name="repo_slug" value="{{ branch_protection_repo or '' }}" placeholder="owner/repo" required>
+      </div>
+      <div class="form-group" style="margin:0; min-width:120px;">
+        <label>Branch</label>
+        <input type="text" name="branch" value="{{ branch_protection_branch or 'main' }}" placeholder="main" required>
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm" style="margin-bottom:1px;">Validate</button>
+    </div>
+  </form>
+
+  {% if branch_protection_result %}
+  <div style="margin-top:16px;">
+    {% set bp = branch_protection_result %}
+    {% if bp.error %}
+    <div class="alert alert-warning">{{ bp.error }}</div>
+    {% else %}
+    <div style="font-size:13px;">
+      <p><strong>Protected:</strong>
+        {% if bp.protected %}<span class="pill pill-green">YES</span>{% else %}<span class="pill pill-red">NO</span>{% endif %}
+      </p>
+      {% if bp.orchestrator_check_status %}
+      {% set ocs = bp.orchestrator_check_status %}
+      <p style="margin-top:8px;"><strong>Release gate required:</strong>
+        {% if ocs.release_gate_required %}<span class="pill pill-green">YES</span>{% else %}<span class="pill pill-red">NO — action needed</span>{% endif %}
+      </p>
+      {% if not ocs.release_gate_required %}
+      <div class="alert alert-warning" style="margin-top:8px;">
+        The <code>orchestrator/release-gate</code> context is not required in branch protection.
+        See <code>docs/security/github-required-checks.md</code>.
+      </div>
+      {% endif %}
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
