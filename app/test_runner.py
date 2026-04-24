@@ -43,6 +43,30 @@ def _install_python_deps(repo_path: str) -> dict | None:
     return None
 
 
+def _install_node_deps(repo_path: str, package_manager: str = "npm") -> dict | None:
+    """Run npm/yarn/pnpm install. Returns error dict on failure, None on success."""
+    if not os.path.isfile(os.path.join(repo_path, "package.json")):
+        return None
+    install_cmd = {
+        "npm": ["npm", "install", "--no-audit", "--no-fund"],
+        "yarn": ["yarn", "install", "--non-interactive"],
+        "pnpm": ["pnpm", "install", "--no-frozen-lockfile"],
+    }.get(package_manager, ["npm", "install", "--no-audit", "--no-fund"])
+    logger.info("Installing Node deps: %s", " ".join(install_cmd))
+    install = subprocess.run(
+        install_cmd,
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if install.returncode != 0:
+        output = (install.stdout + install.stderr)[:2000]
+        logger.warning("Node dep install failed:\n%s", output)
+        return {"status": "ERROR", "output": f"npm install failed:\n{output}"}
+    return None
+
+
 def run_tests(
     repo_path: str,
     timeout: int = 300,
@@ -60,12 +84,16 @@ def run_tests(
         profile_name: Profile name for logging context (optional).
 
     Returns a dict with keys:
-      command   — the command string used, or None if tests were skipped
-      exit_code — integer exit code, or None
-      output    — combined stdout+stderr, truncated to 4000 chars
-      status    — NOT_RUN | PASSED | FAILED | ERROR
+      command              — the command string used, or None if tests were skipped
+      exit_code            — integer exit code, or None
+      output               — combined stdout+stderr, truncated to 4000 chars
+      status               — NOT_RUN | PASSED | FAILED | ERROR
+      dependency_install   — PASSED | FAILED | NOT_RUN (for tracking)
     """
-    result: dict = {"command": None, "exit_code": None, "output": "", "status": "NOT_RUN"}
+    result: dict = {
+        "command": None, "exit_code": None, "output": "",
+        "status": "NOT_RUN", "dependency_install": "NOT_RUN",
+    }
 
     # Determine the command to run
     if profile_command is not None:
@@ -90,7 +118,23 @@ def run_tests(
         err = _install_python_deps(repo_path)
         if err:
             result.update(err)
+            result["dependency_install"] = "FAILED"
             return result
+        result["dependency_install"] = "PASSED"
+    elif profile_name == "node_react":
+        # Detect package manager from lock file for install command
+        if os.path.exists(os.path.join(repo_path, "pnpm-lock.yaml")):
+            pm = "pnpm"
+        elif os.path.exists(os.path.join(repo_path, "yarn.lock")):
+            pm = "yarn"
+        else:
+            pm = "npm"
+        err = _install_node_deps(repo_path, pm)
+        if err:
+            result.update(err)
+            result["dependency_install"] = "FAILED"
+            return result
+        result["dependency_install"] = "PASSED"
 
     cmd_result = run_repo_command(
         workspace_path=repo_path,

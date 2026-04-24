@@ -853,6 +853,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         test_status=test_result["status"],
         test_command=test_result["command"],
         test_output=test_result["output"],
+        dependency_install_status=test_result.get("dependency_install", "NOT_RUN"),
     )
     send_message("tests", test_result["status"], f"{issue_key}: {test_result['status']}")
     logger.info("story_implementation: tests %s", test_result["status"])
