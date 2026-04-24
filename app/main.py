@@ -1439,6 +1439,53 @@ def create_jira_mapping_for_repo(repo_slug: str, body: JiraMappingBody):
 
 
 # ---------------------------------------------------------------------------
+# Phase 18 Iteration 7 — New project bootstrap workflow
+# ---------------------------------------------------------------------------
+
+class ProjectBootstrapBody(BaseModel):
+    repo_slug: str
+    project_type: str  # python_fastapi | static_site
+    base_branch: str = "main"
+    description: str = ""
+
+
+@app.post("/admin/project-bootstrap/start", status_code=201)
+def start_project_bootstrap(body: ProjectBootstrapBody):
+    """Bootstrap a new project with a minimal skeleton and open a PR.
+
+    Validates the repo exists and is near-empty, copies templates, and opens
+    a PR against base_branch. Never auto-merges. Runs synchronously.
+
+    Supported project_types: python_fastapi, static_site.
+    Requires X-Orchestrator-Admin-Key header.
+    """
+    from app.bootstrap import run_project_bootstrap, SUPPORTED_PROJECT_TYPES
+
+    repo_slug = body.repo_slug.strip()
+    if not repo_slug or "/" not in repo_slug:
+        raise HTTPException(status_code=422, detail="repo_slug must be in 'owner/repo' format")
+    if body.project_type not in SUPPORTED_PROJECT_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"project_type must be one of: {', '.join(SUPPORTED_PROJECT_TYPES)}",
+        )
+
+    try:
+        result = run_project_bootstrap(
+            repo_slug=repo_slug,
+            project_type=body.project_type,
+            base_branch=body.base_branch,
+            description=body.description,
+        )
+        return result
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("Bootstrap failed for %s: %s", repo_slug, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Phase 18 Iteration 1 — Project activation workflow
 # ---------------------------------------------------------------------------
 
