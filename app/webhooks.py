@@ -99,7 +99,16 @@ async def telegram_webhook(request: Request):
     # Only process messages from the configured chat
     expected_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if expected_chat_id and incoming_chat_id != expected_chat_id:
-        logger.warning("Telegram webhook: message from unexpected chat %s — ignored", incoming_chat_id)
+        logger.warning("Telegram webhook: message from unexpected chat %s — rejected", incoming_chat_id)
+        record_security_event(
+            event_type="telegram_rejected",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="REJECTED",
+            details={"reason": "unexpected_chat_id"},
+        )
         return {"ok": True}
 
     if not text:
@@ -111,6 +120,20 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     action, run_id = cmd
+
+    # Sanity check run_id (must be positive and reasonable)
+    if run_id <= 0 or run_id > 10_000_000:
+        logger.warning("Telegram webhook: malformed run_id %s in command %s — rejected", run_id, action)
+        record_security_event(
+            event_type="telegram_rejected",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="REJECTED",
+            details={"reason": "malformed_run_id", "run_id": run_id, "action": action},
+        )
+        return {"ok": True}
 
     # Pause check — block approval commands when paused
     if is_paused():
