@@ -1248,3 +1248,78 @@ def rerun_deployment_validation(run_id: int, repo_slug: str | None = None, envir
         "validation_id": result["validation_id"],
         "smoke_results": result["smoke_results"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — Project Onboarding APIs
+# ---------------------------------------------------------------------------
+
+from app.database import (
+    create_onboarding_run, get_onboarding_run, list_onboarding_runs,
+    list_knowledge_snapshots, get_knowledge_snapshot,
+)
+from app.queue import enqueue_onboarding_job
+
+
+class OnboardingStartBody(BaseModel):
+    repo_slug: str
+    base_branch: str = "main"
+
+
+@app.post("/admin/project-onboarding/start", status_code=201)
+def start_project_onboarding(body: OnboardingStartBody):
+    """Start a project onboarding run for a repo.
+
+    Creates a project_onboarding_runs row (PENDING) and enqueues the job.
+    Requires X-Orchestrator-Admin-Key header.
+    """
+    repo_slug = body.repo_slug.strip()
+    if not repo_slug or "/" not in repo_slug:
+        raise HTTPException(
+            status_code=422,
+            detail="repo_slug must be in 'owner/repo' format (e.g. suyog19/learning-platform)",
+        )
+
+    run_id = create_onboarding_run(repo_slug=repo_slug, base_branch=body.base_branch)
+    enqueue_onboarding_job(onboarding_run_id=run_id, repo_slug=repo_slug, base_branch=body.base_branch)
+    logger.info("Onboarding job started: repo_slug=%s run_id=%s", repo_slug, run_id)
+
+    return {
+        "onboarding_run_id": run_id,
+        "repo_slug": repo_slug,
+        "base_branch": body.base_branch,
+        "status": "PENDING",
+        "message": f"Onboarding queued. Poll GET /admin/project-onboarding/runs/{run_id} for status.",
+    }
+
+
+@app.get("/admin/project-onboarding/runs")
+def list_onboarding_runs_endpoint(repo_slug: str | None = None, limit: int = 50):
+    """List project onboarding runs, optionally filtered by repo_slug."""
+    runs = list_onboarding_runs(repo_slug=repo_slug, limit=limit)
+    return {"runs": runs, "count": len(runs)}
+
+
+@app.get("/admin/project-onboarding/runs/{run_id}")
+def get_onboarding_run_endpoint(run_id: int):
+    """Return a single project onboarding run by id."""
+    run = get_onboarding_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Onboarding run {run_id} not found")
+    return run
+
+
+@app.get("/debug/project-knowledge")
+def list_project_knowledge(repo_slug: str):
+    """List all project knowledge snapshots for a repo."""
+    snaps = list_knowledge_snapshots(repo_slug=repo_slug)
+    return {"repo_slug": repo_slug, "snapshots": snaps, "count": len(snaps)}
+
+
+@app.post("/debug/project-knowledge/{repo_slug:path}/refresh", status_code=200)
+def refresh_project_knowledge(repo_slug: str):
+    """Placeholder: trigger knowledge snapshot refresh for a repo (implemented in later iterations)."""
+    return {
+        "repo_slug": repo_slug,
+        "message": "Knowledge refresh not yet implemented — will be available after Iteration 5.",
+    }

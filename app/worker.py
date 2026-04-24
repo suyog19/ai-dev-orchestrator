@@ -17,9 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback, expire_stale_clarifications
+from app.database import update_onboarding_run
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation, epic_breakdown
+from app.onboarding import run_project_onboarding
 from app.clarification import ClarificationRequested
 
 WORKFLOW_HANDLERS = {
@@ -115,6 +117,30 @@ def _execute(job: dict):
         send_message("workflow", "COMPLETED", f"{issue_key}: {summary}")
 
 
+def _execute_onboarding(job: dict):
+    onboarding_run_id = job["run_id"]
+    repo_slug = job["repo_slug"]
+    base_branch = job.get("base_branch", "main")
+
+    with _semaphore:
+        logger.info("Onboarding started: repo_slug=%s (run_id=%s)", repo_slug, onboarding_run_id)
+        update_onboarding_run(onboarding_run_id, status="RUNNING")
+        send_message("project_onboarding", "RUNNING", f"Onboarding {repo_slug} branch={base_branch}")
+
+        try:
+            run_project_onboarding(onboarding_run_id, repo_slug, base_branch)
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+            logger.error("Onboarding FAILED: repo_slug=%s (run_id=%s) — %s", repo_slug, onboarding_run_id, error_msg)
+            update_onboarding_run(onboarding_run_id, status="FAILED", error_detail=error_msg, current_step=None)
+            send_message("project_onboarding", "FAILED", f"{repo_slug}: {error_msg}")
+            return
+
+        update_onboarding_run(onboarding_run_id, status="COMPLETED", current_step=None)
+        logger.info("Onboarding completed: repo_slug=%s (run_id=%s)", repo_slug, onboarding_run_id)
+        send_message("project_onboarding", "COMPLETED", f"Onboarding complete for {repo_slug}")
+
+
 def main():
     logger.info("Worker started (MAX_WORKERS=%s)", MAX_WORKERS)
     init_db()
@@ -142,7 +168,10 @@ def main():
                 if pending > 0:
                     logger.info("%s job(s) still waiting in queue", pending)
                     send_message("queue", "WAITING", f"{pending} job(s) pending in queue")
-                threading.Thread(target=_execute, args=(job,), daemon=True).start()
+                if job.get("workflow_type") == "project_onboarding":
+                    threading.Thread(target=_execute_onboarding, args=(job,), daemon=True).start()
+                else:
+                    threading.Thread(target=_execute, args=(job,), daemon=True).start()
 
             # Periodic stale clarification expiry (every ~1 hour)
             _loop_count += 1
