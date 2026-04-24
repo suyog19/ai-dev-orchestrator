@@ -731,6 +731,27 @@ def _run_post_merge_validation(
             )
         # SKIPPED — no Telegram noise
 
+        # Publish GitHub commit status for deployment validation (best-effort)
+        try:
+            from app.github_status_publisher import publish_deployment_validation_status
+            from app.security import ensure_github_writes_allowed
+            ensure_github_writes_allowed("status", repo_slug, run_id)
+            pub = publish_deployment_validation_status(
+                run_id=run_id,
+                repo_slug=repo_slug,
+                deployment_validation_status=status,
+                pr_number=pr_number,
+                commit_sha=commit_sha,
+            )
+            if pub["errors"]:
+                logger.warning(
+                    "_run_post_merge_validation: GitHub status publish failed — %s", pub["errors"]
+                )
+        except Exception as pub_exc:
+            logger.warning(
+                "_run_post_merge_validation: GitHub status publish error (non-fatal) — %s", pub_exc
+            )
+
     except Exception as exc:
         logger.error(
             "_run_post_merge_validation: non-fatal error for run_id=%s — %s", run_id, exc,

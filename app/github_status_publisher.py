@@ -132,3 +132,88 @@ def publish_github_statuses_for_run(
         "skipped":   False,
         "errors":    errors,
     }
+
+
+def publish_deployment_validation_status(
+    run_id: int,
+    repo_slug: str,
+    deployment_validation_status: str,
+    pr_number: int | None = None,
+    commit_sha: str | None = None,
+) -> dict:
+    """Publish the deployment-validation GitHub commit status for a run.
+
+    Called after deployment validation completes (post-merge). Uses the
+    head_sha stored on the run if commit_sha is not provided. Best-effort:
+    never raises.
+
+    Returns:
+        published: 1 on success, 0 on failure
+        skipped: True if head_sha unavailable
+        errors: list of error strings
+    """
+    from app.database import get_run_verdicts, record_github_status_update
+    from app.github_api import create_commit_status
+    from app.github_status_mapper import map_deployment_validation_to_github
+
+    if not commit_sha:
+        run = get_run_verdicts(run_id)
+        commit_sha = (run or {}).get("head_sha")
+
+    if not commit_sha:
+        logger.warning(
+            "publish_deployment_validation_status: run %s has no head_sha — skipping",
+            run_id,
+        )
+        return {"published": 0, "skipped": True, "errors": ["head_sha missing"]}
+
+    status_payload = map_deployment_validation_to_github(deployment_validation_status)
+    context     = status_payload["context"]
+    state       = status_payload["state"]
+    description = status_payload["description"]
+
+    base_url   = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    target_url = f"{base_url}/debug/workflow-runs/{run_id}/deployment-validation" if base_url else None
+
+    try:
+        gh_response = create_commit_status(
+            repo_slug=repo_slug,
+            sha=commit_sha,
+            state=state,
+            context=context,
+            description=description,
+            target_url=target_url,
+        )
+        record_github_status_update(
+            run_id=run_id,
+            repo_slug=repo_slug,
+            commit_sha=commit_sha,
+            context=context,
+            state=state,
+            description=description,
+            pr_number=pr_number,
+            target_url=target_url,
+            github_response_json=json.dumps(gh_response),
+        )
+        logger.info(
+            "deployment validation status published: run=%s state=%s sha=%.8s",
+            run_id, state, commit_sha,
+        )
+        return {"published": 1, "skipped": False, "errors": []}
+    except Exception as exc:
+        err = f"{context}: {exc}"
+        logger.error("deployment validation status publish failed: run=%s %s", run_id, err)
+        try:
+            record_github_status_update(
+                run_id=run_id,
+                repo_slug=repo_slug,
+                commit_sha=commit_sha,
+                context=context,
+                state="error",
+                description=f"Publish error: {str(exc)[:100]}",
+                pr_number=pr_number,
+                target_url=target_url,
+            )
+        except Exception:
+            pass
+        return {"published": 0, "skipped": False, "errors": [err]}
