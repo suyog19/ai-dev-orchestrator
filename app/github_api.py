@@ -197,6 +197,30 @@ def get_pr_diff(repo_name: str, pr_number: int) -> str:
     return response.text
 
 
+def get_pr_details(repo_slug: str, pr_number: int) -> dict:
+    """Fetch PR metadata including the head commit SHA.
+
+    Returns dict with: number, head_sha, head_ref, base_ref, state, html_url.
+    Raises on HTTP errors.
+    """
+    slug = _normalize_slug(repo_slug)
+    response = requests.get(
+        f"{GITHUB_API}/repos/{slug}/pulls/{pr_number}",
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {
+        "number":   data["number"],
+        "head_sha": data["head"]["sha"],
+        "head_ref": data["head"]["ref"],
+        "base_ref": data["base"]["ref"],
+        "state":    data["state"],
+        "html_url": data["html_url"],
+    }
+
+
 _VALID_GITHUB_STATES = {"success", "failure", "pending", "error"}
 
 

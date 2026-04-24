@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment, get_pr_diff
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment, get_pr_diff, get_pr_details
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
 from app.jira_client import get_issue_details
@@ -1016,6 +1016,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     )
     add_label_to_pr(mapping["repo_slug"], pr["number"], AI_LABEL)
     update_run_field(run_id, pr_url=pr["url"])
+
+    # Store the head SHA for GitHub commit status publishing (Phase 13)
+    try:
+        pr_details = get_pr_details(mapping["repo_slug"], pr["number"])
+        update_run_field(run_id, head_sha=pr_details["head_sha"])
+        logger.info("story_implementation: head_sha=%s stored for run %s", pr_details["head_sha"][:8], run_id)
+    except Exception as exc:
+        logger.warning("story_implementation: get_pr_details failed (non-fatal) — %s", exc)
+
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
 
