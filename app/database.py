@@ -119,6 +119,11 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS head_sha                        VARCHAR(100) NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published        BOOLEAN      NOT NULL DEFAULT FALSE",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published_at     TIMESTAMP    NULL",
+                # Phase 15 — Multi-stack capability profiles
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS capability_profile_name    VARCHAR(100) NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS build_status               VARCHAR(20)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS lint_status                VARCHAR(20)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS dependency_install_status  VARCHAR(20)  NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -358,6 +363,32 @@ def init_db(retries: int = 5, delay: int = 3):
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_clarification_run_id "
                 "ON clarification_requests (run_id)"
+            )
+
+            # Phase 15 — Repo capability profiles
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repo_capability_profiles (
+                    id                   SERIAL PRIMARY KEY,
+                    repo_slug            VARCHAR(200) NOT NULL,
+                    profile_name         VARCHAR(100) NOT NULL,
+                    primary_language     VARCHAR(50)  NULL,
+                    framework            VARCHAR(100) NULL,
+                    package_manager      VARCHAR(100) NULL,
+                    test_command         TEXT         NULL,
+                    build_command        TEXT         NULL,
+                    lint_command         TEXT         NULL,
+                    source_patterns_json TEXT         NULL,
+                    test_patterns_json   TEXT         NULL,
+                    capabilities_json    TEXT         NULL,
+                    auto_detected        BOOLEAN      NOT NULL DEFAULT TRUE,
+                    is_active            BOOLEAN      NOT NULL DEFAULT TRUE,
+                    created_at           TIMESTAMP    NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMP    NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_repo_capability_profiles_slug "
+                "ON repo_capability_profiles (repo_slug)"
             )
 
             # Seed default control flags from env (only if not already set)
@@ -600,6 +631,8 @@ def update_run_field(run_id: int, **fields):
         "release_decision", "release_decision_reason", "release_decided_at",
         # Phase 13
         "head_sha", "github_statuses_published", "github_statuses_published_at",
+        # Phase 15
+        "capability_profile_name", "build_status", "lint_status", "dependency_install_status",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -3151,3 +3184,120 @@ def get_overview_stats() -> dict:
         "security_events": security_events,
         "last_github_publish": last_github_publish,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 — Repo capability profiles
+# ---------------------------------------------------------------------------
+
+def upsert_capability_profile(repo_slug: str, profile: dict) -> int:
+    """Insert or update the active capability profile for a repo. Returns row id."""
+    caps = profile.get("capabilities", {})
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Deactivate previous active profiles for this slug
+            cur.execute(
+                "UPDATE repo_capability_profiles SET is_active=FALSE, updated_at=NOW() "
+                "WHERE repo_slug=%s AND is_active=TRUE",
+                (repo_slug,),
+            )
+            cur.execute(
+                """
+                INSERT INTO repo_capability_profiles
+                    (repo_slug, profile_name, primary_language, framework, package_manager,
+                     test_command, build_command, lint_command,
+                     source_patterns_json, test_patterns_json, capabilities_json,
+                     auto_detected, is_active)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)
+                RETURNING id
+                """,
+                (
+                    repo_slug,
+                    profile.get("profile_name"),
+                    profile.get("primary_language"),
+                    profile.get("framework"),
+                    profile.get("package_manager"),
+                    profile.get("test_command"),
+                    profile.get("build_command"),
+                    profile.get("lint_command"),
+                    json.dumps(profile.get("source_patterns", [])),
+                    json.dumps(profile.get("test_patterns", [])),
+                    json.dumps(caps),
+                    profile.get("auto_detected", True),
+                ),
+            )
+            row = cur.fetchone()
+            return row[0]
+
+
+def get_active_capability_profile(repo_slug: str) -> dict | None:
+    """Return the active capability profile for a repo, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, repo_slug, profile_name, primary_language, framework,
+                       package_manager, test_command, build_command, lint_command,
+                       source_patterns_json, test_patterns_json, capabilities_json,
+                       auto_detected, is_active, created_at, updated_at
+                FROM repo_capability_profiles
+                WHERE repo_slug=%s AND is_active=TRUE
+                ORDER BY id DESC LIMIT 1
+                """,
+                (repo_slug,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0], "repo_slug": row[1], "profile_name": row[2],
+                "primary_language": row[3], "framework": row[4],
+                "package_manager": row[5], "test_command": row[6],
+                "build_command": row[7], "lint_command": row[8],
+                "source_patterns": json.loads(row[9] or "[]"),
+                "test_patterns": json.loads(row[10] or "[]"),
+                "capabilities": json.loads(row[11] or "{}"),
+                "auto_detected": row[12], "is_active": row[13],
+                "created_at": row[14].isoformat() if row[14] else None,
+                "updated_at": row[15].isoformat() if row[15] else None,
+            }
+
+
+def list_capability_profiles(repo_slug: str | None = None) -> list[dict]:
+    """List all capability profile rows, optionally filtered by repo_slug."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if repo_slug:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, profile_name, primary_language, framework,
+                           package_manager, test_command, build_command, lint_command,
+                           capabilities_json, auto_detected, is_active, created_at
+                    FROM repo_capability_profiles
+                    WHERE repo_slug=%s ORDER BY id DESC
+                    """,
+                    (repo_slug,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, repo_slug, profile_name, primary_language, framework,
+                           package_manager, test_command, build_command, lint_command,
+                           capabilities_json, auto_detected, is_active, created_at
+                    FROM repo_capability_profiles
+                    ORDER BY id DESC LIMIT 200
+                    """
+                )
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": r[0], "repo_slug": r[1], "profile_name": r[2],
+                    "primary_language": r[3], "framework": r[4],
+                    "package_manager": r[5], "test_command": r[6],
+                    "build_command": r[7], "lint_command": r[8],
+                    "capabilities": json.loads(r[9] or "{}"),
+                    "auto_detected": r[10], "is_active": r[11],
+                    "created_at": r[12].isoformat() if r[12] else None,
+                }
+                for r in rows
+            ]
