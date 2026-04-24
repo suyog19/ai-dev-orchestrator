@@ -3,7 +3,7 @@ import json
 import logging
 import sys
 from fastapi import FastAPI
-from fastapi.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 from fastapi import HTTPException
