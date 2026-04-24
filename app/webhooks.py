@@ -20,7 +20,26 @@ router = APIRouter()
 
 
 @router.post("/webhooks/jira")
-async def jira_webhook(request: Request):
+async def jira_webhook(request: Request, token: str | None = None):
+    # Jira webhook secret validation (if JIRA_WEBHOOK_SECRET is configured)
+    expected_secret = os.environ.get("JIRA_WEBHOOK_SECRET", "")
+    if expected_secret:
+        if not token or token != expected_secret:
+            logger.warning(
+                "Jira webhook: invalid or missing token from %s",
+                request.client.host if request.client else "unknown",
+            )
+            record_security_event(
+                event_type="webhook_rejected",
+                source="jira",
+                actor=request.client.host if request.client else "unknown",
+                endpoint="/webhooks/jira",
+                method="POST",
+                status="REJECTED",
+                details={"reason": "invalid_token"},
+            )
+            raise HTTPException(status_code=401, detail="Invalid or missing webhook token")
+
     try:
         payload = await request.json()
     except Exception:
