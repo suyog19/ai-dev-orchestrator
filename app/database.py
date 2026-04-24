@@ -2918,7 +2918,7 @@ def get_workflow_run_detail(run_id: int) -> dict | None:
             # Active clarification
             cur.execute(
                 """
-                SELECT id, context_key, question_text, options_json, status, created_at, expires_at
+                SELECT id, context_key, question, options_json, status, created_at, expires_at
                 FROM clarification_requests WHERE run_id = %s AND status = 'PENDING'
                 ORDER BY id DESC LIMIT 1
                 """,
