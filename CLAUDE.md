@@ -56,7 +56,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 **Key files:**
 - `app/main.py` — FastAPI app, all HTTP endpoints
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
-- `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
+- `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: lines 124–128 define a stale one-argument `_is_test_file()` that is dead code (overridden by the profile-aware version at line 287); `_TEST_FILE_PATTERNS` at line 124 is also unused
 - `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
@@ -237,7 +237,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 
 | Setting | Value |
 |---|---|
-| Test command | Profile-based (`get_test_command_for_profile()`); defaults to `pytest -q` for Python FastAPI |
+| Test command | Profile-based (`get_test_command_for_profile()`); defaults to `pytest -q --tb=short` for Python FastAPI |
 | Max fix attempts | 1 (max 2 total coding passes per run) |
 | Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
 | Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + `architecture_status=ARCHITECTURE_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed + profile policy allows auto-merge; all evaluated by `evaluate_release_decision()` in `workflows.py` |
@@ -252,8 +252,8 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 
 | Profile | Detected by | Test command | Auto-merge |
 |---|---|---|---|
-| `python_fastapi` | `requirements.txt` / `pyproject.toml` + FastAPI reference or `app/main.py` | `pytest -q` | Allowed |
-| `java_maven` | `pom.xml` | `mvn test -q` (or `./mvnw test -q` if wrapper present) | Disabled |
+| `python_fastapi` | `requirements.txt` / `pyproject.toml` + FastAPI reference or `app/main.py` | `pytest -q --tb=short` | Allowed |
+| `java_maven` | `pom.xml` | `mvn test -q` (build: `mvn package -DskipTests -q`) | Disabled |
 | `java_gradle` | `build.gradle` or (`gradlew` + `settings.gradle`) | `./gradlew test` or `gradle test` | Disabled |
 | `node_react` | `package.json` + (vite/next config OR react dep OR `src/`) | From `package.json` scripts | Disabled |
 | `generic_unknown` | fallback | None | Disabled |
