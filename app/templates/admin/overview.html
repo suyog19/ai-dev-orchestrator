@@ -5,10 +5,232 @@
 {% block content %}
 <div class="page-header">
   <h1>Overview</h1>
-  <p class="subtitle">System status at a glance</p>
+  <p class="subtitle">System status at a glance — {{ env_name }}</p>
 </div>
+
+<!-- Status cards -->
+<div class="card-grid">
+  <div class="stat-card">
+    <div class="stat-label">Orchestrator</div>
+    <div class="stat-value" style="font-size:18px; margin-top:8px;">
+      {% if paused %}
+        <span class="pill pill-red">PAUSED</span>
+      {% else %}
+        <span class="pill pill-green">RUNNING</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="stat-card">
+    <div class="stat-label">GitHub Writes</div>
+    <div class="stat-value" style="font-size:18px; margin-top:8px;">
+      {% if github_writes %}
+        <span class="pill pill-green">ENABLED</span>
+      {% else %}
+        <span class="pill pill-red">DISABLED</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="stat-card">
+    <div class="stat-label">Auto-Merge</div>
+    <div class="stat-value" style="font-size:18px; margin-top:8px;">
+      {% if auto_merge %}
+        <span class="pill pill-green">ENABLED</span>
+      {% else %}
+        <span class="pill pill-yellow">DISABLED</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="stat-card">
+    <div class="stat-label">Pending Clarifications</div>
+    <div class="stat-value {% if stats.pending_clarifications > 0 %}text-yellow{% endif %}">
+      {{ stats.pending_clarifications }}
+    </div>
+  </div>
+
+  <div class="stat-card">
+    <div class="stat-label">Running Workflows</div>
+    <div class="stat-value {% if stats.running_runs|length > 0 %}text-yellow{% endif %}">
+      {{ stats.running_runs|length }}
+    </div>
+  </div>
+
+  <div class="stat-card">
+    <div class="stat-label">Total Runs</div>
+    <div class="stat-value">
+      {{ stats.run_counts.values() | sum }}
+    </div>
+  </div>
+</div>
+
+<!-- Run status breakdown -->
+<div class="card">
+  <h2>Run Status Breakdown</h2>
+  <div style="display:flex; gap:12px; flex-wrap:wrap;">
+    {% for status, count in stats.run_counts.items() | sort %}
+      {% if status in ('COMPLETED',) %}
+        <span class="pill pill-green">{{ status }}: {{ count }}</span>
+      {% elif status in ('FAILED',) %}
+        <span class="pill pill-red">{{ status }}: {{ count }}</span>
+      {% elif status in ('RUNNING', 'QUEUED', 'RECEIVED', 'WAITING_FOR_APPROVAL') %}
+        <span class="pill pill-yellow">{{ status }}: {{ count }}</span>
+      {% else %}
+        <span class="pill pill-gray">{{ status }}: {{ count }}</span>
+      {% endif %}
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Recent failed runs -->
+{% if stats.failed_runs %}
+<div class="card">
+  <h2>Recent Failed Workflows <span class="pill pill-red" style="font-size:11px;">{{ stats.failed_runs|length }}</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Issue</th>
+          <th>Type</th>
+          <th>Step</th>
+          <th>Error</th>
+          <th>When</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in stats.failed_runs %}
+        <tr>
+          <td><a href="/admin/ui/runs/{{ run.id }}">{{ run.id }}</a></td>
+          <td><code>{{ run.issue_key or '—' }}</code></td>
+          <td>{{ run.workflow_type or '—' }}</td>
+          <td><code>{{ run.current_step or '—' }}</code></td>
+          <td class="text-muted" style="max-width:300px; word-break:break-word; font-size:12px;">{{ run.error_detail or '—' }}</td>
+          <td class="text-muted" style="font-size:12px;">{{ run.created_at or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Recent blocked releases -->
+{% if stats.blocked_runs %}
+<div class="card">
+  <h2>Recent Blocked Releases <span class="pill pill-yellow" style="font-size:11px;">{{ stats.blocked_runs|length }}</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Issue</th>
+          <th>Release</th>
+          <th>Review</th>
+          <th>Test Quality</th>
+          <th>Architecture</th>
+          <th>When</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in stats.blocked_runs %}
+        <tr>
+          <td><a href="/admin/ui/runs/{{ run.id }}">{{ run.id }}</a></td>
+          <td><code>{{ run.issue_key or '—' }}</code></td>
+          <td><span class="pill pill-red">{{ run.release_decision or '—' }}</span></td>
+          <td>{{ run.review_status or '—' }}</td>
+          <td>{{ run.test_quality_status or '—' }}</td>
+          <td>{{ run.architecture_status or '—' }}</td>
+          <td class="text-muted" style="font-size:12px;">{{ run.created_at or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Running workflows -->
+{% if stats.running_runs %}
+<div class="card">
+  <h2>Currently Running <span class="pill pill-yellow" style="font-size:11px;">{{ stats.running_runs|length }}</span></h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Run ID</th><th>Issue</th><th>Step</th><th>Started</th></tr>
+      </thead>
+      <tbody>
+        {% for run in stats.running_runs %}
+        <tr>
+          <td><a href="/admin/ui/runs/{{ run.id }}">{{ run.id }}</a></td>
+          <td><code>{{ run.issue_key or '—' }}</code></td>
+          <td><code>{{ run.current_step or '—' }}</code></td>
+          <td class="text-muted" style="font-size:12px;">{{ run.started_at or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Recent security events -->
+{% if stats.security_events %}
+<div class="card">
+  <h2>Recent Security Events</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Event Type</th>
+          <th>Source</th>
+          <th>Actor</th>
+          <th>Endpoint</th>
+          <th>Status</th>
+          <th>When</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ev in stats.security_events %}
+        <tr>
+          <td>
+            {% if ev.event_type in ('admin_auth_failed', 'webhook_rejected', 'github_write_blocked') %}
+              <span class="pill pill-red" style="font-size:11px;">{{ ev.event_type }}</span>
+            {% else %}
+              <span class="pill pill-gray" style="font-size:11px;">{{ ev.event_type }}</span>
+            {% endif %}
+          </td>
+          <td>{{ ev.source or '—' }}</td>
+          <td class="mono">{{ ev.actor or '—' }}</td>
+          <td class="mono" style="font-size:12px;">{{ ev.endpoint or '—' }}</td>
+          <td>{{ ev.status or '—' }}</td>
+          <td class="text-muted" style="font-size:12px;">{{ ev.created_at or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Last GitHub status publish -->
+{% if stats.last_github_publish %}
+<div class="card">
+  <h2>Last GitHub Status Publish</h2>
+  <p>
+    Run <a href="/admin/ui/runs/{{ stats.last_github_publish.run_id }}">{{ stats.last_github_publish.run_id }}</a>
+    — repo <code>{{ stats.last_github_publish.repo_slug }}</code>
+    — state <code>{{ stats.last_github_publish.state }}</code>
+    — <span class="text-muted">{{ stats.last_github_publish.created_at }}</span>
+  </p>
+</div>
+{% endif %}
+
+{% if not stats.failed_runs and not stats.blocked_runs and not stats.running_runs and not stats.security_events %}
 <div class="placeholder-message">
-  <p>Overview page coming in Iteration 1.</p>
-  <p>Auth is working — you are logged in.</p>
+  <p>All systems look healthy. No failed runs, blocked releases, or security alerts.</p>
 </div>
+{% endif %}
+
 {% endblock %}

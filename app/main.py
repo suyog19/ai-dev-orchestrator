@@ -28,7 +28,7 @@ from app.webhooks import router as webhooks_router
 from app.ui import router as ui_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
-from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill
+from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill, get_overview_stats
 
 load_dotenv()
 

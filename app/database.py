@@ -2774,3 +2774,118 @@ def list_github_status_updates(run_id: int) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def get_overview_stats() -> dict:
+    """Aggregate stats for the admin overview page in a single DB round-trip."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Pending clarifications count
+            cur.execute("SELECT COUNT(*) FROM clarification_requests WHERE status = 'PENDING'")
+            pending_clarifications = cur.fetchone()[0]
+
+            # Recent FAILED runs (last 5)
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, status, current_step, error_detail, created_at
+                FROM workflow_runs
+                WHERE status = 'FAILED'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            failed_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "workflow_type": r[2],
+                    "status": r[3], "current_step": r[4],
+                    "error_detail": (r[5] or "")[:200],
+                    "created_at": r[6].isoformat() if r[6] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Recent RELEASE_BLOCKED runs (last 5)
+            cur.execute(
+                """
+                SELECT id, issue_key, workflow_type, release_decision,
+                       review_status, test_quality_status, architecture_status, created_at
+                FROM workflow_runs
+                WHERE release_decision = 'RELEASE_BLOCKED'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            blocked_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "workflow_type": r[2],
+                    "release_decision": r[3], "review_status": r[4],
+                    "test_quality_status": r[5], "architecture_status": r[6],
+                    "created_at": r[7].isoformat() if r[7] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # RUNNING runs (stale detection)
+            cur.execute(
+                """
+                SELECT id, issue_key, current_step, started_at
+                FROM workflow_runs WHERE status = 'RUNNING'
+                ORDER BY id DESC LIMIT 5
+                """
+            )
+            running_runs = [
+                {
+                    "id": r[0], "issue_key": r[1], "current_step": r[2],
+                    "started_at": r[3].isoformat() if r[3] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Total run counts
+            cur.execute(
+                """
+                SELECT status, COUNT(*) FROM workflow_runs
+                GROUP BY status
+                """
+            )
+            run_counts = {r[0]: r[1] for r in cur.fetchall()}
+
+            # Recent security events (last 10, excluding routine auth successes)
+            cur.execute(
+                """
+                SELECT id, event_type, source, actor, endpoint, status, created_at
+                FROM security_events
+                WHERE event_type != 'admin_auth_success'
+                ORDER BY id DESC LIMIT 10
+                """
+            )
+            security_events = [
+                {
+                    "id": r[0], "event_type": r[1], "source": r[2],
+                    "actor": r[3], "endpoint": r[4], "status": r[5],
+                    "created_at": r[6].isoformat() if r[6] else None,
+                }
+                for r in cur.fetchall()
+            ]
+
+            # Last GitHub status publish
+            cur.execute(
+                """
+                SELECT run_id, repo_slug, state, created_at
+                FROM github_status_updates
+                ORDER BY id DESC LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            last_github_publish = {
+                "run_id": row[0], "repo_slug": row[1],
+                "state": row[2], "created_at": row[3].isoformat() if row[3] else None,
+            } if row else None
+
+    return {
+        "pending_clarifications": pending_clarifications,
+        "failed_runs": failed_runs,
+        "blocked_runs": blocked_runs,
+        "running_runs": running_runs,
+        "run_counts": run_counts,
+        "security_events": security_events,
+        "last_github_publish": last_github_publish,
+    }

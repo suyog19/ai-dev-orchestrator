@@ -21,6 +21,7 @@ from app.ui_auth import (
     verify_csrf,
     _LoginRedirect,
 )
+from app.database import get_overview_stats, get_all_control_flags
 
 logger = logging.getLogger("orchestrator.ui")
 
@@ -96,16 +97,28 @@ def dashboard_root(request: Request):
 
 
 @router.get("/overview", response_class=HTMLResponse)
-def overview_placeholder(request: Request):
+def overview_page(request: Request):
     try:
         token = require_admin_ui(request)
     except _LoginRedirect as exc:
         return redirect_to_login(exc.next_url)
 
     csrf = csrf_token(token)
+    stats = get_overview_stats()
+    flags = get_all_control_flags()
+
+    paused = flags.get("orchestrator_paused", {}).get("value", "false").lower() == "true"
+    github_writes = os.environ.get("ALLOW_GITHUB_WRITES", "true").lower() == "true"
+    auto_merge = os.environ.get("ALLOW_AUTO_MERGE", "true").lower() == "true"
+
     return templates.TemplateResponse("admin/overview.html", {
         "request": request,
         "csrf": csrf,
         "env_name": _env_name(),
         "page": "overview",
+        "paused": paused,
+        "github_writes": github_writes,
+        "auto_merge": auto_merge,
+        "stats": stats,
+        "flags": flags,
     })
