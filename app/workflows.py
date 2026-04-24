@@ -6,6 +6,7 @@ from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC
+from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
 from app.database import (
@@ -24,6 +25,59 @@ AI_LABEL_COLOR = "6f42c1"  # purple
 MAX_FILES_FOR_AUTOMERGE = 3
 
 logger = logging.getLogger("worker")
+
+
+def _build_review_package(
+    issue_key: str,
+    summary: str,
+    story_details: dict,
+    mapping: dict,
+    branch: str,
+    pr: dict,
+    commit_message: str,
+    final_changes: list,
+    diff_block: str,
+    final_test_result: dict,
+    retry_count: int,
+    execution_memory: str,
+) -> dict:
+    """Assemble the full context package the Reviewer Agent will need.
+
+    Returns a dict with keys: story_context, pr_context, diff, test_result, memory_context.
+    Structured to unpack directly into review_pr(**package) in Iteration 3.
+    No Claude call, no DB write, no secrets included.
+    """
+    files_changed = [ch.get("file", "") for ch in final_changes if ch.get("file")]
+    output = (final_test_result.get("output") or "").strip()
+    output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
+
+    return {
+        "story_context": {
+            "key": issue_key,
+            "summary": summary,
+            "description": story_details.get("description"),
+            "acceptance_criteria": story_details.get("acceptance_criteria") or [],
+        },
+        "pr_context": {
+            "number": pr["number"],
+            "url": pr["url"],
+            "title": pr.get("title", ""),
+            "repo_slug": mapping["repo_slug"],
+            "base_branch": mapping["base_branch"],
+            "working_branch": branch,
+            "files_changed": files_changed,
+            "files_changed_count": len(files_changed),
+            "commit_message": commit_message,
+            "retry_count": retry_count,
+        },
+        "diff": diff_block,
+        "test_result": {
+            "status": final_test_result["status"],
+            "command": final_test_result.get("command", ""),
+            "output_excerpt": output_excerpt,
+        },
+        "memory_context": execution_memory,
+    }
 
 
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
@@ -325,6 +379,38 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     update_run_field(run_id, pr_url=pr["url"])
     send_message("pr_created", "COMPLETE", f"{issue_key}: PR #{pr['number']} — {pr['url']}")
     logger.info("story_implementation: PR #%s at %s", pr["number"], pr["url"])
+
+    # --- Build review input package (Reviewer Agent wired in Iteration 3) ---
+    update_run_step(run_id, "building_review_package")
+    story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("story_implementation: get_issue_details failed (non-fatal) — %s", exc)
+
+    review_retry_count = 1 if fix_result else 0
+    review_package = _build_review_package(
+        issue_key=issue_key,
+        summary=summary,
+        story_details=story_details,
+        mapping=mapping,
+        branch=branch,
+        pr=pr,
+        commit_message=commit_message,
+        final_changes=final_changes,
+        diff_block=diff_block,
+        final_test_result=final_test_result,
+        retry_count=review_retry_count,
+        execution_memory=execution_memory,
+    )
+    logger.info(
+        "story_implementation: review_package assembled — story=%s pr=#%s files=%s test=%s ac_items=%d",
+        issue_key,
+        review_package["pr_context"]["number"],
+        review_package["pr_context"]["files_changed"],
+        review_package["test_result"]["status"],
+        len(review_package["story_context"]["acceptance_criteria"]),
+    )
 
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"

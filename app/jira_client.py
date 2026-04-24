@@ -94,6 +94,74 @@ def _adf_body(
     return {"type": "doc", "version": 1, "content": content}
 
 
+def _extract_text_from_adf(node: dict) -> list[str]:
+    """Recursively extract plain text strings from an Atlassian Document Format node."""
+    if not isinstance(node, dict):
+        return []
+    if node.get("type") == "text":
+        text = node.get("text", "").strip()
+        return [text] if text else []
+    parts = []
+    for child in node.get("content", []):
+        parts.extend(_extract_text_from_adf(child))
+    return parts
+
+
+def _parse_acceptance_criteria(text_lines: list[str]) -> list[str]:
+    """Extract bullet items that follow an 'Acceptance Criteria' heading."""
+    in_ac = False
+    criteria = []
+    for line in text_lines:
+        if "acceptance criteria" in line.lower():
+            in_ac = True
+            continue
+        if in_ac:
+            item = line.strip().lstrip("-•* ").strip()
+            if item:
+                criteria.append(item)
+    return criteria
+
+
+def get_issue_details(issue_key: str) -> dict:
+    """Fetch summary, description text, and acceptance_criteria for a Jira issue.
+
+    Returns dict with keys: key, summary, description (str|None), acceptance_criteria (list[str]).
+    Falls back gracefully — never raises. Secrets are never included in the returned dict.
+    """
+    for var in ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"):
+        if not os.environ.get(var):
+            return {"key": issue_key, "summary": "", "description": None, "acceptance_criteria": []}
+
+    req = urllib.request.Request(
+        _api_url(f"/issue/{issue_key}?fields=summary,description"),
+        headers={"Authorization": _auth_header(), "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("get_issue_details: Jira fetch failed for %s — %s", issue_key, exc)
+        return {"key": issue_key, "summary": "", "description": None, "acceptance_criteria": []}
+
+    fields = data.get("fields", {})
+    summary = fields.get("summary", "")
+    adf = fields.get("description") or {}
+    text_lines = _extract_text_from_adf(adf)
+    description = " ".join(text_lines).strip() or None
+    ac = _parse_acceptance_criteria(text_lines)
+
+    logger.info(
+        "get_issue_details: fetched %s — %d AC items found",
+        issue_key, len(ac),
+    )
+    return {
+        "key": issue_key,
+        "summary": summary,
+        "description": description,
+        "acceptance_criteria": ac,
+    }
+
+
 def create_story_under_epic(
     project_key: str,
     epic_key: str,
