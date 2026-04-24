@@ -811,10 +811,14 @@ async def ui_project_detail(request: Request, repo_slug: str):
     except _LoginRedirect as exc:
         return redirect_to_login(exc.next_url)
 
+    import os as _os
     from app.database import (
         list_onboarding_runs, get_onboarding_run, list_knowledge_snapshots,
         get_active_capability_profile, get_deployment_profile,
+        count_completed_workflow_runs_for_repo,
     )
+    from app.repo_mapping import get_all_mappings
+
     runs = list_onboarding_runs(repo_slug=repo_slug, limit=10)
     snapshots = list_knowledge_snapshots(repo_slug=repo_slug)
     capability_profile = get_active_capability_profile(repo_slug)
@@ -826,6 +830,24 @@ async def ui_project_detail(request: Request, repo_slug: str):
         latest_run = get_onboarding_run(runs[0]["id"])
 
     snaps_by_kind = {s["snapshot_kind"]: s for s in snapshots}
+
+    # Activation status: find active mapping for this repo
+    all_mappings = get_all_mappings()
+    active_mapping = next(
+        (m for m in all_mappings if m["repo_slug"] == repo_slug and m["is_active"]),
+        None,
+    )
+    onboarding_completed = any(r["status"] == "COMPLETED" for r in runs)
+
+    # First-use mode status
+    first_use_enabled = _os.environ.get("FIRST_USE_MODE_ENABLED", "true").lower() == "true"
+    first_use_run_count = int(_os.environ.get("FIRST_USE_RUN_COUNT", "3"))
+    completed_run_count = count_completed_workflow_runs_for_repo(repo_slug)
+    first_use_mode_active = first_use_enabled and completed_run_count < first_use_run_count
+
+    # Self-modification guard
+    self_repo = _os.environ.get("ORCHESTRATOR_SELF_REPO", "suyog19/ai-dev-orchestrator")
+    self_modification_guard = repo_slug == self_repo
 
     return templates.TemplateResponse("admin/project_detail.html", {
         "request": request,
@@ -839,4 +861,109 @@ async def ui_project_detail(request: Request, repo_slug: str):
         "snapshots_by_kind": snaps_by_kind,
         "capability_profile": capability_profile,
         "deployment_profile": deployment_profile,
+        "active_mapping": active_mapping,
+        "onboarding_completed": onboarding_completed,
+        "activation_result": None,
+        "first_use_mode_active": first_use_mode_active,
+        "first_use_run_count": first_use_run_count,
+        "completed_run_count": completed_run_count,
+        "self_modification_guard": self_modification_guard,
+    })
+
+
+@router.post("/projects/{repo_slug:path}/activate", response_class=HTMLResponse)
+async def ui_activate_project(request: Request, repo_slug: str):
+    """Handle activation form POST from the project detail page."""
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    from app.database import (
+        list_onboarding_runs, get_onboarding_run, list_knowledge_snapshots,
+        get_active_capability_profile, get_deployment_profile,
+    )
+    from app.repo_mapping import get_all_mappings, add_mapping, update_mapping
+
+    form = await request.form()
+    submitted_csrf = form.get("csrf_token", "")
+    if not verify_csrf(token, submitted_csrf):
+        raise HTTPException(status_code=403, detail="CSRF token mismatch")
+
+    jira_key = (form.get("jira_project_key") or "").strip().upper()
+    base_branch = (form.get("base_branch") or "main").strip()
+    environment = (form.get("environment") or "dev").strip()
+    auto_merge = form.get("auto_merge") == "true"
+
+    if not jira_key:
+        raise HTTPException(status_code=422, detail="jira_project_key is required")
+
+    # Run the same activation logic as the API endpoint
+    runs = list_onboarding_runs(repo_slug=repo_slug, limit=5)
+    completed_run = next((r for r in runs if r["status"] == "COMPLETED"), None)
+    snapshots = list_knowledge_snapshots(repo_slug=repo_slug)
+    capability_profile = get_active_capability_profile(repo_slug)
+    deployment_profile = get_deployment_profile(repo_slug, environment=environment)
+    all_mappings = get_all_mappings()
+    active_mapping = next(
+        (m for m in all_mappings if m["repo_slug"] == repo_slug and m["is_active"]), None
+    )
+
+    activation_result = {"activated": False, "recommendations": [], "steps": {}}
+
+    if completed_run:
+        existing = next(
+            (m for m in all_mappings
+             if m["jira_project_key"] == jira_key and m["repo_slug"] == repo_slug and m["is_active"]),
+            None,
+        )
+        if existing:
+            mapping = update_mapping(existing["id"], base_branch=base_branch, auto_merge_enabled=auto_merge)
+            active_mapping = mapping
+        else:
+            mapping = add_mapping(
+                jira_project_key=jira_key, repo_slug=repo_slug, base_branch=base_branch,
+                auto_merge_enabled=auto_merge, notes="Activated via project dashboard (Phase 18)",
+            )
+            active_mapping = mapping
+
+        activation_result["steps"]["mapping"] = {"ok": True, "id": mapping["id"] if mapping else None}
+        activation_result["activated"] = bool(capability_profile)
+        if capability_profile and capability_profile.get("profile_name") == "generic_unknown":
+            activation_result["recommendations"].append(
+                "Profile is generic_unknown — add config/repo_command_hints.yaml to enable test validation."
+            )
+        if not auto_merge:
+            activation_result["recommendations"].append("auto_merge is off — all PRs require manual review (safe default).")
+
+    import os as _os
+    from app.database import count_completed_workflow_runs_for_repo
+    snaps_by_kind = {s["snapshot_kind"]: s for s in snapshots}
+    onboarding_completed = any(r["status"] == "COMPLETED" for r in runs)
+    latest_run = get_onboarding_run(runs[0]["id"]) if runs else None
+
+    first_use_enabled = _os.environ.get("FIRST_USE_MODE_ENABLED", "true").lower() == "true"
+    first_use_run_count = int(_os.environ.get("FIRST_USE_RUN_COUNT", "3"))
+    completed_run_count = count_completed_workflow_runs_for_repo(repo_slug)
+    first_use_mode_active = first_use_enabled and completed_run_count < first_use_run_count
+
+    return templates.TemplateResponse("admin/project_detail.html", {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": "projects",
+        "repo_slug": repo_slug,
+        "runs": runs,
+        "latest_run": latest_run,
+        "snapshots": snapshots,
+        "snapshots_by_kind": snaps_by_kind,
+        "capability_profile": capability_profile,
+        "deployment_profile": deployment_profile,
+        "active_mapping": active_mapping,
+        "onboarding_completed": onboarding_completed,
+        "activation_result": activation_result,
+        "first_use_mode_active": first_use_mode_active,
+        "first_use_run_count": first_use_run_count,
+        "completed_run_count": completed_run_count,
+        "self_modification_guard": repo_slug == _os.environ.get("ORCHESTRATOR_SELF_REPO", "suyog19/ai-dev-orchestrator"),
     })

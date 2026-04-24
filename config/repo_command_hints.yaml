@@ -1,0 +1,32 @@
+# Repo command hints — override or augment auto-detected capability profiles.
+#
+# Use this when a repo is detected as generic_unknown (e.g. monorepos without
+# root-level standard build files) but has known commands.
+#
+# Each entry overrides auto-detection for that repo_slug.
+# Fields:
+#   profile_name:     capability profile to use (e.g. python_fastapi_monorepo)
+#   test_command:     shell command to run tests (relative to repo root)
+#   build_command:    shell command to build (optional)
+#   lint_command:     shell command to lint (optional)
+#   source_patterns:  glob patterns for source files (optional)
+#   test_patterns:    glob patterns for test files (optional)
+#   primary_language: primary language hint (optional)
+#   framework:        framework hint (optional)
+#   notes:            human-readable note about why this hint exists
+
+repos:
+  # Example entry (uncomment and fill in when a Makefile is added):
+  # suyog19/suyogjoshi-com:
+  #   profile_name: python_fastapi_monorepo
+  #   test_command: make test
+  #   build_command: make build
+  #   lint_command: make lint
+  #   source_patterns:
+  #     - "services/**/app/**/*.py"
+  #     - "infra/**/*.py"
+  #   test_patterns:
+  #     - "services/**/tests/**/*.py"
+  #   primary_language: python
+  #   framework: fastapi
+  #   notes: "AWS Lambda/Mangum monorepo — commands require root Makefile"
