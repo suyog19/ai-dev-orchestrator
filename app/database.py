@@ -115,6 +115,10 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS waiting_for_clarification  BOOLEAN      NOT NULL DEFAULT FALSE",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS active_clarification_id    INTEGER      NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS summary                    TEXT         NULL",
+                # Phase 13 — GitHub-native checks
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS head_sha                        VARCHAR(100) NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published        BOOLEAN      NOT NULL DEFAULT FALSE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published_at     TIMESTAMP    NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -287,6 +291,28 @@ def init_db(retries: int = 5, delay: int = 3):
                     updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
                 )
             """)
+
+            # Phase 13 — GitHub commit status audit log
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS github_status_updates (
+                    id                   SERIAL PRIMARY KEY,
+                    run_id               INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    repo_slug            VARCHAR(200)  NOT NULL,
+                    commit_sha           VARCHAR(100)  NOT NULL,
+                    pr_number            INTEGER       NULL,
+                    context              VARCHAR(100)  NOT NULL,
+                    state                VARCHAR(20)   NOT NULL,
+                    description          TEXT          NULL,
+                    target_url           TEXT          NULL,
+                    github_response_json TEXT          NULL,
+                    created_at           TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_github_status_run_id "
+                "ON github_status_updates (run_id)"
+            )
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS security_events (
@@ -572,6 +598,8 @@ def update_run_field(run_id: int, **fields):
         "architecture_status", "architecture_required",
         "architecture_completed_at", "architecture_summary",
         "release_decision", "release_decision_reason", "release_decided_at",
+        # Phase 13
+        "head_sha", "github_statuses_published", "github_statuses_published_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -2585,6 +2613,164 @@ def list_clarifications(status: str | None = None, run_id: int | None = None, li
             "telegram_message_id": r[12],
             "created_at":          r[13].isoformat() if r[13] else None,
             "expires_at":          r[14].isoformat() if r[14] else None,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — GitHub commit status helpers
+# ---------------------------------------------------------------------------
+
+def get_run_verdicts(run_id: int) -> dict | None:
+    """Return all verdict fields needed for GitHub status publishing."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT test_status, review_status, test_quality_status,
+                       architecture_status, release_decision, head_sha,
+                       pr_url, issue_key
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "test_status":          row[0],
+        "review_status":        row[1],
+        "test_quality_status":  row[2],
+        "architecture_status":  row[3],
+        "release_decision":     row[4],
+        "head_sha":             row[5],
+        "pr_url":               row[6],
+        "issue_key":            row[7],
+    }
+
+def record_github_status_update(
+    run_id: int,
+    repo_slug: str,
+    commit_sha: str,
+    context: str,
+    state: str,
+    description: str | None = None,
+    pr_number: int | None = None,
+    target_url: str | None = None,
+    github_response_json: str | None = None,
+) -> int:
+    """Insert a row into github_status_updates and return its id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO github_status_updates
+                    (run_id, repo_slug, commit_sha, pr_number, context, state,
+                     description, target_url, github_response_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (run_id, repo_slug, commit_sha, pr_number, context, state,
+                 description, target_url, github_response_json),
+            )
+            return cur.fetchone()[0]
+
+
+def find_runs_eligible_for_status_backfill(
+    repo_slug: str | None = None,
+    limit: int = 20,
+    only_missing: bool = True,
+) -> list[dict]:
+    """Return runs that have a PR URL, a release decision, and a head_sha.
+
+    Optionally filter to only runs that have not yet published statuses.
+    Returns list of dicts with run_id, repo_slug (from mapping), head_sha, pr_url,
+    release_decision, github_statuses_published.
+    """
+    conditions = [
+        "wr.pr_url IS NOT NULL",
+        "wr.release_decision IS NOT NULL",
+        "wr.head_sha IS NOT NULL",
+    ]
+    params: list = []
+
+    if only_missing:
+        conditions.append("(wr.github_statuses_published = FALSE OR wr.github_statuses_published IS NULL)")
+
+    where_clause = " AND ".join(conditions)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT wr.id, wr.issue_key, wr.pr_url, wr.head_sha,
+                       wr.release_decision, wr.github_statuses_published,
+                       wr.test_status, wr.review_status, wr.test_quality_status,
+                       wr.architecture_status
+                FROM workflow_runs wr
+                WHERE {where_clause}
+                ORDER BY wr.id DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+
+    results = []
+    for r in rows:
+        pr_url = r[2] or ""
+        # Derive repo_slug from PR URL: https://github.com/owner/repo/pull/N
+        parts = pr_url.replace("https://github.com/", "").split("/")
+        derived_slug = f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else ""
+        if repo_slug and derived_slug != repo_slug:
+            continue
+        results.append({
+            "run_id":                    r[0],
+            "issue_key":                 r[1],
+            "pr_url":                    pr_url,
+            "head_sha":                  r[3],
+            "release_decision":          r[4],
+            "github_statuses_published": r[5],
+            "test_status":               r[6],
+            "review_status":             r[7],
+            "test_quality_status":       r[8],
+            "architecture_status":       r[9],
+            "repo_slug":                 derived_slug,
+        })
+    return results
+
+
+def list_github_status_updates(run_id: int) -> list[dict]:
+    """Return all github_status_updates rows for a run, newest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, repo_slug, commit_sha, pr_number, context,
+                       state, description, target_url, github_response_json,
+                       created_at, updated_at
+                FROM github_status_updates
+                WHERE run_id = %s
+                ORDER BY created_at DESC
+                """,
+                (run_id,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":                   r[0],
+            "run_id":               r[1],
+            "repo_slug":            r[2],
+            "commit_sha":           r[3],
+            "pr_number":            r[4],
+            "context":              r[5],
+            "state":                r[6],
+            "description":          r[7],
+            "target_url":           r[8],
+            "github_response_json": r[9],
+            "created_at":           r[10].isoformat() if r[10] else None,
+            "updated_at":           r[11].isoformat() if r[11] else None,
         }
         for r in rows
     ]

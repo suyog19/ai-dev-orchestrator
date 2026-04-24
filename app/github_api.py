@@ -130,8 +130,18 @@ def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
     """Fetch branch protection info and return an audit summary.
 
     Returns a dict with: repo_slug, branch, protected, required_reviews,
-    required_status_checks, allow_force_pushes, allow_deletions, warnings.
+    required_status_checks, allow_force_pushes, allow_deletions, warnings,
+    orchestrator_check_status (Phase 13: checks for required orchestrator contexts).
     """
+    from app.feedback import GitHubStatusContext, GITHUB_REQUIRED_CHECK
+
+    _OPTIONAL_ORCHESTRATOR_CHECKS = [
+        GitHubStatusContext.TESTS,
+        GitHubStatusContext.REVIEWER,
+        GitHubStatusContext.TEST_QUALITY,
+        GitHubStatusContext.ARCHITECTURE,
+    ]
+
     slug = _normalize_slug(repo_name)
     response = requests.get(
         f"{GITHUB_API}/repos/{slug}/branches/{branch}/protection",
@@ -147,7 +157,15 @@ def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
             "required_status_checks": [],
             "allow_force_pushes": True,
             "allow_deletions": True,
-            "warnings": [f"Branch '{branch}' has no protection rules"],
+            "warnings": [
+                f"Branch '{branch}' has no protection rules",
+                f"CRITICAL: '{GITHUB_REQUIRED_CHECK}' is not a required check — manual merge can bypass AI gates",
+            ],
+            "orchestrator_check_status": {
+                "release_gate_required": False,
+                "missing_required": [GITHUB_REQUIRED_CHECK],
+                "optional_configured": [],
+            },
         }
     response.raise_for_status()
     data = response.json()
@@ -159,9 +177,28 @@ def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
         warnings.append("No required PR reviews")
 
     req_checks = data.get("required_status_checks") or {}
-    checks = req_checks.get("contexts", []) + req_checks.get("checks", [])
-    if not checks:
+    # Contexts can appear as plain strings or as {"context": str} check objects
+    raw_contexts = req_checks.get("contexts", [])
+    raw_checks = req_checks.get("checks", [])
+    check_names = set(raw_contexts)
+    for c in raw_checks:
+        if isinstance(c, dict):
+            check_names.add(c.get("context", ""))
+        else:
+            check_names.add(str(c))
+
+    if not check_names:
         warnings.append("No required status checks configured")
+
+    # Phase 13 — verify orchestrator required check
+    release_gate_required = GITHUB_REQUIRED_CHECK in check_names
+    if not release_gate_required:
+        warnings.append(
+            f"CRITICAL: '{GITHUB_REQUIRED_CHECK}' is not a required check — "
+            "manual merge can bypass AI release gate"
+        )
+
+    optional_configured = [c for c in _OPTIONAL_ORCHESTRATOR_CHECKS if c in check_names]
 
     force_push = (data.get("allow_force_pushes") or {}).get("enabled", False)
     if force_push:
@@ -178,10 +215,15 @@ def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
         "required_reviews": required_reviews,
         "required_reviews_count": req_reviews.get("required_approving_review_count", 0),
         "dismiss_stale_reviews": req_reviews.get("dismiss_stale_reviews", False),
-        "required_status_checks": checks,
+        "required_status_checks": sorted(check_names),
         "allow_force_pushes": force_push,
         "allow_deletions": allow_del,
         "warnings": warnings,
+        "orchestrator_check_status": {
+            "release_gate_required": release_gate_required,
+            "missing_required": [] if release_gate_required else [GITHUB_REQUIRED_CHECK],
+            "optional_configured": optional_configured,
+        },
     }
 
 
@@ -195,6 +237,76 @@ def get_pr_diff(repo_name: str, pr_number: int) -> str:
     )
     response.raise_for_status()
     return response.text
+
+
+def get_pr_details(repo_slug: str, pr_number: int) -> dict:
+    """Fetch PR metadata including the head commit SHA.
+
+    Returns dict with: number, head_sha, head_ref, base_ref, state, html_url.
+    Raises on HTTP errors.
+    """
+    slug = _normalize_slug(repo_slug)
+    response = requests.get(
+        f"{GITHUB_API}/repos/{slug}/pulls/{pr_number}",
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {
+        "number":   data["number"],
+        "head_sha": data["head"]["sha"],
+        "head_ref": data["head"]["ref"],
+        "base_ref": data["base"]["ref"],
+        "state":    data["state"],
+        "html_url": data["html_url"],
+    }
+
+
+_VALID_GITHUB_STATES = {"success", "failure", "pending", "error"}
+
+
+def create_commit_status(
+    repo_slug: str,
+    sha: str,
+    state: str,
+    context: str,
+    description: str,
+    target_url: str | None = None,
+) -> dict:
+    """Publish a GitHub commit status on a specific SHA.
+
+    state must be one of: success, failure, pending, error.
+    Raises ValueError for invalid state, RuntimeError/HTTPError on API failures.
+    Returns the GitHub API response dict.
+    """
+    if state not in _VALID_GITHUB_STATES:
+        raise ValueError(f"Invalid GitHub status state '{state}'. Must be one of {_VALID_GITHUB_STATES}")
+    if not sha or len(sha) < 7:
+        raise ValueError(f"Invalid commit SHA: {sha!r}")
+
+    # GitHub descriptions >140 chars are silently truncated — enforce here so logs are accurate
+    if len(description) > 140:
+        description = description[:137] + "..."
+
+    slug = _normalize_slug(repo_slug)
+    payload: dict = {"state": state, "context": context, "description": description}
+    if target_url:
+        payload["target_url"] = target_url
+
+    response = requests.post(
+        f"{GITHUB_API}/repos/{slug}/statuses/{sha}",
+        json=payload,
+        headers=_headers(),
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    logger.info(
+        "Commit status published: repo=%s sha=%.8s context=%s state=%s",
+        slug, sha, context, state,
+    )
+    return data
 
 
 def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:

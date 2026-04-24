@@ -26,6 +26,7 @@ from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
+from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill
 
 load_dotenv()
 
@@ -482,6 +483,53 @@ def get_workflow_run_release_decision(run_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Phase 13 — GitHub status update inspection APIs
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/github-status-updates")
+def list_github_status_updates_endpoint(run_id: int):
+    """List all GitHub commit status updates for a specific workflow run."""
+    rows = list_github_status_updates(run_id)
+    return {"run_id": run_id, "count": len(rows), "statuses": rows}
+
+
+@app.get("/debug/workflow-runs/{run_id}/github-statuses")
+def get_run_github_statuses(run_id: int):
+    """Return GitHub commit statuses published for a specific workflow run."""
+    rows = list_github_status_updates(run_id)
+    return {"run_id": run_id, "count": len(rows), "statuses": rows}
+
+
+@app.post("/debug/workflow-runs/{run_id}/republish-github-statuses")
+def republish_github_statuses(run_id: int, repo_slug: str):
+    """Re-publish GitHub commit statuses for a completed run.
+
+    Idempotent: duplicate statuses on GitHub are acceptable (GitHub keeps the latest per context).
+    A new row is always recorded in github_status_updates for the republish attempt.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.database import get_run_verdicts
+    from app.github_status_publisher import publish_github_statuses_for_run
+    from app.security import ensure_github_writes_allowed
+
+    run = get_run_verdicts(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Workflow run {run_id} not found")
+
+    try:
+        ensure_github_writes_allowed("status", repo_slug, run_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    result = publish_github_statuses_for_run(run_id, repo_slug)
+    return {
+        "run_id":    run_id,
+        "repo_slug": repo_slug,
+        "result":    result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Epic outcome rollup — generate and inspect
 # ---------------------------------------------------------------------------
 
@@ -864,6 +912,113 @@ def audit_branch_protection(repo_slug: str, branch: str = "main"):
         return get_branch_protection(repo_slug, branch)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
+
+
+class ValidateRequiredChecksRequest(BaseModel):
+    repo_slug: str
+    branch: str = "main"
+
+
+@app.post("/admin/github/branch-protection/validate-required-checks")
+def validate_required_checks(body: ValidateRequiredChecksRequest):
+    """Dry-run assessment of whether required orchestrator status checks are configured.
+
+    Read-only — does not mutate GitHub branch protection settings.
+    Returns: valid (bool), missing_required_contexts, recommendations.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.github_api import get_branch_protection
+    from app.feedback import GITHUB_REQUIRED_CHECK
+
+    try:
+        audit = get_branch_protection(body.repo_slug, body.branch)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
+
+    orch_status = audit.get("orchestrator_check_status", {})
+    missing = orch_status.get("missing_required", [])
+    valid = len(missing) == 0
+
+    recommendations = []
+    if not audit.get("protected"):
+        recommendations.append(
+            f"Branch '{body.branch}' has no protection rules. Enable branch protection "
+            "and require the orchestrator/release-gate status check."
+        )
+    elif not valid:
+        recommendations.append(
+            f"Add '{GITHUB_REQUIRED_CHECK}' as a required status check in GitHub → "
+            f"Settings → Branches → {body.branch} → Required status checks."
+        )
+    if audit.get("allow_force_pushes"):
+        recommendations.append("Disable force pushes to prevent bypassing required checks.")
+
+    return {
+        "repo_slug":                body.repo_slug,
+        "branch":                   body.branch,
+        "valid":                    valid,
+        "protected":                audit.get("protected", False),
+        "missing_required_contexts": missing,
+        "optional_configured":      orch_status.get("optional_configured", []),
+        "current_required_checks":  audit.get("required_status_checks", []),
+        "recommendations":          recommendations,
+    }
+
+
+class BackfillRequest(BaseModel):
+    repo_slug: str | None = None
+    limit: int = 20
+    only_missing: bool = True
+
+
+@app.post("/admin/github/statuses/backfill")
+def backfill_github_statuses(body: BackfillRequest):
+    """Backfill GitHub commit statuses for recent eligible runs.
+
+    Eligible runs: have a PR URL, release decision, and head_sha.
+    Ineligible runs (no head_sha) are reported as skipped with reason.
+    Safe to rerun — GitHub keeps the latest status per context, DB records each attempt.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.github_status_publisher import publish_github_statuses_for_run
+    from app.security import ensure_github_writes_allowed
+
+    eligible = find_runs_eligible_for_status_backfill(
+        repo_slug=body.repo_slug,
+        limit=body.limit,
+        only_missing=body.only_missing,
+    )
+
+    published_runs = []
+    skipped_runs = []
+    failed_runs = []
+
+    for run in eligible:
+        run_id = run["run_id"]
+        repo_slug = run["repo_slug"]
+        try:
+            ensure_github_writes_allowed("status", repo_slug, run_id)
+        except RuntimeError as exc:
+            skipped_runs.append({"run_id": run_id, "reason": str(exc)})
+            continue
+
+        result = publish_github_statuses_for_run(run_id, repo_slug)
+        if result["skipped"]:
+            skipped_runs.append({"run_id": run_id, "reason": result["errors"][0] if result["errors"] else "skipped"})
+        elif result["failed"] > 0:
+            failed_runs.append({"run_id": run_id, "errors": result["errors"]})
+        else:
+            published_runs.append({"run_id": run_id, "published": result["published"]})
+
+    return {
+        "eligible_found":   len(eligible),
+        "published_count":  len(published_runs),
+        "skipped_count":    len(skipped_runs),
+        "failed_count":     len(failed_runs),
+        "published_runs":   published_runs,
+        "skipped_runs":     skipped_runs,
+        "failed_runs":      failed_runs,
+    }
 
 
 @app.post("/admin/resume", status_code=200)

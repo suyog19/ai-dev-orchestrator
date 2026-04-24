@@ -56,6 +56,10 @@ class FeedbackType:
     CLARIFICATION_CANCELLED     = "clarification_cancelled"
     CLARIFICATION_EXPIRED       = "clarification_expired"
     CLARIFICATION_COUNT         = "clarification_count"
+    # GitHub status signals (Phase 13)
+    GITHUB_STATUSES_PUBLISHED   = "github_statuses_published"
+    GITHUB_STATUS_PUBLISH_FAILED = "github_status_publish_failed"
+    GITHUB_REQUIRED_CHECK_MISSING = "github_required_check_missing"
 
 
 class ClarificationStatus:
@@ -168,6 +172,25 @@ ARCHITECTURE_REVIEW_BLOCKS_MERGE = True  # ARCHITECTURE_APPROVED required for au
 # Phase 12 — Clarification config
 CLARIFICATION_ENABLED        = True   # master switch; set False to disable all clarification checkpoints
 CLARIFICATION_TIMEOUT_HOURS  = 24     # hours before a PENDING clarification expires
+
+# Phase 13 — GitHub commit status context names
+class GitHubStatusContext:
+    TESTS            = "orchestrator/tests"
+    REVIEWER         = "orchestrator/reviewer-agent"
+    TEST_QUALITY     = "orchestrator/test-quality-agent"
+    ARCHITECTURE     = "orchestrator/architecture-agent"
+    RELEASE_GATE     = "orchestrator/release-gate"
+
+
+class GitHubState:
+    SUCCESS = "success"
+    FAILURE = "failure"
+    PENDING = "pending"
+    ERROR   = "error"
+
+
+# The single required context for branch protection
+GITHUB_REQUIRED_CHECK = GitHubStatusContext.RELEASE_GATE
 
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5
