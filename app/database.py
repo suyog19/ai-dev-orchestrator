@@ -103,6 +103,14 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_required    BOOLEAN      NOT NULL DEFAULT TRUE",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_completed_at TIMESTAMP   NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_summary     TEXT         NULL",
+                # Phase 10 — Architecture Agent + Release Gate
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_status        VARCHAR(50)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_required      BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_completed_at  TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS architecture_summary       TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision           VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision_reason    TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decided_at         TIMESTAMP    NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -222,6 +230,29 @@ def init_db(retries: int = 5, delay: int = 3):
                     findings_json            TEXT          NULL,
                     recommendations_json     TEXT          NULL,
                     blocking_reasons_json    TEXT          NULL,
+                    model_used               VARCHAR(100)  NULL,
+                    memory_snapshot_ids_json TEXT          NULL,
+                    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            # Phase 10 — Architecture Agent reviews
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agent_architecture_reviews (
+                    id                       SERIAL PRIMARY KEY,
+                    run_id                   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    pr_number                INTEGER       NULL,
+                    pr_url                   VARCHAR(500)  NULL,
+                    repo_slug                VARCHAR(200)  NULL,
+                    story_key                VARCHAR(100)  NULL,
+                    agent_name               VARCHAR(100)  NOT NULL DEFAULT 'architecture_agent',
+                    architecture_status      VARCHAR(50)   NOT NULL,
+                    risk_level               VARCHAR(20)   NULL,
+                    summary                  TEXT          NULL,
+                    impact_areas_json        TEXT          NULL,
+                    blocking_reasons_json    TEXT          NULL,
+                    recommendations_json     TEXT          NULL,
                     model_used               VARCHAR(100)  NULL,
                     memory_snapshot_ids_json TEXT          NULL,
                     created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
@@ -352,6 +383,10 @@ def update_run_field(run_id: int, **fields):
         # Phase 9
         "test_quality_status", "test_quality_required",
         "test_quality_completed_at", "test_quality_summary",
+        # Phase 10
+        "architecture_status", "architecture_required",
+        "architecture_completed_at", "architecture_summary",
+        "release_decision", "release_decision_reason", "release_decided_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -493,6 +528,66 @@ def store_test_quality_review(
         run_id, tqr_id, quality_status,
     )
     return tqr_id
+
+
+def store_architecture_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist an Architecture Agent verdict and update workflow_runs architecture fields.
+
+    Inserts one row into agent_architecture_reviews and sets architecture_status
+    + architecture_completed_at on the parent workflow_run. Returns the new row id.
+    """
+    from app.feedback import AgentName
+
+    architecture_status = verdict.get("architecture_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_architecture_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, architecture_status, risk_level, summary,
+                     impact_areas_json, blocking_reasons_json, recommendations_json, model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.ARCHITECTURE_AGENT,
+                    architecture_status,
+                    verdict.get("risk_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("impact_areas") or []),
+                    json.dumps(verdict.get("blocking_reasons") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    model_used,
+                ),
+            )
+            ar_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET architecture_status = %s, architecture_completed_at = NOW(),
+                    architecture_summary = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (architecture_status, verdict.get("summary"), run_id),
+            )
+
+    logger.info(
+        "store_architecture_review: run_id=%s ar_id=%s status=%s",
+        run_id, ar_id, architecture_status,
+    )
+    return ar_id
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1018,34 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             tq_row = cur.fetchone()
 
+            # --- Architecture Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_approved'      AND feedback_value='true') AS arch_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_needs_review'  AND feedback_value='true') AS arch_needs_review,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='architecture_blocked'       AND feedback_value='true') AS arch_blocked
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            arch_row = cur.fetchone()
+
+            # --- Release Gate stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_APPROVED') AS rel_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_BLOCKED')  AS rel_blocked,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='release_decision' AND feedback_value='RELEASE_SKIPPED')  AS rel_skipped
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            release_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -1000,6 +1123,36 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                         "tq_approved":  int(tq_approved or 0),
                         "tq_weak":      int(tq_weak or 0),
                         "tq_blocking":  int(tq_blocking or 0),
+                    })
+
+            if arch_row:
+                arch_approved, arch_needs_review, arch_blocked = arch_row
+                arch_total = (arch_approved or 0) + (arch_needs_review or 0) + (arch_blocked or 0)
+                if int(arch_total) > 0:
+                    exec_bullets.append(
+                        f"Architecture Agent: {int(arch_approved or 0)} approved, "
+                        f"{int(arch_needs_review or 0)} needs-review, "
+                        f"{int(arch_blocked or 0)} blocked of {int(arch_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "arch_approved":     int(arch_approved or 0),
+                        "arch_needs_review": int(arch_needs_review or 0),
+                        "arch_blocked":      int(arch_blocked or 0),
+                    })
+
+            if release_row:
+                rel_approved, rel_blocked, rel_skipped = release_row
+                rel_total = (rel_approved or 0) + (rel_blocked or 0) + (rel_skipped or 0)
+                if int(rel_total) > 0:
+                    exec_bullets.append(
+                        f"Release Gate: {int(rel_approved or 0)} approved, "
+                        f"{int(rel_blocked or 0)} blocked, "
+                        f"{int(rel_skipped or 0)} skipped of {int(rel_total)} decisions"
+                    )
+                    exec_evidence.update({
+                        "release_approved": int(rel_approved or 0),
+                        "release_blocked":  int(rel_blocked or 0),
+                        "release_skipped":  int(rel_skipped or 0),
                     })
 
             exec_summary = (
@@ -1099,7 +1252,8 @@ def record_execution_feedback(run_id: int) -> int:
                 """
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
-                       review_status, test_quality_status
+                       review_status, test_quality_status,
+                       architecture_status, release_decision
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -1109,7 +1263,8 @@ def record_execution_feedback(run_id: int) -> int:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
                 files_changed_count, error_detail, current_step, \
-                review_status, test_quality_status = row
+                review_status, test_quality_status, \
+                architecture_status, release_decision = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1207,6 +1362,29 @@ def record_execution_feedback(run_id: int) -> int:
                         _ev(FeedbackType.SUSPICIOUS_TEST_COUNT, len(json.loads(tqr[2] or "[]")))
                     except Exception:
                         pass
+
+            # Architecture signals (Phase 10)
+            if architecture_status:
+                from app.feedback import ArchitectureStatus
+                _ev(FeedbackType.ARCHITECTURE_STATUS, architecture_status)
+                if architecture_status == ArchitectureStatus.APPROVED:
+                    _ev(FeedbackType.ARCHITECTURE_APPROVED, "true")
+                elif architecture_status == ArchitectureStatus.NEEDS_REVIEW:
+                    _ev(FeedbackType.ARCHITECTURE_NEEDS_REVIEW, "true")
+                elif architecture_status == ArchitectureStatus.BLOCKED:
+                    _ev(FeedbackType.ARCHITECTURE_BLOCKED, "true")
+
+                cur.execute(
+                    "SELECT risk_level FROM agent_architecture_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                )
+                ar_row = cur.fetchone()
+                if ar_row and ar_row[0]:
+                    _ev(FeedbackType.ARCHITECTURE_RISK_LEVEL, ar_row[0])
+
+            # Release Gate signals (Phase 10)
+            if release_decision:
+                _ev(FeedbackType.RELEASE_DECISION, release_decision)
 
             if not events:
                 return 0
@@ -1739,6 +1917,69 @@ def list_test_quality_reviews(
             "model_used":        r[14],
             "created_at":        r[15].isoformat() if r[15] else None,
             "updated_at":        r[16].isoformat() if r[16] else None,
+        }
+        for r in rows
+    ]
+
+
+def list_architecture_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    architecture_status: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return agent_architecture_reviews rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    if repo_slug is not None:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    if architecture_status is not None:
+        conditions.append("architecture_status = %s")
+        params.append(architecture_status)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, pr_number, pr_url, repo_slug, story_key,
+                       agent_name, architecture_status, risk_level, summary,
+                       impact_areas_json, blocking_reasons_json, recommendations_json,
+                       model_used, created_at, updated_at
+                FROM agent_architecture_reviews
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":                    r[0],
+            "run_id":                r[1],
+            "pr_number":             r[2],
+            "pr_url":                r[3],
+            "repo_slug":             r[4],
+            "story_key":             r[5],
+            "agent_name":            r[6],
+            "architecture_status":   r[7],
+            "risk_level":            r[8],
+            "summary":               r[9],
+            "impact_areas":          json.loads(r[10]) if r[10] else [],
+            "blocking_reasons":      json.loads(r[11]) if r[11] else [],
+            "recommendations":       json.loads(r[12]) if r[12] else [],
+            "model_used":            r[13],
+            "created_at":            r[14].isoformat() if r[14] else None,
+            "updated_at":            r[15].isoformat() if r[15] else None,
         }
         for r in rows
     ]

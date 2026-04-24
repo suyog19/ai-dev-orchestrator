@@ -1011,3 +1011,205 @@ def review_test_quality(
         raise RuntimeError("Test Quality Agent returned no tool_use block")
 
     return tool_block.input
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Architecture / Impact Agent
+# ---------------------------------------------------------------------------
+
+ARCHITECTURE_PROMPT = (
+    "You are an independent Architecture / Impact Agent. Your job is to assess whether a PR "
+    "is safe from a design and system-impact perspective — independently of whether tests pass "
+    "or the code matches the Story.\n\n"
+    "You will receive:\n"
+    "- The Jira Story (key, summary, description, acceptance criteria)\n"
+    "- Repository context (language, framework, repo slug)\n"
+    "- The PR (number, title, body)\n"
+    "- The unified diff and changed file list\n"
+    "- Signal context (test status, reviewer verdict, test quality verdict, file count, retry count)\n"
+    "- Memory context (prior lessons from this repository)\n\n"
+    "Evaluate these dimensions:\n"
+    "1. Scope discipline — Is the change limited to the Story scope? Unrelated refactoring or touching too many layers?\n"
+    "2. API compatibility — Did request/response shape or endpoint behavior change? Backward-compatible?\n"
+    "3. Data/model impact — Schema or model change? Migration needed? Risk to stored data?\n"
+    "4. Dependency impact — New dependency added? Existing dependency changed? Version risk?\n"
+    "5. Operational impact — Config or env var changes? Deployment/runtime impact?\n"
+    "6. Security impact — Auth/permission changes? Input validation changed? Sensitive data exposure?\n"
+    "7. Maintainability — Design coherent? Duplication introduced? Future maintenance risk?\n\n"
+    "Verdict rules (strictly enforced):\n"
+    "- ARCHITECTURE_BLOCKED: auth/security/data compatibility unsafe; change contradicts Story; "
+    "large unrelated redesign introduced; response contract broken without justification.\n"
+    "- ARCHITECTURE_NEEDS_REVIEW: medium-risk design concern; change is broader than Story but not dangerous; "
+    "design could cause future maintenance issues.\n"
+    "- ARCHITECTURE_APPROVED: change is scoped to the Story, no meaningful architecture or system risk detected.\n\n"
+    "Do not penalize for style. Do not comment on test adequacy (that is the Test Quality Agent's job). "
+    "Do not repeat what the Reviewer Agent says about code quality. "
+    "Call the submit_architecture_review tool only — do not respond with prose."
+)
+
+_ARCHITECTURE_TOOL = {
+    "name": "submit_architecture_review",
+    "description": "Submit a structured architecture and system-impact verdict for a PR.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "architecture_status": {
+                "type": "string",
+                "enum": ["ARCHITECTURE_APPROVED", "ARCHITECTURE_NEEDS_REVIEW", "ARCHITECTURE_BLOCKED"],
+                "description": (
+                    "Overall verdict. ARCHITECTURE_BLOCKED for unsafe security/data/API changes or scope violations. "
+                    "ARCHITECTURE_NEEDS_REVIEW for medium-risk design concerns. "
+                    "ARCHITECTURE_APPROVED for scoped, low-risk changes."
+                ),
+            },
+            "risk_level": {
+                "type": "string",
+                "enum": ["LOW", "MEDIUM", "HIGH"],
+                "description": "Overall architecture risk level of this change.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "1-3 sentences summarising the architecture verdict.",
+            },
+            "impact_areas": {
+                "type": "array",
+                "description": "Assessment per impact dimension.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "area": {
+                            "type": "string",
+                            "enum": ["api", "data", "security", "dependencies", "config", "scope", "maintainability"],
+                            "description": "The impact dimension being assessed.",
+                        },
+                        "risk": {
+                            "type": "string",
+                            "enum": ["LOW", "MEDIUM", "HIGH"],
+                            "description": "Risk level for this specific area.",
+                        },
+                        "finding": {
+                            "type": "string",
+                            "description": "Concise finding for this area.",
+                        },
+                    },
+                    "required": ["area", "risk", "finding"],
+                },
+            },
+            "blocking_reasons": {
+                "type": "array",
+                "description": "Reasons for ARCHITECTURE_BLOCKED verdict (empty if not blocked).",
+                "items": {"type": "string"},
+            },
+            "recommendations": {
+                "type": "array",
+                "description": "Non-blocking suggestions for design improvements.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "architecture_status", "risk_level", "summary",
+            "impact_areas", "blocking_reasons", "recommendations",
+        ],
+    },
+}
+
+
+def review_architecture(
+    story_context: dict,
+    repo_context: dict,
+    pr_context: dict,
+    diff_context: dict,
+    signal_context: dict,
+    memory_context: str = "",
+) -> dict:
+    """Run the Architecture Agent against a PR and return a structured verdict.
+
+    story_context keys: key, summary, description, acceptance_criteria (list[str])
+    repo_context keys: repo_slug, primary_language, framework
+    pr_context keys: number, url, title, body
+    diff_context keys: full_diff (str), changed_files (list[str])
+    signal_context keys: test_status, review_status, test_quality_status,
+                         files_changed_count, retry_count
+    memory_context: formatted bullet string from get_execution_memory()
+
+    Returns the submit_architecture_review tool input dict:
+    {
+        "architecture_status": "ARCHITECTURE_APPROVED" | "ARCHITECTURE_NEEDS_REVIEW" | "ARCHITECTURE_BLOCKED",
+        "risk_level":          "LOW" | "MEDIUM" | "HIGH",
+        "summary":             "...",
+        "impact_areas":        [{"area": ..., "risk": ..., "finding": ...}, ...],
+        "blocking_reasons":    [...],
+        "recommendations":     [...],
+    }
+    Raises RuntimeError if Claude returns no tool_use block.
+    """
+    ac_lines = "\n".join(
+        f"  - {ac}" for ac in (story_context.get("acceptance_criteria") or [])
+    )
+    story_block = (
+        f"Story: {story_context.get('key', '')} — {story_context.get('summary', '')}\n"
+        f"Description: {story_context.get('description') or '(none)'}\n"
+        f"Acceptance criteria:\n{ac_lines or '  (none provided)'}"
+    )
+
+    repo_block = (
+        f"Repository: {repo_context.get('repo_slug', '')}\n"
+        f"Language: {repo_context.get('primary_language', 'unknown')}\n"
+        f"Framework: {repo_context.get('framework', 'unknown')}"
+    )
+
+    pr_body = (pr_context.get("body") or "").strip()[:800]
+    changed_files = "\n".join(f"  - {f}" for f in (diff_context.get("changed_files") or []))
+
+    diff_trimmed = (diff_context.get("full_diff") or "").strip()
+    if len(diff_trimmed) > 8000:
+        diff_trimmed = diff_trimmed[:8000] + "\n... (diff truncated)"
+
+    memory_block = (
+        f"Prior lessons from this repository:\n{memory_context}\n\n"
+        if memory_context else ""
+    )
+
+    user_content = (
+        f"{story_block}\n\n"
+        f"{repo_block}\n\n"
+        f"PR #{pr_context.get('number', '')} — {pr_context.get('title', '')}\n"
+        f"PR URL: {pr_context.get('url', '')}\n"
+        f"PR body:\n{pr_body or '  (none)'}\n\n"
+        f"Changed files ({signal_context.get('files_changed_count', 0)} total):\n"
+        f"{changed_files or '  (none)'}\n\n"
+        f"Other agent signals:\n"
+        f"  Test status: {signal_context.get('test_status', 'NOT_RUN')}\n"
+        f"  Reviewer verdict: {signal_context.get('review_status', 'N/A')}\n"
+        f"  Test Quality verdict: {signal_context.get('test_quality_status', 'N/A')}\n"
+        f"  Files changed: {signal_context.get('files_changed_count', 0)}\n"
+        f"  Retry count: {signal_context.get('retry_count', 0)}\n\n"
+        f"Unified diff:\n```\n{diff_trimmed}\n```\n\n"
+        f"{memory_block}"
+        f"Assess the architecture and system impact, then call submit_architecture_review with your verdict."
+    )
+
+    response = _CLIENT.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=[{
+            "type": "text",
+            "text": ARCHITECTURE_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }],
+        tools=[_ARCHITECTURE_TOOL],
+        tool_choice={"type": "tool", "name": "submit_architecture_review"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Claude architecture_review done (sonnet) — input=%s output=%s",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        raise RuntimeError("Architecture Agent returned no tool_use block")
+
+    return tool_block.input

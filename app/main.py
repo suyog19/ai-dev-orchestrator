@@ -15,6 +15,7 @@ from app.database import (
     generate_epic_outcome_rollup,
     list_agent_reviews,
     list_test_quality_reviews,
+    list_architecture_reviews,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -417,6 +418,61 @@ def get_workflow_run_test_quality(run_id: int):
     if not reviews:
         raise HTTPException(status_code=404, detail=f"No test quality reviews found for run_id={run_id}")
     return {"run_id": run_id, "test_quality_reviews": reviews, "count": len(reviews)}
+
+
+@app.get("/debug/architecture-reviews")
+def get_architecture_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    architecture_status: str | None = None,
+    limit: int = 20,
+):
+    """List agent_architecture_reviews rows. Filter by run_id, repo_slug, or architecture_status."""
+    return list_architecture_reviews(
+        run_id=run_id,
+        repo_slug=repo_slug,
+        architecture_status=architecture_status,
+        limit=limit,
+    )
+
+
+@app.get("/debug/workflow-runs/{run_id}/architecture")
+def get_workflow_run_architecture(run_id: int):
+    """Return all Architecture Agent verdicts for a specific workflow run."""
+    reviews = list_architecture_reviews(run_id=run_id)
+    if not reviews:
+        raise HTTPException(status_code=404, detail=f"No architecture reviews found for run_id={run_id}")
+    return {"run_id": run_id, "architecture_reviews": reviews, "count": len(reviews)}
+
+
+@app.get("/debug/workflow-runs/{run_id}/release-decision")
+def get_workflow_run_release_decision(run_id: int):
+    """Return the release decision and architecture status for a specific workflow run."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, release_decision, release_decision_reason, release_decided_at,
+                       architecture_status, architecture_summary,
+                       merge_status, review_status, test_quality_status
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Workflow run {run_id} not found")
+    return {
+        "run_id":                  row[0],
+        "release_decision":        row[1],
+        "release_decision_reason": row[2],
+        "release_decided_at":      row[3].isoformat() if row[3] else None,
+        "architecture_status":     row[4],
+        "architecture_summary":    row[5],
+        "merge_status":            row[6],
+        "review_status":           row[7],
+        "test_quality_status":     row[8],
+    }
 
 
 # ---------------------------------------------------------------------------
