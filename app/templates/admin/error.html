@@ -1,0 +1,11 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Error{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Error</h1>
+</div>
+<div class="alert alert-error">{{ message }}</div>
+<p><a href="javascript:history.back()" class="btn btn-ghost btn-sm">← Go Back</a></p>
+{% endblock %}

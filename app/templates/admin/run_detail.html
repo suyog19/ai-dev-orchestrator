@@ -1,0 +1,202 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Run #{{ run.id }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Run #{{ run.id }} — <code>{{ run.issue_key or 'no issue' }}</code></h1>
+  <p class="subtitle">{{ run.workflow_type or '—' }} &middot; created {{ (run.created_at or '')[:16] }}</p>
+</div>
+
+<a href="/admin/ui/runs" class="btn btn-ghost btn-sm" style="margin-bottom:20px;">← Back to Runs</a>
+
+<!-- Summary row -->
+<div class="card-grid" style="margin-top:16px;">
+  <div class="stat-card">
+    <div class="stat-label">Status</div>
+    <div style="margin-top:8px;">
+      {% if run.status == 'COMPLETED' %}<span class="pill pill-green">{{ run.status }}</span>
+      {% elif run.status == 'FAILED' %}<span class="pill pill-red">{{ run.status }}</span>
+      {% elif run.status in ('RUNNING','QUEUED') %}<span class="pill pill-yellow">{{ run.status }}</span>
+      {% else %}<span class="pill pill-gray">{{ run.status }}</span>{% endif %}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Release Decision</div>
+    <div style="margin-top:8px;">
+      {% if run.release_decision == 'RELEASE_APPROVED' %}<span class="pill pill-green">APPROVED</span>
+      {% elif run.release_decision == 'RELEASE_BLOCKED' %}<span class="pill pill-red">BLOCKED</span>
+      {% elif run.release_decision == 'RELEASE_SKIPPED' %}<span class="pill pill-yellow">SKIPPED</span>
+      {% elif run.release_decision %}<span class="pill pill-gray">{{ run.release_decision }}</span>
+      {% else %}<span class="text-muted">—</span>{% endif %}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Merge Status</div>
+    <div style="margin-top:8px;">
+      {% if run.merge_status == 'MERGED' %}<span class="pill pill-green">MERGED</span>
+      {% elif run.merge_status and 'BLOCKED' in run.merge_status %}<span class="pill pill-red">{{ run.merge_status }}</span>
+      {% elif run.merge_status %}<span class="pill pill-gray">{{ run.merge_status }}</span>
+      {% else %}<span class="text-muted">—</span>{% endif %}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Tests</div>
+    <div style="margin-top:8px;">
+      {% if run.test_status == 'PASSED' %}<span class="pill pill-green">PASSED</span>
+      {% elif run.test_status == 'FAILED' %}<span class="pill pill-red">FAILED</span>
+      {% elif run.test_status %}<span class="pill pill-gray">{{ run.test_status }}</span>
+      {% else %}<span class="text-muted">—</span>{% endif %}
+    </div>
+  </div>
+</div>
+
+<!-- Repo / Branch / PR info -->
+<div class="card">
+  <h2>Run Info</h2>
+  <table style="width:auto;">
+    <tbody>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0; white-space:nowrap;">Current Step</td><td><code>{{ run.current_step or '—' }}</code></td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Branch</td><td><code>{{ run.working_branch or '—' }}</code></td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Head SHA</td><td><code>{{ (run.head_sha or '—')[:12] }}</code></td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Files Changed</td><td>{{ run.files_changed_count or '—' }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Retry Count</td><td>{{ run.retry_count or 0 }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">PR</td><td>
+        {% if run.pr_url %}<a href="{{ run.pr_url }}" target="_blank" rel="noopener">{{ run.pr_url }}</a>{% else %}—{% endif %}
+      </td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">GitHub Statuses</td><td>
+        {% if run.github_statuses_published %}<span class="pill pill-green">Published</span>{% else %}<span class="pill pill-gray">Not Published</span>{% endif %}
+        {% if run.github_statuses_published_at %}<span class="text-muted" style="font-size:12px;">{{ run.github_statuses_published_at[:16] }}</span>{% endif %}
+      </td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Started</td><td>{{ run.started_at or '—' }}</td></tr>
+      <tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Completed</td><td>{{ run.completed_at or '—' }}</td></tr>
+      {% if run.merged_at %}<tr><td style="color:#6b7280; padding:4px 16px 4px 0;">Merged</td><td>{{ run.merged_at }}</td></tr>{% endif %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Release decision reason -->
+{% if run.release_decision_reason %}
+<div class="card">
+  <h2>Release Gate Reason</h2>
+  <p style="font-size:13px;">{{ run.release_decision_reason }}</p>
+</div>
+{% endif %}
+
+<!-- Reviewer Agent -->
+<div class="card">
+  <h2>Reviewer Agent</h2>
+  {% if run.agent_review %}
+  {% set r = run.agent_review %}
+  <p>
+    {% if r.review_status == 'APPROVED_BY_AI' %}<span class="pill pill-green">{{ r.review_status }}</span>
+    {% elif r.review_status == 'BLOCKED' %}<span class="pill pill-red">{{ r.review_status }}</span>
+    {% elif r.review_status %}<span class="pill pill-yellow">{{ r.review_status }}</span>
+    {% endif %}
+    {% if r.risk_level %} &middot; Risk: <strong>{{ r.risk_level }}</strong>{% endif %}
+  </p>
+  {% if r.summary %}<p style="margin-top:8px; font-size:13px;">{{ r.summary }}</p>{% endif %}
+  {% if r.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ r.blocking_reasons }}</p>{% endif %}
+  {% if r.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ r.recommendations }}</p>{% endif %}
+  {% else %}
+  <p class="text-muted">No review recorded.</p>
+  {% endif %}
+</div>
+
+<!-- Test Quality Agent -->
+<div class="card">
+  <h2>Test Quality Agent</h2>
+  {% if run.tq_review %}
+  {% set tq = run.tq_review %}
+  <p>
+    {% if tq.quality_status == 'TEST_QUALITY_APPROVED' %}<span class="pill pill-green">{{ tq.quality_status }}</span>
+    {% elif tq.quality_status == 'TESTS_BLOCKING' %}<span class="pill pill-red">{{ tq.quality_status }}</span>
+    {% elif tq.quality_status %}<span class="pill pill-yellow">{{ tq.quality_status }}</span>
+    {% endif %}
+    {% if tq.confidence_level %} &middot; Confidence: <strong>{{ tq.confidence_level }}</strong>{% endif %}
+    {% if tq.missing_test_count %} &middot; Missing: {{ tq.missing_test_count }}{% endif %}
+  </p>
+  {% if tq.summary %}<p style="margin-top:8px; font-size:13px;">{{ tq.summary }}</p>{% endif %}
+  {% if tq.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ tq.blocking_reasons }}</p>{% endif %}
+  {% else %}
+  <p class="text-muted">No test quality review recorded.</p>
+  {% endif %}
+</div>
+
+<!-- Architecture Agent -->
+<div class="card">
+  <h2>Architecture Agent</h2>
+  {% if run.arch_review %}
+  {% set ar = run.arch_review %}
+  <p>
+    {% if ar.architecture_status == 'ARCHITECTURE_APPROVED' %}<span class="pill pill-green">{{ ar.architecture_status }}</span>
+    {% elif ar.architecture_status == 'ARCHITECTURE_BLOCKED' %}<span class="pill pill-red">{{ ar.architecture_status }}</span>
+    {% elif ar.architecture_status %}<span class="pill pill-yellow">{{ ar.architecture_status }}</span>
+    {% endif %}
+    {% if ar.risk_level %} &middot; Risk: <strong>{{ ar.risk_level }}</strong>{% endif %}
+  </p>
+  {% if ar.summary %}<p style="margin-top:8px; font-size:13px;">{{ ar.summary }}</p>{% endif %}
+  {% if ar.blocking_reasons %}<p class="text-red" style="font-size:12px; margin-top:6px;"><strong>Blocking:</strong> {{ ar.blocking_reasons }}</p>{% endif %}
+  {% if ar.recommendations %}<p class="text-muted" style="font-size:12px; margin-top:6px;"><strong>Recommendations:</strong> {{ ar.recommendations }}</p>{% endif %}
+  {% else %}
+  <p class="text-muted">No architecture review recorded.</p>
+  {% endif %}
+</div>
+
+<!-- GitHub Statuses -->
+{% if run.github_statuses %}
+<div class="card">
+  <h2>GitHub Commit Statuses</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Context</th><th>State</th><th>Description</th><th>Published</th></tr>
+      </thead>
+      <tbody>
+        {% for gs in run.github_statuses %}
+        <tr>
+          <td><code style="font-size:12px;">{{ gs.context }}</code></td>
+          <td>
+            {% if gs.state == 'success' %}<span class="pill pill-green">{{ gs.state }}</span>
+            {% elif gs.state == 'failure' %}<span class="pill pill-red">{{ gs.state }}</span>
+            {% elif gs.state == 'pending' %}<span class="pill pill-yellow">{{ gs.state }}</span>
+            {% else %}<span class="pill pill-gray">{{ gs.state }}</span>{% endif %}
+          </td>
+          <td style="font-size:12px;">{{ gs.description or '—' }}</td>
+          <td class="text-muted" style="font-size:11px;">{{ (gs.created_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<!-- Active Clarification -->
+{% if run.active_clarification %}
+{% set cl = run.active_clarification %}
+<div class="card" style="border-color:#eab308;">
+  <h2>Pending Clarification #{{ cl.id }}</h2>
+  <p class="text-yellow"><strong>Context:</strong> {{ cl.context_key }}</p>
+  <p style="margin-top:8px; font-size:13px;">{{ cl.question_text }}</p>
+  {% if cl.options %}
+  <ul style="margin-top:8px; font-size:13px; padding-left:20px;">
+    {% for opt in cl.options %}<li>{{ opt }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  <p class="text-muted" style="font-size:12px; margin-top:8px;">Expires: {{ cl.expires_at or '—' }}</p>
+  <p style="margin-top:12px;">
+    <a href="/admin/ui/clarifications" class="btn btn-warning btn-sm">Manage Clarification</a>
+  </p>
+</div>
+{% endif %}
+
+<!-- Error detail -->
+{% if run.error_detail %}
+<div class="card" style="border-color:#ef4444;">
+  <h2>Error Detail</h2>
+  <pre style="font-size:12px; white-space:pre-wrap; word-break:break-word; color:#991b1b; background:#fee2e2; padding:12px; border-radius:4px;">{{ run.error_detail }}</pre>
+</div>
+{% endif %}
+
+{% endblock %}

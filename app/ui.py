@@ -21,7 +21,10 @@ from app.ui_auth import (
     verify_csrf,
     _LoginRedirect,
 )
-from app.database import get_overview_stats, get_all_control_flags
+from app.database import (
+    get_overview_stats, get_all_control_flags,
+    list_workflow_runs_for_ui, get_workflow_run_detail,
+)
 
 logger = logging.getLogger("orchestrator.ui")
 
@@ -83,7 +86,7 @@ def logout():
 
 
 # ---------------------------------------------------------------------------
-# Dashboard root — redirect to overview (Iteration 1 will add the real page)
+# Dashboard root — redirect to overview
 # ---------------------------------------------------------------------------
 
 @router.get("", response_class=HTMLResponse)
@@ -121,4 +124,77 @@ def overview_page(request: Request):
         "auto_merge": auto_merge,
         "stats": stats,
         "flags": flags,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Workflow runs list (Iteration 2)
+# ---------------------------------------------------------------------------
+
+@router.get("/runs", response_class=HTMLResponse)
+def runs_list(
+    request: Request,
+    status: str = "",
+    workflow_type: str = "",
+    issue_key: str = "",
+    release_decision: str = "",
+    limit: int = 30,
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    runs = list_workflow_runs_for_ui(
+        status=status or None,
+        workflow_type=workflow_type or None,
+        issue_key=issue_key or None,
+        release_decision=release_decision or None,
+        limit=limit,
+    )
+    return templates.TemplateResponse("admin/runs.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "runs",
+        "runs": runs,
+        "filters": {
+            "status": status,
+            "workflow_type": workflow_type,
+            "issue_key": issue_key,
+            "release_decision": release_decision,
+            "limit": limit,
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# Workflow run detail (Iteration 3)
+# ---------------------------------------------------------------------------
+
+@router.get("/runs/{run_id}", response_class=HTMLResponse)
+def run_detail(request: Request, run_id: int):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    run = get_workflow_run_detail(run_id)
+    if not run:
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request,
+            "csrf": csrf,
+            "env_name": _env_name(),
+            "page": "runs",
+            "message": f"No workflow run found with id={run_id}",
+        }, status_code=404)
+
+    return templates.TemplateResponse("admin/run_detail.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "runs",
+        "run": run,
     })
