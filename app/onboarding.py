@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 from app.claude_client import generate_onboarding_architecture_summary, generate_onboarding_coding_conventions
-from app.database import update_onboarding_run, upsert_capability_profile, upsert_knowledge_snapshot
+from app.database import update_onboarding_run, upsert_capability_profile, upsert_knowledge_snapshot, get_deployment_profile, upsert_deployment_profile
 from app.repo_profiler import (
     detect_repo_capability_profile,
     get_test_command_for_profile,
@@ -47,6 +47,89 @@ def _clone_repo_readonly(run_id: int, repo_slug: str, base_branch: str) -> str:
     return repo_path
 
 
+def _infer_deployment_type(deploy_files: list[str], top_level: list[str]) -> str:
+    """Infer likely deployment type from file names in the structure scan."""
+    combined = [f.lower() for f in deploy_files + top_level]
+    combined_str = " ".join(combined)
+    if "dockerfile" in combined_str:
+        return "docker"
+    if ".github" in combined_str or "github" in combined_str:
+        return "github_actions"
+    if "procfile" in combined_str:
+        return "heroku"
+    if "app.yaml" in combined_str:
+        return "google_app_engine"
+    if "serverless.yml" in combined_str or "serverless.yaml" in combined_str:
+        return "serverless"
+    return "unknown"
+
+
+def _check_deployment_profile(
+    repo_slug: str,
+    structure_scan: dict,
+    environment: str = "dev",
+) -> tuple[str, dict]:
+    """Check or create a deployment profile for the repo.
+
+    Returns (status_string, notes_dict).
+    Status values:
+      CONFIGURED_ENABLED  — existing profile is enabled
+      CONFIGURED_DISABLED — existing profile exists but is disabled
+      DRAFT_CREATED       — no profile existed; created disabled draft
+      NOT_CONFIGURED      — no profile and couldn't infer enough to create one
+    """
+    existing = get_deployment_profile(repo_slug=repo_slug, environment=environment)
+    deploy_files = structure_scan.get("deploy_files", [])
+    top_level = structure_scan.get("top_level_dirs", []) + structure_scan.get("top_level_files", [])
+
+    if existing:
+        status = "CONFIGURED_ENABLED" if existing.get("enabled") else "CONFIGURED_DISABLED"
+        notes = {
+            "summary": f"Deployment profile found for {repo_slug}/{environment}: type={existing.get('deployment_type')}, enabled={existing.get('enabled')}",
+            "deployment_type": existing.get("deployment_type"),
+            "base_url": existing.get("base_url"),
+            "enabled": existing.get("enabled"),
+            "recommendations": ["Profile exists. Enable and add smoke tests when base_url is confirmed."] if not existing.get("enabled") else [],
+        }
+        logger.info("Deployment profile found for %s: type=%s enabled=%s", repo_slug, existing.get("deployment_type"), existing.get("enabled"))
+        return status, notes
+
+    # No existing profile — infer deployment type and create disabled draft
+    inferred_type = _infer_deployment_type(deploy_files, top_level)
+    recommendations = []
+    if inferred_type == "docker":
+        recommendations.append("Dockerfile detected. Add base_url and enable profile when deployment URL is known.")
+    elif inferred_type == "github_actions":
+        recommendations.append("GitHub Actions CI detected. Confirm deployment target and add base_url for smoke tests.")
+    else:
+        recommendations.append(f"Deployment type unclear (inferred: {inferred_type}). Set base_url manually when deployed.")
+
+    recommendations.append("Auto-merge is disabled for this repo until deployment validation is configured and tested.")
+
+    # Create disabled draft
+    draft_data = {
+        "repo_slug": repo_slug,
+        "environment": environment,
+        "deployment_type": inferred_type,
+        "base_url": None,
+        "healthcheck_path": None,
+        "enabled": False,
+        "smoke_tests": [],
+    }
+    upsert_deployment_profile(draft_data)
+
+    notes = {
+        "summary": f"No deployment profile found for {repo_slug}/{environment}. Created disabled draft (type={inferred_type}). Set base_url to enable.",
+        "deployment_type": inferred_type,
+        "inferred_from": deploy_files[:5],
+        "base_url": None,
+        "enabled": False,
+        "recommendations": recommendations,
+    }
+    logger.info("Deployment draft created for %s: type=%s", repo_slug, inferred_type)
+    return "DRAFT_CREATED", notes
+
+
 def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: str):
     """Execute the project onboarding workflow.
 
@@ -57,6 +140,7 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
       4. Repo structure scan (stored as structure_scan_json)
       5. Architecture summary via Claude (stored as knowledge snapshot)
       6. Coding conventions snapshot via Claude
+      7. Deployment profile check (create disabled draft if missing)
 
     Workspace is cleaned up in the finally block regardless of outcome.
     Status transitions are managed by the worker (_execute_onboarding).
@@ -230,6 +314,32 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
         logger.info(
             "Project onboarding conventions captured: run_id=%s (%d patterns_to_follow)",
             onboarding_run_id, len(conventions.get("patterns_to_follow", [])),
+        )
+
+        # ------------------------------------------------------------------
+        # Step 7: deployment profile check
+        # ------------------------------------------------------------------
+        update_onboarding_run(onboarding_run_id, current_step="deployment_check")
+        deploy_status, deploy_notes = _check_deployment_profile(
+            repo_slug=repo_slug,
+            structure_scan=structure,
+            environment="dev",
+        )
+        upsert_knowledge_snapshot(
+            repo_slug=repo_slug,
+            snapshot_kind="deployment",
+            summary=deploy_notes["summary"],
+            details=deploy_notes,
+            source_files=structure.get("deploy_files", []),
+        )
+        update_onboarding_run(
+            onboarding_run_id,
+            current_step="deployment_checked",
+            deployment_profile_status=deploy_status,
+        )
+        logger.info(
+            "Project onboarding deployment check done: run_id=%s status=%s",
+            onboarding_run_id, deploy_status,
         )
 
     finally:
