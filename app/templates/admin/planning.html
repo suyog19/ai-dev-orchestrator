@@ -1,0 +1,58 @@
+{% extends "admin/base.html" %}
+
+{% block title %}Planning Runs{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Planning Runs</h1>
+  <p class="subtitle">Epic → Story breakdowns</p>
+</div>
+
+{% if runs %}
+<div class="card" style="padding:0;">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Epic Key</th>
+          <th>Status</th>
+          <th>Approval</th>
+          <th>Step</th>
+          <th>Stories Created</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td><a href="/admin/ui/planning/{{ run.id }}"><strong>{{ run.id }}</strong></a></td>
+          <td><code>{{ run.issue_key or '—' }}</code></td>
+          <td>
+            {% if run.status == 'COMPLETED' %}<span class="pill pill-green">{{ run.status }}</span>
+            {% elif run.status == 'FAILED' %}<span class="pill pill-red">{{ run.status }}</span>
+            {% elif run.status in ('RUNNING','WAITING_FOR_APPROVAL') %}<span class="pill pill-yellow">{{ run.status }}</span>
+            {% else %}<span class="pill pill-gray">{{ run.status }}</span>{% endif %}
+          </td>
+          <td>
+            {% if run.approval_status == 'APPROVED' %}<span class="pill pill-green">APPROVED</span>
+            {% elif run.approval_status == 'REJECTED' %}<span class="pill pill-red">REJECTED</span>
+            {% elif run.approval_status == 'REGENERATED' %}<span class="pill pill-yellow">REGENERATED</span>
+            {% elif run.approval_status %}<span class="pill pill-gray">{{ run.approval_status }}</span>
+            {% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+          <td style="font-size:11px;">{{ run.current_step or '—' }}</td>
+          <td>{{ run.created_jira_children_count or '—' }}</td>
+          <td class="text-muted" style="font-size:11px;">{{ (run.created_at or '')[:16] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="placeholder-message">
+  <p>No planning runs found.</p>
+</div>
+{% endif %}
+{% endblock %}

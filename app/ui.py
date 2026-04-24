@@ -24,6 +24,9 @@ from app.ui_auth import (
 from app.database import (
     get_overview_stats, get_all_control_flags,
     list_workflow_runs_for_ui, get_workflow_run_detail,
+    list_planning_runs, get_planning_run_detail,
+    list_clarifications,
+    mark_clarification_answered, mark_clarification_cancelled,
 )
 
 logger = logging.getLogger("orchestrator.ui")
@@ -198,3 +201,181 @@ def run_detail(request: Request, run_id: int):
         "page": "runs",
         "run": run,
     })
+
+
+# ---------------------------------------------------------------------------
+# Planning page (Iteration 4)
+# ---------------------------------------------------------------------------
+
+@router.get("/planning", response_class=HTMLResponse)
+def planning_page(request: Request, limit: int = 20):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    runs = list_planning_runs(limit=limit)
+    return templates.TemplateResponse("admin/planning.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "planning",
+        "runs": runs,
+        "limit": limit,
+    })
+
+
+@router.get("/planning/{run_id}", response_class=HTMLResponse)
+def planning_detail(request: Request, run_id: int):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    run = get_planning_run_detail(run_id)
+    if not run:
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf, "env_name": _env_name(),
+            "page": "planning",
+            "message": f"No planning run found with id={run_id}",
+        }, status_code=404)
+
+    return templates.TemplateResponse("admin/planning_detail.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "planning",
+        "run": run,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Clarifications page (Iteration 5)
+# ---------------------------------------------------------------------------
+
+@router.get("/clarifications", response_class=HTMLResponse)
+def clarifications_page(request: Request, status: str = "PENDING", limit: int = 30):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    csrf = csrf_token(token)
+    clarifications = list_clarifications(status=status or None, limit=limit)
+    return templates.TemplateResponse("admin/clarifications.html", {
+        "request": request,
+        "csrf": csrf,
+        "env_name": _env_name(),
+        "page": "clarifications",
+        "clarifications": clarifications,
+        "active_status": status,
+        "limit": limit,
+    })
+
+
+@router.post("/clarifications/{clar_id}/answer", response_class=HTMLResponse)
+async def ui_answer_clarification(
+    request: Request,
+    clar_id: int,
+    answer_text: str = Form(...),
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.database import get_clarification_by_id
+    from app.clarification import resume_workflow_after_clarification
+    from app.telegram import send_message as _send
+
+    clar = get_clarification_by_id(clar_id)
+    if not clar or clar["status"] != "PENDING":
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications",
+            "message": f"Clarification {clar_id} not found or not PENDING.",
+        }, status_code=409)
+
+    mark_clarification_answered(clar_id, answer_text.strip())
+    resume_workflow_after_clarification(clar["run_id"])
+    _send("admin_clarification_answered", "ANSWERED",
+          f"UI: admin answered clarification {clar_id} for run {clar['run_id']}")
+    return RedirectResponse(url="/admin/ui/clarifications", status_code=302)
+
+
+@router.post("/clarifications/{clar_id}/cancel", response_class=HTMLResponse)
+async def ui_cancel_clarification(
+    request: Request,
+    clar_id: int,
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.database import get_clarification_by_id, fail_run
+    from app.telegram import send_message as _send
+
+    clar = get_clarification_by_id(clar_id)
+    if not clar or clar["status"] != "PENDING":
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications",
+            "message": f"Clarification {clar_id} not found or not PENDING.",
+        }, status_code=409)
+
+    mark_clarification_cancelled(clar_id)
+    fail_run(clar["run_id"], f"Clarification {clar_id} cancelled from admin UI")
+    _send("admin_clarification_cancelled", "CANCELLED",
+          f"UI: admin cancelled clarification {clar_id} — run {clar['run_id']} FAILED")
+    return RedirectResponse(url="/admin/ui/clarifications", status_code=302)
+
+
+@router.post("/clarifications/{clar_id}/resend", response_class=HTMLResponse)
+async def ui_resend_clarification(
+    request: Request,
+    clar_id: int,
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.database import get_clarification_by_id, update_clarification_telegram_id
+    from app.telegram import send_clarification_request
+
+    clar = get_clarification_by_id(clar_id)
+    if not clar:
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "clarifications",
+            "message": f"Clarification {clar_id} not found.",
+        }, status_code=404)
+
+    msg_id = send_clarification_request(clar)
+    if msg_id:
+        update_clarification_telegram_id(clar_id, msg_id)
+    return RedirectResponse(url="/admin/ui/clarifications", status_code=302)
