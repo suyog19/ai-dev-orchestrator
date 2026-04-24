@@ -11,6 +11,7 @@ from app.database import (
     is_paused, record_security_event,
 )
 from app.dispatcher import dispatch
+from app.security import check_rate_limit
 from app.telegram import send_message, parse_approval_command
 from app.queue import enqueue
 from app.workflows import create_jira_stories_for_run
@@ -39,6 +40,12 @@ async def jira_webhook(request: Request, token: str | None = None):
                 details={"reason": "invalid_token"},
             )
             raise HTTPException(status_code=401, detail="Invalid or missing webhook token")
+
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit("/webhooks/jira", client_ip):
+        logger.warning("Jira webhook rate limit exceeded from %s", client_ip)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     try:
         payload = await request.json()
@@ -114,6 +121,11 @@ async def telegram_webhook(request: Request):
     message = payload.get("message") or payload.get("edited_message") or {}
     text = (message.get("text") or "").strip()
     incoming_chat_id = str(message.get("chat", {}).get("id", ""))
+
+    # Rate limiting per chat_id
+    if not check_rate_limit("/webhooks/telegram", incoming_chat_id or "unknown"):
+        logger.warning("Telegram webhook rate limit exceeded for chat %s", incoming_chat_id)
+        return {"ok": True}  # Telegram expects 200 even on rejection
 
     # Only process messages from the configured chat
     expected_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")

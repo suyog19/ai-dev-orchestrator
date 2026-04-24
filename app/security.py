@@ -100,8 +100,52 @@ def _log_github_block(action: str, repo_slug: str, run_id: int | None, reason: s
         pass
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting (Redis-backed sliding window)
+# ---------------------------------------------------------------------------
+
+# Default limits: (max_requests, window_seconds)
+_RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "/webhooks/jira":     (30, 60),   # 30 per minute
+    "/webhooks/telegram": (10, 60),   # 10 per minute per chat_id
+    "_admin_mutating":    (20, 60),   # 20 per minute for admin mutating endpoints
+}
+
+
+def _rate_limit_key(prefix: str, identifier: str, window_seconds: int) -> str:
+    import time
+    window = int(time.time()) // window_seconds
+    return f"rl:{prefix}:{identifier}:{window}"
+
+
+def check_rate_limit(path: str, identifier: str) -> bool:
+    """Return True if the request is within the rate limit, False if exceeded."""
+    try:
+        from app.queue import get_redis
+        redis = get_redis()
+
+        if path == "/webhooks/jira":
+            max_req, window = _RATE_LIMITS["/webhooks/jira"]
+            key = _rate_limit_key("jira", "global", window)
+        elif path == "/webhooks/telegram":
+            max_req, window = _RATE_LIMITS["/webhooks/telegram"]
+            key = _rate_limit_key("telegram", identifier, window)
+        elif is_admin_protected(path):
+            max_req, window = _RATE_LIMITS["_admin_mutating"]
+            key = _rate_limit_key("admin", identifier, window)
+        else:
+            return True  # no limit
+
+        count = redis.incr(key)
+        if count == 1:
+            redis.expire(key, window)
+        return int(count) <= max_req
+    except Exception:
+        return True  # fail open on Redis error
+
+
 async def admin_key_middleware(request: Request, call_next):
-    """Middleware: enforce admin key on /debug/* and /admin/* paths."""
+    """Middleware: enforce admin key on /debug/* and /admin/* paths; rate-limit admin mutating calls."""
     path = request.url.path
     method = request.method
 
@@ -125,6 +169,16 @@ async def admin_key_middleware(request: Request, call_next):
                 {"detail": "Unauthorized — X-Orchestrator-Admin-Key required"},
                 status_code=403,
             )
+
+        # Rate-limit admin mutating calls
+        if method in _MUTATING_METHODS:
+            actor = _actor(request)
+            if not check_rate_limit(path, actor):
+                logger.warning("Admin rate limit exceeded: %s %s (client=%s)", method, path, actor)
+                return JSONResponse(
+                    {"detail": "Rate limit exceeded — too many admin requests"},
+                    status_code=429,
+                )
 
         # Auth succeeded — log mutating calls for audit trail
         if method in _MUTATING_METHODS:
