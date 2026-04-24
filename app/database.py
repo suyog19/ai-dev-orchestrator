@@ -530,6 +530,66 @@ def store_test_quality_review(
     return tqr_id
 
 
+def store_architecture_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist an Architecture Agent verdict and update workflow_runs architecture fields.
+
+    Inserts one row into agent_architecture_reviews and sets architecture_status
+    + architecture_completed_at on the parent workflow_run. Returns the new row id.
+    """
+    from app.feedback import AgentName
+
+    architecture_status = verdict.get("architecture_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_architecture_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, architecture_status, risk_level, summary,
+                     impact_areas_json, blocking_reasons_json, recommendations_json, model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.ARCHITECTURE_AGENT,
+                    architecture_status,
+                    verdict.get("risk_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("impact_areas") or []),
+                    json.dumps(verdict.get("blocking_reasons") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    model_used,
+                ),
+            )
+            ar_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET architecture_status = %s, architecture_completed_at = NOW(),
+                    architecture_summary = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (architecture_status, verdict.get("summary"), run_id),
+            )
+
+    logger.info(
+        "store_architecture_review: run_id=%s ar_id=%s status=%s",
+        run_id, ar_id, architecture_status,
+    )
+    return ar_id
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 — planning helpers
 # ---------------------------------------------------------------------------

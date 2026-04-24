@@ -5,7 +5,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
 from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
@@ -19,8 +19,9 @@ from app.database import (
     get_planning_memory, get_execution_memory,
     store_agent_review,
     store_test_quality_review,
+    store_architecture_review,
 )
-from app.feedback import ReviewStatus, TestQualityStatus
+from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -227,6 +228,131 @@ def _format_test_quality_comment(verdict: dict) -> str:
         f"### Recommendations\n{rec_lines}\n\n"
         f"---\n"
         f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Test Quality Agent_"
+    )
+
+
+# --- Architecture / Impact Agent helpers (Phase 10) ---
+
+_API_PATTERNS     = ("main.py", "routes", "router", "endpoints", "api", "views")
+_MODEL_PATTERNS   = ("model", "schema", "models", "schemas", "entity")
+_STORAGE_PATTERNS = ("database", "db", "migration", "alembic", "repository", "repo")
+_CONFIG_PATTERNS  = (".env", "config", "settings", "constants")
+_DOC_PATTERNS     = ("readme", ".md", "docs/", "changelog")
+
+
+def _classify_changed_files(files: list[str]) -> dict:
+    """Group changed files by architectural layer for the Architecture Agent."""
+    groups: dict[str, list[str]] = {
+        "api": [], "model": [], "storage": [], "config": [], "test": [], "docs": [], "other": [],
+    }
+    for f in files:
+        fl = f.lower()
+        if _is_test_file(f):
+            groups["test"].append(f)
+        elif any(p in fl for p in _DOC_PATTERNS):
+            groups["docs"].append(f)
+        elif any(p in fl for p in _API_PATTERNS):
+            groups["api"].append(f)
+        elif any(p in fl for p in _MODEL_PATTERNS):
+            groups["model"].append(f)
+        elif any(p in fl for p in _STORAGE_PATTERNS):
+            groups["storage"].append(f)
+        elif any(p in fl for p in _CONFIG_PATTERNS):
+            groups["config"].append(f)
+        else:
+            groups["other"].append(f)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _build_architecture_review_package(
+    issue_key: str,
+    summary: str,
+    story_details: dict,
+    mapping: dict,
+    pr: dict,
+    final_changes: list,
+    diff_block: str,
+    final_test_result: dict,
+    verdict: dict,
+    tq_verdict: dict,
+    retry_count: int,
+    execution_memory: str,
+    repo_analysis: dict,
+) -> dict:
+    """Assemble context for the Architecture Agent.
+
+    Returns a dict that unpacks directly into review_architecture(**pkg).
+    No Claude call, no DB write, no secrets included.
+    """
+    all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
+    lang = repo_analysis.get("primary_language", "unknown")
+    framework = repo_analysis.get("framework", "unknown")
+
+    return {
+        "story_context": {
+            "key": issue_key,
+            "summary": summary,
+            "description": story_details.get("description"),
+            "acceptance_criteria": story_details.get("acceptance_criteria") or [],
+        },
+        "repo_context": {
+            "repo_slug": mapping.get("repo_slug", ""),
+            "primary_language": lang,
+            "framework": framework,
+        },
+        "pr_context": {
+            "number": pr["number"],
+            "url": pr["url"],
+            "title": pr.get("title", ""),
+            "body": pr.get("body", ""),
+        },
+        "diff_context": {
+            "full_diff": diff_block,
+            "changed_files": all_files,
+        },
+        "signal_context": {
+            "test_status": final_test_result["status"],
+            "review_status": verdict.get("review_status", "N/A"),
+            "test_quality_status": tq_verdict.get("quality_status", "N/A"),
+            "files_changed_count": len(all_files),
+            "retry_count": retry_count,
+        },
+        "memory_context": execution_memory,
+    }
+
+
+def _format_architecture_comment(verdict: dict) -> str:
+    """Render an Architecture Agent verdict as a GitHub PR comment in markdown."""
+    status = verdict.get("architecture_status", "UNKNOWN")
+    risk = verdict.get("risk_level", "UNKNOWN")
+    summary = verdict.get("summary", "")
+    impact_areas = verdict.get("impact_areas") or []
+    blocking = verdict.get("blocking_reasons") or []
+    recommendations = verdict.get("recommendations") or []
+
+    emoji = {
+        "ARCHITECTURE_APPROVED":      "✅",
+        "ARCHITECTURE_NEEDS_REVIEW":  "⚠️",
+        "ARCHITECTURE_BLOCKED":       "🚫",
+        "ERROR":                      "❌",
+    }.get(status, "❓")
+
+    impact_lines = "\n".join(
+        f"- **{a.get('area', '?').upper()}**: `{a.get('risk', '?')}` — {a.get('finding', '')}"
+        for a in impact_areas
+    ) or "_None_"
+    blocking_lines = "\n".join(f"- {b}" for b in blocking) or "_None_"
+    rec_lines = "\n".join(f"- {r}" for r in recommendations) or "_None_"
+
+    return (
+        f"## {emoji} Architecture Agent Verdict: `{status}`\n\n"
+        f"**Risk Level:** {risk}\n\n"
+        f"### Summary\n{summary}\n\n"
+        f"### Impact Areas\n{impact_lines}\n\n"
+        f"### Blocking Reasons\n{blocking_lines}\n\n"
+        f"### Recommendations\n{rec_lines}\n\n"
+        f"---\n"
+        f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Architecture Agent_"
     )
 
 
