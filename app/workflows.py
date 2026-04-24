@@ -150,6 +150,7 @@ def _build_test_quality_package(
     final_test_result: dict,
     retry_count: int,
     execution_memory: str,
+    profile_name: str | None = None,
 ) -> dict:
     """Assemble the full context package for the Test Quality Agent.
 
@@ -157,8 +158,8 @@ def _build_test_quality_package(
     No Claude call, no DB write, no secrets included.
     """
     all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
-    source_files = [f for f in all_files if not _is_test_file(f)]
-    test_files = [f for f in all_files if _is_test_file(f)]
+    source_files = [f for f in all_files if not _is_test_file(f, profile_name)]
+    test_files = [f for f in all_files if _is_test_file(f, profile_name)]
 
     output = (final_test_result.get("output") or "").strip()
     output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
@@ -187,6 +188,7 @@ def _build_test_quality_package(
             "output_excerpt": output_excerpt,
             "test_files_changed": test_files,
             "skipped_tests_detected": skipped,
+            "profile_name": profile_name or "python_fastapi",
         },
         "implementation_context": {
             "files_changed_count": len(all_files),
@@ -237,7 +239,7 @@ def _format_test_quality_comment(verdict: dict) -> str:
     )
 
 
-# --- Architecture / Impact Agent helpers (Phase 10) ---
+# --- Architecture / Impact Agent helpers (Phase 10 + Phase 15 profile-aware) ---
 
 _API_PATTERNS     = ("main.py", "routes", "router", "endpoints", "api", "views")
 _MODEL_PATTERNS   = ("model", "schema", "models", "schemas", "entity")
@@ -245,15 +247,98 @@ _STORAGE_PATTERNS = ("database", "db", "migration", "alembic", "repository", "re
 _CONFIG_PATTERNS  = (".env", "config", "settings", "constants")
 _DOC_PATTERNS     = ("readme", ".md", "docs/", "changelog")
 
+# Phase 15: Java-specific classification patterns
+_JAVA_BUILD_PATTERNS      = ("pom.xml", "build.gradle", "settings.gradle", "gradlew", "Makefile")
+_JAVA_CONTROLLER_PATTERNS = ("Controller",)
+_JAVA_SERVICE_PATTERNS    = ("Service", "ServiceImpl")
+_JAVA_REPO_PATTERNS       = ("Repository", "Dao", "Mapper")
+_JAVA_ENTITY_PATTERNS     = ("Entity", "Model", "Dto", "Request", "Response")
+_JAVA_CONFIG_PATTERNS     = ("Config", "Configuration", "Properties", "application.yml", "application.properties")
 
-def _classify_changed_files(files: list[str]) -> dict:
-    """Group changed files by architectural layer for the Architecture Agent."""
+# Phase 15: Node/React-specific classification patterns (lowercased for .lower() matching)
+_NODE_BUILD_PATTERNS   = ("package.json", "yarn.lock", "pnpm-lock", "package-lock", ".lock")
+_NODE_STATE_PATTERNS   = ("store", "slice", "context", "redux", "zustand", "recoil", "atom")
+_NODE_HOOK_PATTERNS    = ("/hooks/", "/hook/")
+_NODE_ROUTE_PATTERNS   = ("/routes/", "/route/", "/pages/", "/page/", "router")
+_NODE_API_PATTERNS     = ("/api/", "/services/", "/service/", "client", "fetch", "axios")
+_NODE_CONFIG_PATTERNS  = (".env", "vite.config", "tsconfig", "next.config", "jest.config", "vitest.config", ".eslintrc")
+
+# Phase 15: Profile-aware test file patterns
+_JAVA_TEST_PATTERNS   = ("src/test/", "Test.java", "Tests.java", "IT.java", "Spec.java")
+_NODE_TEST_PATTERNS   = (".test.ts", ".test.tsx", ".test.js", ".spec.ts", ".spec.tsx", ".spec.js", "__tests__/")
+_PYTHON_TEST_PATTERNS = ("tests/", "test_", "_test.py", "/test")
+
+
+def _is_test_file(path: str, profile_name: str | None = None) -> bool:
+    """Return True if a file path looks like a test file, using profile-aware patterns."""
+    if profile_name in ("java_maven", "java_gradle"):
+        return any(p in path for p in _JAVA_TEST_PATTERNS)
+    if profile_name == "node_react":
+        return any(p in path for p in _NODE_TEST_PATTERNS)
+    return any(p in path for p in _PYTHON_TEST_PATTERNS)
+
+
+def _classify_java_files(files: list[str]) -> dict:
+    """Classify changed files using Java layer patterns."""
+    groups: dict[str, list[str]] = {
+        "controller": [], "service": [], "repository": [], "entity": [], "config": [], "test": [], "build": [], "other": [],
+    }
+    for f in files:
+        if _is_test_file(f, "java_maven"):
+            groups["test"].append(f)
+        elif any(p in f for p in _JAVA_BUILD_PATTERNS):
+            groups["build"].append(f)
+        elif any(p in f for p in _JAVA_CONTROLLER_PATTERNS):
+            groups["controller"].append(f)
+        elif any(p in f for p in _JAVA_SERVICE_PATTERNS):
+            groups["service"].append(f)
+        elif any(p in f for p in _JAVA_REPO_PATTERNS):
+            groups["repository"].append(f)
+        elif any(p in f for p in _JAVA_ENTITY_PATTERNS):
+            groups["entity"].append(f)
+        elif any(p in f for p in _JAVA_CONFIG_PATTERNS):
+            groups["config"].append(f)
+        else:
+            groups["other"].append(f)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _classify_node_files(files: list[str]) -> dict:
+    """Classify changed files using Node/React layer patterns."""
+    groups: dict[str, list[str]] = {
+        "component": [], "hook": [], "route": [], "state": [], "api": [], "config": [], "test": [], "build": [], "other": [],
+    }
+    for f in files:
+        fl = f.lower()
+        if _is_test_file(f, "node_react"):
+            groups["test"].append(f)
+        elif any(p in fl for p in _NODE_BUILD_PATTERNS):
+            groups["build"].append(f)
+        elif any(p in fl for p in _NODE_STATE_PATTERNS):
+            groups["state"].append(f)
+        elif any(p in fl for p in _NODE_HOOK_PATTERNS):
+            groups["hook"].append(f)
+        elif any(p in fl for p in _NODE_ROUTE_PATTERNS):
+            groups["route"].append(f)
+        elif any(p in fl for p in _NODE_API_PATTERNS):
+            groups["api"].append(f)
+        elif any(p in fl for p in _NODE_CONFIG_PATTERNS):
+            groups["config"].append(f)
+        elif f.endswith((".tsx", ".jsx")):
+            groups["component"].append(f)
+        else:
+            groups["other"].append(f)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _classify_python_files(files: list[str]) -> dict:
+    """Classify changed files using Python/FastAPI layer patterns."""
     groups: dict[str, list[str]] = {
         "api": [], "model": [], "storage": [], "config": [], "test": [], "docs": [], "other": [],
     }
     for f in files:
         fl = f.lower()
-        if _is_test_file(f):
+        if _is_test_file(f, "python_fastapi"):
             groups["test"].append(f)
         elif any(p in fl for p in _DOC_PATTERNS):
             groups["docs"].append(f)
@@ -270,6 +355,19 @@ def _classify_changed_files(files: list[str]) -> dict:
     return {k: v for k, v in groups.items() if v}
 
 
+def _classify_changed_files(files: list[str], profile_name: str | None = None) -> dict:
+    """Group changed files by architectural layer, profile-aware (Phase 15).
+
+    Routes to stack-specific classification for java_* and node_react profiles;
+    falls back to the original Python/FastAPI classification for everything else.
+    """
+    if profile_name in ("java_maven", "java_gradle"):
+        return _classify_java_files(files)
+    if profile_name == "node_react":
+        return _classify_node_files(files)
+    return _classify_python_files(files)
+
+
 def _build_architecture_review_package(
     issue_key: str,
     summary: str,
@@ -284,6 +382,7 @@ def _build_architecture_review_package(
     retry_count: int,
     execution_memory: str,
     repo_analysis: dict,
+    profile_name: str | None = None,
 ) -> dict:
     """Assemble context for the Architecture Agent.
 
@@ -293,6 +392,7 @@ def _build_architecture_review_package(
     all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
     lang = repo_analysis.get("primary_language", "unknown")
     framework = repo_analysis.get("framework", "unknown")
+    file_classification = _classify_changed_files(all_files, profile_name)
 
     return {
         "story_context": {
@@ -305,6 +405,7 @@ def _build_architecture_review_package(
             "repo_slug": mapping.get("repo_slug", ""),
             "primary_language": lang,
             "framework": framework,
+            "profile_name": profile_name or "python_fastapi",
         },
         "pr_context": {
             "number": pr["number"],
@@ -315,6 +416,7 @@ def _build_architecture_review_package(
         "diff_context": {
             "full_diff": diff_block,
             "changed_files": all_files,
+            "file_classification": file_classification,
         },
         "signal_context": {
             "test_status": final_test_result["status"],
@@ -1231,6 +1333,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             final_test_result=final_test_result,
             retry_count=review_retry_count,
             execution_memory=execution_memory,
+            profile_name=_profile_name,
         )
         tq_verdict = review_test_quality(**tq_package)
         store_test_quality_review(
@@ -1309,6 +1412,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             retry_count=review_retry_count,
             execution_memory=execution_memory,
             repo_analysis=analysis,
+            profile_name=_profile_name,
         )
         arch_verdict = review_architecture(**arch_package)
         store_architecture_review(
