@@ -115,6 +115,10 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS waiting_for_clarification  BOOLEAN      NOT NULL DEFAULT FALSE",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS active_clarification_id    INTEGER      NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS summary                    TEXT         NULL",
+                # Phase 13 — GitHub-native checks
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS head_sha                        VARCHAR(100) NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published        BOOLEAN      NOT NULL DEFAULT FALSE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS github_statuses_published_at     TIMESTAMP    NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -287,6 +291,28 @@ def init_db(retries: int = 5, delay: int = 3):
                     updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
                 )
             """)
+
+            # Phase 13 — GitHub commit status audit log
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS github_status_updates (
+                    id                   SERIAL PRIMARY KEY,
+                    run_id               INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    repo_slug            VARCHAR(200)  NOT NULL,
+                    commit_sha           VARCHAR(100)  NOT NULL,
+                    pr_number            INTEGER       NULL,
+                    context              VARCHAR(100)  NOT NULL,
+                    state                VARCHAR(20)   NOT NULL,
+                    description          TEXT          NULL,
+                    target_url           TEXT          NULL,
+                    github_response_json TEXT          NULL,
+                    created_at           TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_github_status_run_id "
+                "ON github_status_updates (run_id)"
+            )
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS security_events (
