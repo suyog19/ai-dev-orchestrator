@@ -2092,7 +2092,7 @@ def list_feedback_events(
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT id, source_type, source_run_id, repo_slug, feedback_type, value_json, created_at
+                SELECT id, source_type, source_run_id, repo_slug, feedback_type, feedback_value, created_at
                 FROM feedback_events
                 {where}
                 ORDER BY id DESC LIMIT %s
@@ -2107,7 +2107,7 @@ def list_feedback_events(
             "source_run_id": r[2],
             "repo_slug":    r[3],
             "feedback_type": r[4],
-            "value":        json.loads(r[5]) if r[5] else None,
+            "value":        r[5],
             "created_at":   r[6].isoformat() if r[6] else None,
         }
         for r in rows
