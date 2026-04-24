@@ -51,7 +51,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
 - `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()` and `review_test_quality()` both use forced `tool_choice` for structured output
-- `app/database.py` — all DB access; schema migrations in `init_db()`
+- `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
 - `app/file_modifier.py` — applies code patches returned by Claude (original → replacement matching)
@@ -62,6 +62,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/git_ops.py` — clone, commit, push
 - `app/repo_mapping.py` — CRUD for `repo_mappings` table
 - `app/test_runner.py` — runs `pytest -q` in a cloned workspace
+- `app/telegram.py` — `send_message(event_type, status, detail)` used by all workflow steps for Telegram notifications
 - `app/queue.py` — Redis queue enqueue/dequeue
 
 **Event flow:**
@@ -205,7 +206,7 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | `worker_interrupted` | Run was RUNNING when worker restarted |
 | `unknown` | Error does not match any known pattern |
 
-### Phase 8 — Reviewer Agent (Phase 8+)
+### Reviewer Agent
 
 **`review_status` values:** `APPROVED_BY_AI` | `NEEDS_CHANGES` | `BLOCKED` | `ERROR`
 **`risk_level` values:** `LOW` | `MEDIUM` | `HIGH`
@@ -223,7 +224,7 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 
 **Review feedback events:** `review_status`, `review_risk_level`, `review_approved`, `review_needs_changes`, `review_blocked`
 
-### Phase 9 — Test Quality Agent (Phase 9+)
+### Test Quality Agent
 
 **`quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR`
 **`confidence_level` values:** `LOW` | `MEDIUM` | `HIGH`
