@@ -60,7 +60,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 **Key files:**
 - `app/main.py` — FastAPI app, all HTTP endpoints
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
-- `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: lines 124–128 define a stale one-argument `_is_test_file()` that is dead code (overridden by the profile-aware version at line 287); `_TEST_FILE_PATTERNS` at line 124 is also unused
+- `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: there is a stale one-argument `_is_test_file()` near the top of the file that is dead code (overridden by the profile-aware version further down); `_TEST_FILE_PATTERNS` defined alongside it is also unused
 - `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
@@ -142,6 +142,7 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `control_flags` | Runtime control flags (paused state); DB takes precedence over env var |
 | `github_status_updates` | Append-only audit log of every GitHub commit status publish attempt; one row per gate per run per attempt |
 | `repo_capability_profiles` | Active capability profile per repo (profile_name, commands, capabilities_json); upserted on each clone |
+| `clarification_requests` | One row per clarification issued; FK to `workflow_runs`; status: PENDING / ANSWERED / CANCELLED / EXPIRED |
 | `deployment_profiles` | Per-repo/environment smoke test configuration; unique on (repo_slug, environment); seeded from `config/deployment_profiles.yaml` |
 | `deployment_validations` | One row per post-merge validation run (FK to workflow_runs); stores smoke_results_json, status, timing |
 
@@ -158,9 +159,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 **`workflow_runs.test_quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR` (NULL until TQ review completes)
 **`workflow_runs.architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR` (NULL until arch review completes)
 **`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
-**`workflow_runs` Phase 13 columns:** `head_sha` (fetched from GitHub after PR creation), `github_statuses_published` (bool), `github_statuses_published_at` (timestamp)
-**`workflow_runs` Phase 15 columns:** `capability_profile_name`, `build_status`, `lint_status`, `dependency_install_status`
-**`workflow_runs` Phase 16 columns:** `deployment_validation_status`, `deployment_validation_summary`, `deployment_validation_completed_at`
+**`workflow_runs` extended columns:** `head_sha` (GitHub PR head SHA), `github_statuses_published` (bool), `capability_profile_name`, `build_status`, `lint_status`, `dependency_install_status`, `deployment_validation_status`, `deployment_validation_summary`, `deployment_validation_completed_at`
 
 **`clarification_requests.status` values:** `PENDING` | `ANSWERED` | `CANCELLED` | `EXPIRED`
 **Clarification context keys:** `pre_planning` (epic), `pre_suggest` (story implementation), `pre_review` (review agents)
@@ -268,7 +267,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 
 File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-test files + up to 2 Python import dependencies + best test file (max 6 files total).
 
-### Capability Profiles (Phase 15)
+### Capability Profiles
 
 `app/repo_profiler.py` — detection order: Gradle > Maven > Node > Python > Unknown.
 
@@ -301,7 +300,7 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Approval commands | `APPROVE <run_id>` / `REJECT <run_id>` / `REGENERATE <run_id>` |
 | Idempotency guard | Blocks if the Epic already has Jira children |
 
-### Clarification Loop (Phase 12)
+### Clarification Loop
 
 `app/clarification.py` is the core module.
 
@@ -400,7 +399,7 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 
 **Architecture feedback events:** `architecture_status`, `architecture_risk_level`, `architecture_approved`, `architecture_needs_review`, `architecture_blocked`
 
-### GitHub Status Publishing (Phase 13)
+### GitHub Status Publishing
 
 After `evaluate_release_decision()` stores its verdict, `publish_github_statuses_for_run()` in `app/github_status_publisher.py` publishes five GitHub commit statuses using the PR's `head_sha`. Publishing is guarded by `ensure_github_writes_allowed("status", ...)` and is **non-fatal** — failures log a warning and send a Telegram alert but never abort the workflow.
 
@@ -438,7 +437,7 @@ Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 
 **Release feedback events:** `release_decision`, `release_blocking_gate_count`
 
-### Post-Merge Deployment Validation (Phase 16)
+### Post-Merge Deployment Validation
 
 `_run_post_merge_validation(run_id, issue_key, repo_slug, commit_sha, pr_number, environment)` in `workflows.py` is called after a successful merge. It is **non-fatal and observational** — a FAILED result is recorded but never retroactively alters `release_decision`.
 
@@ -570,7 +569,7 @@ OPTIONS:
 RECOMMENDATION: <recommendation + why>
 ```
 
-## Admin Dashboard (Phase 14)
+## Admin Dashboard
 
 Browser-based operations console at `/admin/ui`. Served as server-rendered HTML via Jinja2; no JavaScript framework.
 
