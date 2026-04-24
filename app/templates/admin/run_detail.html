@@ -253,7 +253,13 @@
 
 <!-- Deployment Validation (Phase 16) -->
 <div class="card">
-  <h2>Deployment Validation</h2>
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+    <h2 style="margin:0;">Deployment Validation</h2>
+    <form method="post" action="/admin/ui/runs/{{ run.id }}/run-deployment-validation" style="margin:0;">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="btn btn-ghost btn-sm" title="Re-run deployment smoke tests">↻ Re-run Validation</button>
+    </form>
+  </div>
   {% set dv = run.deployment_validation %}
   {% set dv_status = run.deployment_validation_status %}
   {% if dv %}

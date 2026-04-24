@@ -1164,3 +1164,59 @@ def get_run_dep_validation(run_id: int):
     if not row:
         raise HTTPException(status_code=404, detail=f"No deployment validation for run {run_id}")
     return row
+
+
+@app.post("/debug/workflow-runs/{run_id}/run-deployment-validation", status_code=200)
+def rerun_deployment_validation(run_id: int, repo_slug: str | None = None, environment: str = "dev"):
+    """Admin-triggered re-run of deployment validation for a workflow run.
+
+    Stores a new deployment_validations row and updates workflow_runs.deployment_validation_status.
+    Requires admin key auth (inherited from BaseHTTPMiddleware).
+    """
+    from app.database import get_conn as _gc
+    from app.deployment_validator import run_deployment_validation as _run_dv
+    import os
+
+    # Resolve repo_slug from workflow_runs if not provided
+    if not repo_slug:
+        with _gc() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT repo_slug FROM repo_mappings rm "
+                    "JOIN workflow_runs wr ON wr.id=%s "
+                    "WHERE rm.jira_project_key = split_part(wr.issue_key, '-', 1) "
+                    "LIMIT 1",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    repo_slug = row[0]
+
+    if not repo_slug:
+        raise HTTPException(
+            status_code=422,
+            detail="repo_slug is required (could not derive from run mapping)",
+        )
+
+    timeout_s = int(os.environ.get("DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS", "120"))
+    retry_n   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_COUNT", "3"))
+    retry_d   = int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS", "10"))
+
+    result = _run_dv(
+        run_id=run_id,
+        repo_slug=repo_slug,
+        environment=environment,
+        timeout_seconds=timeout_s,
+        retry_count=retry_n,
+        retry_delay_seconds=retry_d,
+    )
+
+    return {
+        "run_id": run_id,
+        "repo_slug": repo_slug,
+        "environment": environment,
+        "status": result["status"],
+        "summary": result["summary"],
+        "validation_id": result["validation_id"],
+        "smoke_results": result["smoke_results"],
+    }

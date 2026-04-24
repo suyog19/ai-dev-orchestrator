@@ -722,3 +722,51 @@ async def ui_deployments(
         "filter_status": status or "",
         "limit": limit,
     })
+
+
+@router.post("/runs/{run_id}/run-deployment-validation", response_class=HTMLResponse)
+async def ui_rerun_deployment_validation(
+    request: Request,
+    run_id: int,
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/error.html", {
+            "request": request, "csrf": csrf_token(token), "env_name": _env_name(),
+            "page": "runs", "message": "CSRF validation failed.",
+        }, status_code=403)
+
+    from app.deployment_validator import run_deployment_validation as _run_dv
+    from app.database import get_conn as _gc
+    import os
+
+    # Resolve repo_slug from run's mapping
+    repo_slug = None
+    with _gc() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT repo_slug FROM repo_mappings rm "
+                "JOIN workflow_runs wr ON wr.id=%s "
+                "WHERE rm.jira_project_key = split_part(wr.issue_key, '-', 1) "
+                "LIMIT 1",
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                repo_slug = row[0]
+
+    if repo_slug:
+        _run_dv(
+            run_id=run_id,
+            repo_slug=repo_slug,
+            timeout_seconds=int(os.environ.get("DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS", "120")),
+            retry_count=int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_COUNT", "3")),
+            retry_delay_seconds=int(os.environ.get("DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS", "10")),
+        )
+
+    return RedirectResponse(url=f"/admin/ui/runs/{run_id}", status_code=302)
