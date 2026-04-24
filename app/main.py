@@ -30,6 +30,10 @@ from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, u
 from app.database import add_manual_memory, generate_repo_memory_snapshot
 from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill, get_overview_stats
 from app.database import list_capability_profiles, get_active_capability_profile
+from app.database import (
+    upsert_deployment_profile, get_deployment_profile, list_deployment_profiles,
+    update_deployment_profile_field, list_deployment_validations, get_deployment_validation,
+)
 
 load_dotenv()
 
@@ -1062,3 +1066,101 @@ def get_repo_capability_profile(repo_slug: str):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=f"No active profile for {repo_slug}")
     return profile
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Profiles
+# ---------------------------------------------------------------------------
+
+class DeploymentProfileBody(BaseModel):
+    repo_slug: str
+    environment: str = "dev"
+    deployment_type: str
+    base_url: str | None = None
+    healthcheck_path: str | None = None
+    enabled: bool = True
+    smoke_tests: list | None = None
+
+
+class DeploymentProfileUpdateBody(BaseModel):
+    deployment_type: str | None = None
+    base_url: str | None = None
+    healthcheck_path: str | None = None
+    enabled: bool | None = None
+    smoke_tests: list | None = None
+
+
+@app.get("/debug/deployment-profiles")
+def list_dep_profiles(repo_slug: str | None = None):
+    """List deployment profiles, optionally filtered by repo_slug."""
+    profiles = list_deployment_profiles(repo_slug=repo_slug)
+    return {"profiles": profiles, "count": len(profiles)}
+
+
+@app.get("/debug/deployment-profiles/{repo_slug:path}")
+def get_dep_profile(repo_slug: str, environment: str = "dev"):
+    """Return the active deployment profile for a repo_slug + environment."""
+    profile = get_deployment_profile(repo_slug, environment)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"No profile for {repo_slug}/{environment}")
+    return profile
+
+
+@app.post("/debug/deployment-profiles", status_code=201)
+def create_dep_profile(body: DeploymentProfileBody):
+    """Create or update a deployment profile (upsert on repo_slug+environment)."""
+    if body.smoke_tests is not None:
+        try:
+            import json as _json
+            _json.dumps(body.smoke_tests)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid smoke_tests JSON: {exc}")
+    data = body.model_dump()
+    profile_id = upsert_deployment_profile(data)
+    return {"id": profile_id, "message": "Deployment profile created/updated"}
+
+
+@app.put("/debug/deployment-profiles/{profile_id}", status_code=200)
+def update_dep_profile(profile_id: int, body: DeploymentProfileUpdateBody):
+    """Update specific fields on a deployment profile by id."""
+    updates: dict = {}
+    if body.deployment_type is not None:
+        updates["deployment_type"] = body.deployment_type
+    if body.base_url is not None:
+        updates["base_url"] = body.base_url
+    if body.healthcheck_path is not None:
+        updates["healthcheck_path"] = body.healthcheck_path
+    if body.enabled is not None:
+        updates["enabled"] = body.enabled
+    if body.smoke_tests is not None:
+        import json as _json
+        updates["smoke_tests_json"] = _json.dumps(body.smoke_tests)
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update")
+    update_deployment_profile_field(profile_id, **updates)
+    return {"message": "Deployment profile updated"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Deployment Validations (read endpoints; write via service)
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/deployment-validations")
+def list_dep_validations(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List deployment validations with optional filters."""
+    rows = list_deployment_validations(run_id=run_id, repo_slug=repo_slug, status=status, limit=limit)
+    return {"validations": rows, "count": len(rows)}
+
+
+@app.get("/debug/workflow-runs/{run_id}/deployment-validation")
+def get_run_dep_validation(run_id: int):
+    """Return the latest deployment validation for a workflow run."""
+    row = get_deployment_validation(run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No deployment validation for run {run_id}")
+    return row
