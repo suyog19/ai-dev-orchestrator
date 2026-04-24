@@ -1323,3 +1323,104 @@ def refresh_project_knowledge(repo_slug: str):
         "repo_slug": repo_slug,
         "message": "Knowledge refresh not yet implemented — will be available after Iteration 5.",
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 Iteration 9 — Jira repo mapping setup helper
+# ---------------------------------------------------------------------------
+
+class JiraMappingBody(BaseModel):
+    jira_project_key: str
+    base_branch: str = "main"
+    environment: str = "dev"
+    auto_merge_enabled: bool = False
+
+
+@app.post("/admin/project-onboarding/{repo_slug:path}/create-jira-mapping", status_code=201)
+def create_jira_mapping_for_repo(repo_slug: str, body: JiraMappingBody):
+    """Create or update a Jira repo mapping for an onboarded project.
+
+    Behaviour:
+    1. Check if a mapping for (jira_project_key, repo_slug) already exists
+    2. If yes, update base_branch and auto_merge_enabled
+    3. If no, create new mapping (auto_merge_enabled=False is the safe default)
+    4. Verify mapping health (active, correct slug)
+    5. Return mapping + capability profile + health status
+
+    Requires X-Orchestrator-Admin-Key header.
+    """
+    from app.repo_mapping import get_all_mappings, add_mapping, update_mapping
+    from app.database import get_active_capability_profile
+
+    repo_slug = repo_slug.strip()
+    jira_key = body.jira_project_key.strip().upper()
+    if not jira_key:
+        raise HTTPException(status_code=422, detail="jira_project_key is required")
+    if not repo_slug or "/" not in repo_slug:
+        raise HTTPException(status_code=422, detail="repo_slug must be in 'owner/repo' format")
+
+    # Check for existing active mapping
+    all_mappings = get_all_mappings()
+    existing = next(
+        (m for m in all_mappings
+         if m["jira_project_key"] == jira_key
+         and m["repo_slug"] == repo_slug
+         and m["is_active"]),
+        None,
+    )
+
+    if existing:
+        updated = update_mapping(
+            existing["id"],
+            base_branch=body.base_branch,
+            auto_merge_enabled=body.auto_merge_enabled,
+        )
+        mapping = updated
+        created = False
+    else:
+        mapping = add_mapping(
+            jira_project_key=jira_key,
+            repo_slug=repo_slug,
+            base_branch=body.base_branch,
+            auto_merge_enabled=body.auto_merge_enabled,
+            notes=f"Created via project onboarding helper (Phase 17)",
+        )
+        created = True
+
+    # Mapping health checks
+    health: dict = {
+        "is_active": mapping.get("is_active", False),
+        "has_repo_slug": bool(mapping.get("repo_slug")),
+        "auto_merge_disabled_for_safety": not mapping.get("auto_merge_enabled", True),
+    }
+
+    # Check capability profile exists for this repo
+    profile = get_active_capability_profile(repo_slug)
+    health["capability_profile_detected"] = profile is not None
+    if profile:
+        health["profile_name"] = profile["profile_name"]
+
+    health_ok = health["is_active"] and health["has_repo_slug"] and health["capability_profile_detected"]
+
+    recommendations = []
+    if not health["auto_merge_disabled_for_safety"]:
+        recommendations.append("auto_merge is enabled — ensure tests pass reliably before merging automatically.")
+    if not profile:
+        recommendations.append("No capability profile detected yet. Run POST /admin/project-onboarding/start first.")
+    if profile and profile.get("profile_name") not in ("python_fastapi",):
+        recommendations.append("This profile has auto_merge disabled by policy. PRs will require manual merge.")
+
+    logger.info(
+        "Jira mapping %s for %s -> %s (health=%s)",
+        "created" if created else "updated",
+        jira_key, repo_slug, health_ok,
+    )
+
+    return {
+        "mapping": mapping,
+        "created": created,
+        "health": health,
+        "health_ok": health_ok,
+        "capability_profile": profile,
+        "recommendations": recommendations,
+    }
