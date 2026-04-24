@@ -2,6 +2,8 @@ import logging
 import os
 import subprocess
 
+from app.command_runner import run_repo_command
+
 logger = logging.getLogger("worker")
 
 # Any of these in the repo root signals a pytest-compatible project
@@ -90,27 +92,14 @@ def run_tests(
             result.update(err)
             return result
 
-    logger.info("Running tests [profile=%s]: %s", profile_label, command)
-    try:
-        proc = subprocess.run(
-            command.split(),
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        combined = (proc.stdout + proc.stderr).strip()
-        result["exit_code"] = proc.returncode
-        result["output"] = combined[:4000]
-        result["status"] = "PASSED" if proc.returncode == 0 else "FAILED"
-        last_line = combined.splitlines()[-1] if combined else ""
-        logger.info(
-            "Tests %s [profile=%s] (exit=%d) — %s",
-            result["status"], profile_label, proc.returncode, last_line,
-        )
-    except subprocess.TimeoutExpired:
-        result["status"] = "ERROR"
-        result["output"] = f"Tests timed out after {timeout}s"
-        logger.error("Test run timed out after %ds [profile=%s]", timeout, profile_label)
-
+    cmd_result = run_repo_command(
+        workspace_path=repo_path,
+        command=command,
+        timeout_seconds=timeout,
+        profile_name=profile_label,
+        label="tests",
+    )
+    result["status"] = cmd_result["status"]
+    result["exit_code"] = cmd_result["exit_code"]
+    result["output"] = cmd_result["output"]
     return result
