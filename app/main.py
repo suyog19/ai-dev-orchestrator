@@ -14,6 +14,7 @@ from app.database import (
     approve_planning_run, reject_planning_run, record_planning_feedback,
     generate_epic_outcome_rollup,
     list_agent_reviews,
+    list_test_quality_reviews,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -391,6 +392,31 @@ def get_workflow_run_reviews(run_id: int):
     if not reviews:
         raise HTTPException(status_code=404, detail=f"No reviews found for run_id={run_id}")
     return {"run_id": run_id, "reviews": reviews, "count": len(reviews)}
+
+
+@app.get("/debug/test-quality-reviews")
+def get_test_quality_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    quality_status: str | None = None,
+    limit: int = 20,
+):
+    """List agent_test_quality_reviews rows. Filter by run_id, repo_slug, or quality_status."""
+    return list_test_quality_reviews(
+        run_id=run_id,
+        repo_slug=repo_slug,
+        quality_status=quality_status,
+        limit=limit,
+    )
+
+
+@app.get("/debug/workflow-runs/{run_id}/test-quality")
+def get_workflow_run_test_quality(run_id: int):
+    """Return all Test Quality Agent verdicts for a specific workflow run."""
+    reviews = list_test_quality_reviews(run_id=run_id)
+    if not reviews:
+        raise HTTPException(status_code=404, detail=f"No test quality reviews found for run_id={run_id}")
+    return {"run_id": run_id, "test_quality_reviews": reviews, "count": len(reviews)}
 
 
 # ---------------------------------------------------------------------------
