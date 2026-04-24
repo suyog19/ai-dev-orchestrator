@@ -1571,6 +1571,24 @@ def record_execution_feedback(run_id: int) -> int:
             if release_decision:
                 _ev(FeedbackType.RELEASE_DECISION, release_decision)
 
+            # Clarification signals (Phase 12)
+            cur.execute(
+                "SELECT status FROM clarification_requests WHERE run_id = %s",
+                (run_id,),
+            )
+            clar_rows = cur.fetchall()
+            if clar_rows:
+                _ev(FeedbackType.CLARIFICATION_COUNT, len(clar_rows))
+                statuses = [r[0] for r in clar_rows]
+                if any(s == "PENDING" or s == "ANSWERED" or s == "EXPIRED" or s == "CANCELLED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_REQUESTED, "true")
+                if any(s == "ANSWERED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_ANSWERED, "true")
+                if any(s == "CANCELLED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_CANCELLED, "true")
+                if any(s == "EXPIRED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_EXPIRED, "true")
+
             if not events:
                 return 0
 

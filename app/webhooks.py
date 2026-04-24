@@ -87,6 +87,11 @@ async def _handle_clarification_command(cmd: tuple, incoming_chat_id: str) -> di
         if ok:
             run_id = clarification["run_id"]
             logger.info("Clarification %s cancelled (run_id=%s)", clarification_id, run_id)
+            record_security_event(
+                event_type="clarification_cancelled", source="telegram", actor=incoming_chat_id,
+                endpoint="/webhooks/telegram", method="POST", status="CANCELLED",
+                details={"clarification_id": clarification_id, "run_id": run_id},
+            )
             # Fail the run since user explicitly cancelled
             from app.database import fail_run
             fail_run(run_id, f"Clarification {clarification_id} cancelled by user")
