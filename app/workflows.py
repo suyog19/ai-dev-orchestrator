@@ -711,6 +711,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         and applied.get("applied", False)
         and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
         and review_status == ReviewStatus.APPROVED_BY_AI
+        and test_quality_status == TestQualityStatus.APPROVED
     )
 
     update_run_step(run_id, "merge_check")
@@ -733,6 +734,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             f"Reasons: {blocking}",
         )
         logger.info("story_implementation: merge blocked by review — %s", blocking)
+    elif test_quality_status == TestQualityStatus.BLOCKING:
+        blocking = "; ".join(tq_verdict.get("missing_tests") or ["test quality blocked merge"])
+        update_run_field(run_id, merge_status="BLOCKED_BY_TEST_QUALITY")
+        send_message(
+            "merge_blocked_by_test_quality", "BLOCKED",
+            f"{issue_key}: PR #{pr['number']} merge blocked by Test Quality Agent\n"
+            f"Missing: {blocking}",
+        )
+        logger.info("story_implementation: merge blocked by test quality — %s", blocking)
     else:
         reasons = []
         if not mapping.get("auto_merge_enabled"):
@@ -747,6 +757,10 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             reasons.append("review needs changes")
         elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
             reasons.append(f"review status: {review_status}")
+        if test_quality_status == TestQualityStatus.WEAK:
+            reasons.append("test quality weak")
+        elif test_quality_status not in (TestQualityStatus.APPROVED,):
+            reasons.append(f"test quality status: {test_quality_status}")
         reason_str = "; ".join(reasons) if reasons else "conditions not met"
         update_run_field(run_id, merge_status="SKIPPED")
         send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")
