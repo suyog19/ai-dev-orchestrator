@@ -94,10 +94,15 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS assumptions_json    TEXT NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS open_questions_json TEXT NULL",
                 # Phase 8 — Reviewer Agent
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_status       VARCHAR(30)  NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_required     BOOLEAN      NOT NULL DEFAULT TRUE",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMP    NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_summary      TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_status            VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_required          BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_completed_at      TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_summary           TEXT         NULL",
+                # Phase 9 — Test Quality Agent
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_status      VARCHAR(40)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_required    BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_completed_at TIMESTAMP   NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_summary     TEXT         NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -224,6 +229,30 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            # Phase 9 — Test Quality Agent reviews
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agent_test_quality_reviews (
+                    id                       SERIAL PRIMARY KEY,
+                    run_id                   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    pr_number                INTEGER       NULL,
+                    pr_url                   VARCHAR(500)  NULL,
+                    repo_slug                VARCHAR(200)  NULL,
+                    story_key                VARCHAR(100)  NULL,
+                    agent_name               VARCHAR(100)  NOT NULL DEFAULT 'test_quality_agent',
+                    quality_status           VARCHAR(40)   NOT NULL,
+                    confidence_level         VARCHAR(20)   NULL,
+                    summary                  TEXT          NULL,
+                    coverage_findings_json   TEXT          NULL,
+                    missing_tests_json       TEXT          NULL,
+                    suspicious_tests_json    TEXT          NULL,
+                    recommendations_json     TEXT          NULL,
+                    model_used               VARCHAR(100)  NULL,
+                    memory_snapshot_ids_json TEXT          NULL,
+                    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
     if seed_file.exists():
@@ -320,6 +349,9 @@ def update_run_field(run_id: int, **fields):
         "created_jira_children_count",
         # Phase 8
         "review_status", "review_required", "review_completed_at", "review_summary",
+        # Phase 9
+        "test_quality_status", "test_quality_required",
+        "test_quality_completed_at", "test_quality_summary",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -395,6 +427,72 @@ def store_agent_review(
         run_id, review_id, review_status,
     )
     return review_id
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Test Quality Agent helpers
+# ---------------------------------------------------------------------------
+
+def store_test_quality_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist a Test Quality Agent verdict and update workflow_runs test_quality fields.
+
+    Inserts one row into agent_test_quality_reviews and sets test_quality_status
+    + test_quality_completed_at on the parent workflow_run. Returns the new row id.
+    """
+    from app.feedback import AgentName
+
+    quality_status = verdict.get("quality_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_test_quality_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, quality_status, confidence_level, summary,
+                     coverage_findings_json, missing_tests_json,
+                     suspicious_tests_json, recommendations_json, model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.TEST_QUALITY_AGENT,
+                    quality_status,
+                    verdict.get("confidence_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("coverage_findings") or []),
+                    json.dumps(verdict.get("missing_tests") or []),
+                    json.dumps(verdict.get("suspicious_tests") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    model_used,
+                ),
+            )
+            tqr_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET test_quality_status = %s, test_quality_completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (quality_status, run_id),
+            )
+
+    logger.info(
+        "store_test_quality_review: run_id=%s tqr_id=%s status=%s",
+        run_id, tqr_id, quality_status,
+    )
+    return tqr_id
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +894,35 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
             )
             exec_categories = cur.fetchall()
 
+            # --- Reviewer Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_approved'      AND feedback_value='true') AS rev_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_needs_changes' AND feedback_value='true') AS rev_needs_changes,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_blocked'       AND feedback_value='true') AS rev_blocked,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='review_status') AS rev_total
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            review_row = cur.fetchone()
+
+            # --- Test Quality Agent stats ---
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='test_quality_approved' AND feedback_value='true') AS tq_approved,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='tests_weak'            AND feedback_value='true') AS tq_weak,
+                    COUNT(DISTINCT source_run_id) FILTER (WHERE feedback_type='tests_blocking'        AND feedback_value='true') AS tq_blocking
+                FROM feedback_events
+                WHERE source_type='execution_run' AND repo_slug=%s
+                """,
+                (repo_slug,),
+            )
+            tq_row = cur.fetchone()
+
             # --- Planning stats (all project_keys mapped to this repo) ---
             plan_row = None
             if project_keys:
@@ -844,6 +971,36 @@ def generate_repo_memory_snapshot(repo_slug: str) -> dict:
                 exec_evidence["failure_categories"] = {
                     cat: int(cnt) for cat, cnt in exec_categories
                 }
+
+            if review_row:
+                rev_approved, rev_needs_changes, rev_blocked, rev_total = review_row
+                if rev_total and int(rev_total) > 0:
+                    exec_bullets.append(
+                        f"Reviewer Agent: {int(rev_approved or 0)} approved, "
+                        f"{int(rev_needs_changes or 0)} needs-changes, "
+                        f"{int(rev_blocked or 0)} blocked of {int(rev_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "review_approved":      int(rev_approved or 0),
+                        "review_needs_changes": int(rev_needs_changes or 0),
+                        "review_blocked":       int(rev_blocked or 0),
+                        "review_total":         int(rev_total or 0),
+                    })
+
+            if tq_row:
+                tq_approved, tq_weak, tq_blocking = tq_row
+                tq_total = (tq_approved or 0) + (tq_weak or 0) + (tq_blocking or 0)
+                if int(tq_total) > 0:
+                    exec_bullets.append(
+                        f"Test Quality Agent: {int(tq_approved or 0)} approved, "
+                        f"{int(tq_weak or 0)} weak, "
+                        f"{int(tq_blocking or 0)} blocking of {int(tq_total)} reviewed"
+                    )
+                    exec_evidence.update({
+                        "tq_approved":  int(tq_approved or 0),
+                        "tq_weak":      int(tq_weak or 0),
+                        "tq_blocking":  int(tq_blocking or 0),
+                    })
 
             exec_summary = (
                 "\n".join(f"- {b}" for b in exec_bullets)
@@ -942,7 +1099,7 @@ def record_execution_feedback(run_id: int) -> int:
                 """
                 SELECT issue_key, status, test_status, retry_count,
                        merge_status, files_changed_count, error_detail, current_step,
-                       review_status
+                       review_status, test_quality_status
                 FROM workflow_runs WHERE id = %s
                 """,
                 (run_id,),
@@ -951,7 +1108,8 @@ def record_execution_feedback(run_id: int) -> int:
             if not row:
                 return 0
             issue_key, status, test_status, retry_count, merge_status, \
-                files_changed_count, error_detail, current_step, review_status = row
+                files_changed_count, error_detail, current_step, \
+                review_status, test_quality_status = row
             issue_key_out = issue_key
 
             # Resolve repo_slug from active mapping for this project
@@ -1020,6 +1178,35 @@ def record_execution_feedback(run_id: int) -> int:
                 ar = cur.fetchone()
                 if ar and ar[0]:
                     _ev(FeedbackType.REVIEW_RISK_LEVEL, ar[0])
+
+            # Test quality signals (Phase 9)
+            if test_quality_status:
+                from app.feedback import TestQualityStatus
+                _ev(FeedbackType.TEST_QUALITY_STATUS, test_quality_status)
+                if test_quality_status == TestQualityStatus.APPROVED:
+                    _ev(FeedbackType.TEST_QUALITY_APPROVED, "true")
+                elif test_quality_status == TestQualityStatus.WEAK:
+                    _ev(FeedbackType.TESTS_WEAK, "true")
+                elif test_quality_status == TestQualityStatus.BLOCKING:
+                    _ev(FeedbackType.TESTS_BLOCKING, "true")
+
+                cur.execute(
+                    """SELECT confidence_level, missing_tests_json, suspicious_tests_json
+                       FROM agent_test_quality_reviews WHERE run_id = %s ORDER BY id DESC LIMIT 1""",
+                    (run_id,),
+                )
+                tqr = cur.fetchone()
+                if tqr:
+                    if tqr[0]:
+                        _ev(FeedbackType.TEST_QUALITY_CONFIDENCE, tqr[0])
+                    try:
+                        _ev(FeedbackType.MISSING_TEST_COUNT, len(json.loads(tqr[1] or "[]")))
+                    except Exception:
+                        pass
+                    try:
+                        _ev(FeedbackType.SUSPICIOUS_TEST_COUNT, len(json.loads(tqr[2] or "[]")))
+                    except Exception:
+                        pass
 
             if not events:
                 return 0
@@ -1491,6 +1678,70 @@ def add_manual_memory(scope_type: str, scope_key: str, content: str) -> dict:
         "created_at":  created_at.isoformat(),
         "updated_at":  updated_at.isoformat(),
     }
+
+
+def list_test_quality_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    quality_status: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return agent_test_quality_reviews rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    if repo_slug is not None:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    if quality_status is not None:
+        conditions.append("quality_status = %s")
+        params.append(quality_status)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, pr_number, pr_url, repo_slug, story_key,
+                       agent_name, quality_status, confidence_level, summary,
+                       coverage_findings_json, missing_tests_json, suspicious_tests_json,
+                       recommendations_json, model_used, created_at, updated_at
+                FROM agent_test_quality_reviews
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":                r[0],
+            "run_id":            r[1],
+            "pr_number":         r[2],
+            "pr_url":            r[3],
+            "repo_slug":         r[4],
+            "story_key":         r[5],
+            "agent_name":        r[6],
+            "quality_status":    r[7],
+            "confidence_level":  r[8],
+            "summary":           r[9],
+            "coverage_findings": json.loads(r[10]) if r[10] else [],
+            "missing_tests":     json.loads(r[11]) if r[11] else [],
+            "suspicious_tests":  json.loads(r[12]) if r[12] else [],
+            "recommendations":   json.loads(r[13]) if r[13] else [],
+            "model_used":        r[14],
+            "created_at":        r[15].isoformat() if r[15] else None,
+            "updated_at":        r[16].isoformat() if r[16] else None,
+        }
+        for r in rows
+    ]
 
 
 def list_agent_reviews(

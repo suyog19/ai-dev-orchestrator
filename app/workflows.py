@@ -5,7 +5,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality
 from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
@@ -18,8 +18,9 @@ from app.database import (
     record_planning_feedback, record_execution_feedback,
     get_planning_memory, get_execution_memory,
     store_agent_review,
+    store_test_quality_review,
 )
-from app.feedback import ReviewStatus
+from app.feedback import ReviewStatus, TestQualityStatus
 from app.test_runner import run_tests
 
 AI_LABEL = "ai-generated"
@@ -110,6 +111,122 @@ def _format_review_comment(verdict: dict) -> str:
         f"### Recommendations\n{rec_lines}\n\n"
         f"---\n"
         f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Reviewer Agent_"
+    )
+
+
+_TEST_FILE_PATTERNS = ("tests/", "test_", "_test.py", "/test")
+
+def _is_test_file(path: str) -> bool:
+    """Return True if a file path looks like a test file."""
+    return any(p in path for p in _TEST_FILE_PATTERNS)
+
+
+_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", ".skip(", "skipTest(")
+
+def _detect_skipped_tests(diff: str, test_output: str) -> bool:
+    """Return True if skipped tests are detected in the diff or test output."""
+    combined = (diff or "") + (test_output or "")
+    lower = combined.lower()
+    if "skipped" in lower:
+        return True
+    return any(p in combined for p in _SKIP_PATTERNS)
+
+
+def _build_test_quality_package(
+    issue_key: str,
+    summary: str,
+    story_details: dict,
+    mapping: dict,
+    pr: dict,
+    final_changes: list,
+    diff_block: str,
+    final_test_result: dict,
+    retry_count: int,
+    execution_memory: str,
+) -> dict:
+    """Assemble the full context package for the Test Quality Agent.
+
+    Returns a dict with keys that unpack directly into review_test_quality(**pkg).
+    No Claude call, no DB write, no secrets included.
+    """
+    all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
+    source_files = [f for f in all_files if not _is_test_file(f)]
+    test_files = [f for f in all_files if _is_test_file(f)]
+
+    output = (final_test_result.get("output") or "").strip()
+    output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
+    skipped = _detect_skipped_tests(diff_block, output)
+
+    return {
+        "story_context": {
+            "key": issue_key,
+            "summary": summary,
+            "description": story_details.get("description"),
+            "acceptance_criteria": story_details.get("acceptance_criteria") or [],
+        },
+        "pr_context": {
+            "number": pr["number"],
+            "url": pr["url"],
+            "title": pr.get("title", ""),
+            "body": pr.get("body", ""),
+        },
+        "diff_context": {
+            "full_diff": diff_block,
+            "changed_files": all_files,
+        },
+        "test_context": {
+            "status": final_test_result["status"],
+            "command": final_test_result.get("command", ""),
+            "output_excerpt": output_excerpt,
+            "test_files_changed": test_files,
+            "skipped_tests_detected": skipped,
+        },
+        "implementation_context": {
+            "files_changed_count": len(all_files),
+            "retry_count": retry_count,
+            "changed_source_files": source_files,
+            "changed_test_files": test_files,
+        },
+        "memory_context": execution_memory,
+    }
+
+
+def _format_test_quality_comment(verdict: dict) -> str:
+    """Render a Test Quality Agent verdict as a GitHub PR comment in markdown."""
+    status = verdict.get("quality_status", "UNKNOWN")
+    confidence = verdict.get("confidence_level", "UNKNOWN")
+    summary = verdict.get("summary", "")
+    findings = verdict.get("coverage_findings") or []
+    missing = verdict.get("missing_tests") or []
+    suspicious = verdict.get("suspicious_tests") or []
+    recommendations = verdict.get("recommendations") or []
+
+    emoji = {
+        "TEST_QUALITY_APPROVED": "✅",
+        "TESTS_WEAK": "⚠️",
+        "TESTS_BLOCKING": "🚫",
+        "ERROR": "❌",
+    }.get(status, "❓")
+
+    findings_lines = "\n".join(
+        f"- [{f.get('status', '?').upper()}] **{f.get('criteria', '')}**: {f.get('evidence', '')}"
+        for f in findings
+    ) or "_None_"
+
+    missing_lines = "\n".join(f"- {m}" for m in missing) or "_None_"
+    suspicious_lines = "\n".join(f"- {s}" for s in suspicious) or "_None_"
+    rec_lines = "\n".join(f"- {r}" for r in recommendations) or "_None_"
+
+    return (
+        f"## {emoji} Test Quality Agent Verdict: `{status}`\n\n"
+        f"**Confidence:** {confidence}\n\n"
+        f"### Summary\n{summary}\n\n"
+        f"### Coverage Findings\n{findings_lines}\n\n"
+        f"### Missing Tests\n{missing_lines}\n\n"
+        f"### Suspicious Test Changes\n{suspicious_lines}\n\n"
+        f"### Recommendations\n{rec_lines}\n\n"
+        f"---\n"
+        f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Test Quality Agent_"
     )
 
 
@@ -508,9 +625,85 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         )
         verdict = error_verdict
 
+    # --- Run Test Quality Agent ---
+    update_run_step(run_id, "test_quality_review")
+    tq_verdict: dict = {}
+    try:
+        tq_package = _build_test_quality_package(
+            issue_key=issue_key,
+            summary=summary,
+            story_details=story_details,
+            mapping=mapping,
+            pr=pr,
+            final_changes=final_changes,
+            diff_block=diff_block,
+            final_test_result=final_test_result,
+            retry_count=review_retry_count,
+            execution_memory=execution_memory,
+        )
+        tq_verdict = review_test_quality(**tq_package)
+        store_test_quality_review(
+            run_id=run_id,
+            verdict=tq_verdict,
+            pr_number=pr["number"],
+            pr_url=pr["url"],
+            repo_slug=mapping["repo_slug"],
+            story_key=issue_key,
+        )
+        logger.info(
+            "story_implementation: test_quality complete — status=%s confidence=%s",
+            tq_verdict.get("quality_status"), tq_verdict.get("confidence_level"),
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_test_quality_comment(tq_verdict))
+            logger.info("story_implementation: test quality comment posted to PR #%s", pr["number"])
+        except Exception as comment_exc:
+            logger.warning("story_implementation: TQ PR comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "test_quality_completed",
+            tq_verdict.get("quality_status", "UNKNOWN"),
+            (
+                f"{issue_key}: PR #{pr['number']}\n"
+                f"Test Quality: {tq_verdict.get('quality_status')}\n"
+                f"Confidence: {tq_verdict.get('confidence_level')}\n"
+                f"{tq_verdict.get('summary', '')}"
+            ),
+        )
+    except Exception as exc:
+        logger.error("story_implementation: Test Quality Agent failed — %s", exc)
+        tq_verdict = {
+            "quality_status": TestQualityStatus.ERROR,
+            "confidence_level": "LOW",
+            "summary": f"Test Quality Agent error: {exc}",
+            "coverage_findings": [],
+            "missing_tests": [str(exc)],
+            "suspicious_tests": [],
+            "recommendations": [],
+        }
+        try:
+            store_test_quality_review(
+                run_id=run_id,
+                verdict=tq_verdict,
+                pr_number=pr["number"],
+                pr_url=pr["url"],
+                repo_slug=mapping["repo_slug"],
+                story_key=issue_key,
+            )
+        except Exception as db_exc:
+            logger.error("story_implementation: store_test_quality_review failed — %s", db_exc)
+        try:
+            post_pr_comment(mapping["repo_slug"], pr["number"], _format_test_quality_comment(tq_verdict))
+        except Exception as comment_exc:
+            logger.warning("story_implementation: TQ error comment failed (non-fatal) — %s", comment_exc)
+        send_message(
+            "test_quality_error", "ERROR",
+            f"{issue_key}: Test Quality Agent error — {exc}",
+        )
+
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
     review_status = verdict.get("review_status", ReviewStatus.ERROR)
+    test_quality_status = tq_verdict.get("quality_status", TestQualityStatus.ERROR)
 
     auto_merge_ok = (
         mapping.get("auto_merge_enabled")
@@ -518,6 +711,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         and applied.get("applied", False)
         and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
         and review_status == ReviewStatus.APPROVED_BY_AI
+        and test_quality_status == TestQualityStatus.APPROVED
     )
 
     update_run_step(run_id, "merge_check")
@@ -540,6 +734,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             f"Reasons: {blocking}",
         )
         logger.info("story_implementation: merge blocked by review — %s", blocking)
+    elif test_quality_status == TestQualityStatus.BLOCKING:
+        blocking = "; ".join(tq_verdict.get("missing_tests") or ["test quality blocked merge"])
+        update_run_field(run_id, merge_status="BLOCKED_BY_TEST_QUALITY")
+        send_message(
+            "merge_blocked_by_test_quality", "BLOCKED",
+            f"{issue_key}: PR #{pr['number']} merge blocked by Test Quality Agent\n"
+            f"Missing: {blocking}",
+        )
+        logger.info("story_implementation: merge blocked by test quality — %s", blocking)
     else:
         reasons = []
         if not mapping.get("auto_merge_enabled"):
@@ -554,6 +757,10 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             reasons.append("review needs changes")
         elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
             reasons.append(f"review status: {review_status}")
+        if test_quality_status == TestQualityStatus.WEAK:
+            reasons.append("test quality weak")
+        elif test_quality_status not in (TestQualityStatus.APPROVED,):
+            reasons.append(f"test quality status: {test_quality_status}")
         reason_str = "; ".join(reasons) if reasons else "conditions not met"
         update_run_field(run_id, merge_status="SKIPPED")
         send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")
