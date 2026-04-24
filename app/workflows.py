@@ -437,6 +437,9 @@ def evaluate_release_decision(
     review_status: str,
     test_quality_status: str,
     architecture_status: str,
+    build_status: str = "NOT_RUN",
+    lint_status: str = "NOT_RUN",
+    capability_profile: dict | None = None,
 ) -> dict:
     """Evaluate all agent gates and return a unified release decision.
 
@@ -459,6 +462,9 @@ def evaluate_release_decision(
         blocking_gates.append("test quality blocking")
     if architecture_status == ArchitectureStatus.BLOCKED:
         blocking_gates.append("architecture blocked")
+    # Phase 15: build failure is a hard block
+    if build_status == "FAILED":
+        blocking_gates.append("build failed")
 
     if blocking_gates:
         return {
@@ -493,6 +499,9 @@ def evaluate_release_decision(
         warnings.append("architecture needs human review")
     elif architecture_status not in (ArchitectureStatus.APPROVED,):
         skip_reasons.append(f"architecture status: {architecture_status}")
+    # Phase 15: lint failure is a soft skip (RELEASE_SKIPPED, not RELEASE_BLOCKED)
+    if lint_status == "FAILED":
+        skip_reasons.append("lint failed")
 
     if skip_reasons:
         return {
@@ -946,6 +955,37 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.info("story_implementation: fix attempt passed")
         final_test_result = retest_result
 
+    # --- Phase 15: Build and lint (run after tests pass, non-fatal) ---
+    _build_status = "NOT_RUN"
+    _lint_status = "NOT_RUN"
+    if capability_profile:
+        from app.repo_profiler import get_build_command_for_profile, get_lint_command_for_profile
+        from app.test_runner import run_build, run_lint
+        _build_cmd = get_build_command_for_profile(capability_profile)
+        _lint_cmd = get_lint_command_for_profile(capability_profile)
+        if _build_cmd:
+            update_run_step(run_id, "building")
+            _build_result = run_build(
+                repo_path=repo_path,
+                build_command=_build_cmd,
+                profile_name=_profile_name,
+            )
+            _build_status = _build_result["status"]
+            update_run_field(run_id, build_status=_build_status)
+            send_message("build", _build_status, f"{issue_key}: build {_build_status}")
+            logger.info("story_implementation: build %s", _build_status)
+        if _lint_cmd:
+            update_run_step(run_id, "linting")
+            _lint_result = run_lint(
+                repo_path=repo_path,
+                lint_command=_lint_cmd,
+                profile_name=_profile_name,
+            )
+            _lint_status = _lint_result["status"]
+            update_run_field(run_id, lint_status=_lint_status)
+            send_message("lint", _lint_status, f"{issue_key}: lint {_lint_status}")
+            logger.info("story_implementation: lint %s", _lint_status)
+
     # --- Commit and push ---
     suggestion_description = suggestion_summary or (changes[0].get("description", "") if changes else "") or summary
     commit_message = f"ai: {issue_key} — {suggestion_description}"
@@ -1355,6 +1395,8 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         review_status=review_status,
         test_quality_status=test_quality_status,
         architecture_status=architecture_status,
+        build_status=_build_status,
+        lint_status=_lint_status,
     )
     update_run_field(
         run_id,

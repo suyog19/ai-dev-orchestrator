@@ -147,3 +147,49 @@ def run_tests(
     result["exit_code"] = cmd_result["exit_code"]
     result["output"] = cmd_result["output"]
     return result
+
+
+def run_build(
+    repo_path: str,
+    build_command: str | None,
+    profile_name: str | None = None,
+    timeout: int = 300,
+) -> dict:
+    """Run the build command for a profile. Returns status dict.
+
+    Returns:
+        {"status": "PASSED|FAILED|NOT_RUN|ERROR", "command": str|None, "output": str}
+    """
+    if not build_command:
+        return {"status": "NOT_RUN", "command": None, "output": ""}
+    result = run_repo_command(
+        workspace_path=repo_path,
+        command=build_command,
+        timeout_seconds=timeout,
+        profile_name=profile_name or "unknown",
+        label="build",
+    )
+    return {"status": result["status"], "command": result["command"], "output": result["output"]}
+
+
+def run_lint(
+    repo_path: str,
+    lint_command: str | None,
+    profile_name: str | None = None,
+    timeout: int = 120,
+) -> dict:
+    """Run the lint command for a profile. Returns status dict.
+
+    Returns:
+        {"status": "PASSED|FAILED|NOT_RUN|ERROR", "command": str|None, "output": str}
+    """
+    if not lint_command:
+        return {"status": "NOT_RUN", "command": None, "output": ""}
+    result = run_repo_command(
+        workspace_path=repo_path,
+        command=lint_command,
+        timeout_seconds=timeout,
+        profile_name=profile_name or "unknown",
+        label="lint",
+    )
+    return {"status": result["status"], "command": result["command"], "output": result["output"]}
