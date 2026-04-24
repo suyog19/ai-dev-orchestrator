@@ -113,6 +113,122 @@ def _format_review_comment(verdict: dict) -> str:
     )
 
 
+_TEST_FILE_PATTERNS = ("tests/", "test_", "_test.py", "/test")
+
+def _is_test_file(path: str) -> bool:
+    """Return True if a file path looks like a test file."""
+    return any(p in path for p in _TEST_FILE_PATTERNS)
+
+
+_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", ".skip(", "skipTest(")
+
+def _detect_skipped_tests(diff: str, test_output: str) -> bool:
+    """Return True if skipped tests are detected in the diff or test output."""
+    combined = (diff or "") + (test_output or "")
+    lower = combined.lower()
+    if "skipped" in lower:
+        return True
+    return any(p in combined for p in _SKIP_PATTERNS)
+
+
+def _build_test_quality_package(
+    issue_key: str,
+    summary: str,
+    story_details: dict,
+    mapping: dict,
+    pr: dict,
+    final_changes: list,
+    diff_block: str,
+    final_test_result: dict,
+    retry_count: int,
+    execution_memory: str,
+) -> dict:
+    """Assemble the full context package for the Test Quality Agent.
+
+    Returns a dict with keys that unpack directly into review_test_quality(**pkg).
+    No Claude call, no DB write, no secrets included.
+    """
+    all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
+    source_files = [f for f in all_files if not _is_test_file(f)]
+    test_files = [f for f in all_files if _is_test_file(f)]
+
+    output = (final_test_result.get("output") or "").strip()
+    output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
+    skipped = _detect_skipped_tests(diff_block, output)
+
+    return {
+        "story_context": {
+            "key": issue_key,
+            "summary": summary,
+            "description": story_details.get("description"),
+            "acceptance_criteria": story_details.get("acceptance_criteria") or [],
+        },
+        "pr_context": {
+            "number": pr["number"],
+            "url": pr["url"],
+            "title": pr.get("title", ""),
+            "body": pr.get("body", ""),
+        },
+        "diff_context": {
+            "full_diff": diff_block,
+            "changed_files": all_files,
+        },
+        "test_context": {
+            "status": final_test_result["status"],
+            "command": final_test_result.get("command", ""),
+            "output_excerpt": output_excerpt,
+            "test_files_changed": test_files,
+            "skipped_tests_detected": skipped,
+        },
+        "implementation_context": {
+            "files_changed_count": len(all_files),
+            "retry_count": retry_count,
+            "changed_source_files": source_files,
+            "changed_test_files": test_files,
+        },
+        "memory_context": execution_memory,
+    }
+
+
+def _format_test_quality_comment(verdict: dict) -> str:
+    """Render a Test Quality Agent verdict as a GitHub PR comment in markdown."""
+    status = verdict.get("quality_status", "UNKNOWN")
+    confidence = verdict.get("confidence_level", "UNKNOWN")
+    summary = verdict.get("summary", "")
+    findings = verdict.get("coverage_findings") or []
+    missing = verdict.get("missing_tests") or []
+    suspicious = verdict.get("suspicious_tests") or []
+    recommendations = verdict.get("recommendations") or []
+
+    emoji = {
+        "TEST_QUALITY_APPROVED": "✅",
+        "TESTS_WEAK": "⚠️",
+        "TESTS_BLOCKING": "🚫",
+        "ERROR": "❌",
+    }.get(status, "❓")
+
+    findings_lines = "\n".join(
+        f"- [{f.get('status', '?').upper()}] **{f.get('criteria', '')}**: {f.get('evidence', '')}"
+        for f in findings
+    ) or "_None_"
+
+    missing_lines = "\n".join(f"- {m}" for m in missing) or "_None_"
+    suspicious_lines = "\n".join(f"- {s}" for s in suspicious) or "_None_"
+    rec_lines = "\n".join(f"- {r}" for r in recommendations) or "_None_"
+
+    return (
+        f"## {emoji} Test Quality Agent Verdict: `{status}`\n\n"
+        f"**Confidence:** {confidence}\n\n"
+        f"### Summary\n{summary}\n\n"
+        f"### Coverage Findings\n{findings_lines}\n\n"
+        f"### Missing Tests\n{missing_lines}\n\n"
+        f"### Suspicious Test Changes\n{suspicious_lines}\n\n"
+        f"### Recommendations\n{rec_lines}\n\n"
+        f"---\n"
+        f"_🤖 [AI Dev Orchestrator](https://github.com/suyog19/ai-dev-orchestrator) — Test Quality Agent_"
+    )
+
+
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     status = test_result["status"]
     output = (test_result.get("output") or "").strip()
