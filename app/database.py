@@ -2542,10 +2542,17 @@ def update_clarification_telegram_id(clarification_id: int, telegram_message_id:
             )
 
 
-def list_clarifications(status: str | None = None, limit: int = 50) -> list[dict]:
-    """Return clarification_requests, optionally filtered by status, newest first."""
-    where = "WHERE status = %s" if status else ""
-    params = [status] if status else []
+def list_clarifications(status: str | None = None, run_id: int | None = None, limit: int = 50) -> list[dict]:
+    """Return clarification_requests, optionally filtered by status and/or run_id, newest first."""
+    conditions = []
+    params: list = []
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     params.append(limit)
     with get_conn() as conn:
         with conn.cursor() as cur:

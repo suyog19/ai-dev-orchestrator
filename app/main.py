@@ -706,6 +706,114 @@ def recompute_memory(scope_type: str, scope_key: str):
 
 
 # ---------------------------------------------------------------------------
+# Clarification inspection and management APIs
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/clarifications")
+def list_clarifications_endpoint(
+    status: str | None = None,
+    run_id: int | None = None,
+    limit: int = 50,
+):
+    """List clarification_requests. Filter by status (PENDING/ANSWERED/CANCELLED/EXPIRED) or run_id."""
+    from app.database import list_clarifications
+    return list_clarifications(status=status, run_id=run_id, limit=limit)
+
+
+@app.get("/debug/clarifications/{clarification_id}")
+def get_clarification_endpoint(clarification_id: int):
+    """Return full details for a single clarification_request."""
+    from app.database import get_clarification_by_id
+    clar = get_clarification_by_id(clarification_id)
+    if not clar:
+        raise HTTPException(status_code=404, detail=f"Clarification {clarification_id} not found")
+    return clar
+
+
+@app.post("/debug/clarifications/{clarification_id}/answer", status_code=200)
+async def admin_answer_clarification(clarification_id: int, request: Request):
+    """Admin endpoint: answer a clarification and resume the workflow. Requires admin key."""
+    body = await request.json()
+    answer_text = body.get("answer_text", "").strip()
+    if not answer_text:
+        raise HTTPException(status_code=400, detail="answer_text is required")
+
+    from app.database import get_clarification_by_id, mark_clarification_answered
+    from app.clarification import resume_workflow_after_clarification
+
+    clar = get_clarification_by_id(clarification_id)
+    if not clar:
+        raise HTTPException(status_code=404, detail=f"Clarification {clarification_id} not found")
+    if clar["status"] != "PENDING":
+        raise HTTPException(status_code=409, detail=f"Clarification {clarification_id} is {clar['status']}, not PENDING")
+
+    ok = mark_clarification_answered(clarification_id, answer_text)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to mark clarification answered")
+
+    resume_workflow_after_clarification(clar["run_id"])
+    send_message(
+        "admin_clarification_answered", "ANSWERED",
+        f"Admin answered clarification {clarification_id} for run {clar['run_id']}: {answer_text[:100]}",
+    )
+    return {
+        "clarification_id": clarification_id,
+        "run_id": clar["run_id"],
+        "status": "ANSWERED",
+        "answer_text": answer_text,
+        "summary": f"Clarification answered; run {clar['run_id']} re-enqueued.",
+    }
+
+
+@app.post("/debug/clarifications/{clarification_id}/cancel", status_code=200)
+def admin_cancel_clarification(clarification_id: int):
+    """Admin endpoint: cancel a clarification and fail the workflow. Requires admin key."""
+    from app.database import get_clarification_by_id, mark_clarification_cancelled, fail_run
+
+    clar = get_clarification_by_id(clarification_id)
+    if not clar:
+        raise HTTPException(status_code=404, detail=f"Clarification {clarification_id} not found")
+    if clar["status"] != "PENDING":
+        raise HTTPException(status_code=409, detail=f"Clarification {clarification_id} is {clar['status']}, not PENDING")
+
+    ok = mark_clarification_cancelled(clarification_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to cancel clarification")
+
+    fail_run(clar["run_id"], f"Clarification {clarification_id} cancelled by admin")
+    send_message(
+        "admin_clarification_cancelled", "CANCELLED",
+        f"Admin cancelled clarification {clarification_id} — run {clar['run_id']} marked FAILED.",
+    )
+    return {
+        "clarification_id": clarification_id,
+        "run_id": clar["run_id"],
+        "status": "CANCELLED",
+        "summary": f"Clarification cancelled; run {clar['run_id']} marked FAILED.",
+    }
+
+
+@app.post("/debug/clarifications/{clarification_id}/resend", status_code=200)
+def admin_resend_clarification(clarification_id: int):
+    """Admin endpoint: resend the Telegram clarification question. Requires admin key."""
+    from app.database import get_clarification_by_id, update_clarification_telegram_id
+    from app.telegram import send_clarification_request
+
+    clar = get_clarification_by_id(clarification_id)
+    if not clar:
+        raise HTTPException(status_code=404, detail=f"Clarification {clarification_id} not found")
+
+    msg_id = send_clarification_request(clar)
+    if msg_id:
+        update_clarification_telegram_id(clarification_id, msg_id)
+    return {
+        "clarification_id": clarification_id,
+        "telegram_message_id": msg_id,
+        "summary": "Clarification question resent to Telegram.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Admin — Security events inspection
 # ---------------------------------------------------------------------------
 
