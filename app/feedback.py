@@ -33,6 +33,14 @@ class FeedbackType:
     REVIEW_APPROVED             = "review_approved"
     REVIEW_NEEDS_CHANGES        = "review_needs_changes"
     REVIEW_BLOCKED              = "review_blocked"
+    # Test quality signals (Phase 9)
+    TEST_QUALITY_STATUS         = "test_quality_status"
+    TEST_QUALITY_CONFIDENCE     = "test_quality_confidence"
+    TEST_QUALITY_APPROVED       = "test_quality_approved"
+    TESTS_WEAK                  = "tests_weak"
+    TESTS_BLOCKING              = "tests_blocking"
+    MISSING_TEST_COUNT          = "missing_test_count"
+    SUSPICIOUS_TEST_COUNT       = "suspicious_test_count"
 
 
 class FailureCategory:
@@ -61,10 +69,11 @@ class MemoryKind:
     MANUAL_NOTE         = "manual_note"
 
 
-# Phase 8 — Reviewer Agent constants
+# Phase 8 — Reviewer Agent constants / Phase 9 — Test Quality Agent constants
 
 class AgentName:
-    REVIEWER_AGENT = "reviewer_agent"
+    REVIEWER_AGENT      = "reviewer_agent"
+    TEST_QUALITY_AGENT  = "test_quality_agent"
 
 
 class ReviewStatus:
@@ -80,9 +89,26 @@ class ReviewRiskLevel:
     HIGH   = "HIGH"
 
 
+class TestQualityStatus:
+    APPROVED  = "TEST_QUALITY_APPROVED"
+    WEAK      = "TESTS_WEAK"
+    BLOCKING  = "TESTS_BLOCKING"
+    ERROR     = "ERROR"
+
+
+class TestQualityConfidence:
+    LOW    = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH   = "HIGH"
+
+
 # Phase 8 config
 REVIEW_REQUIRED     = True   # every story_implementation run triggers a review
 REVIEW_BLOCKS_MERGE = True   # APPROVED_BY_AI required for auto-merge
+
+# Phase 9 config
+TEST_QUALITY_REQUIRED     = True  # every story_implementation run triggers test quality review
+TEST_QUALITY_BLOCKS_MERGE = True  # TEST_QUALITY_APPROVED required for auto-merge
 
 # Prompt injection limits
 MEMORY_MAX_BULLETS = 5

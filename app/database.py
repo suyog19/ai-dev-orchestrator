@@ -94,10 +94,15 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS assumptions_json    TEXT NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS open_questions_json TEXT NULL",
                 # Phase 8 — Reviewer Agent
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_status       VARCHAR(30)  NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_required     BOOLEAN      NOT NULL DEFAULT TRUE",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMP    NULL",
-                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_summary      TEXT         NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_status            VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_required          BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_completed_at      TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_summary           TEXT         NULL",
+                # Phase 9 — Test Quality Agent
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_status      VARCHAR(40)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_required    BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_completed_at TIMESTAMP   NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS test_quality_summary     TEXT         NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -224,6 +229,30 @@ def init_db(retries: int = 5, delay: int = 3):
                 )
             """)
 
+            # Phase 9 — Test Quality Agent reviews
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agent_test_quality_reviews (
+                    id                       SERIAL PRIMARY KEY,
+                    run_id                   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    pr_number                INTEGER       NULL,
+                    pr_url                   VARCHAR(500)  NULL,
+                    repo_slug                VARCHAR(200)  NULL,
+                    story_key                VARCHAR(100)  NULL,
+                    agent_name               VARCHAR(100)  NOT NULL DEFAULT 'test_quality_agent',
+                    quality_status           VARCHAR(40)   NOT NULL,
+                    confidence_level         VARCHAR(20)   NULL,
+                    summary                  TEXT          NULL,
+                    coverage_findings_json   TEXT          NULL,
+                    missing_tests_json       TEXT          NULL,
+                    suspicious_tests_json    TEXT          NULL,
+                    recommendations_json     TEXT          NULL,
+                    model_used               VARCHAR(100)  NULL,
+                    memory_snapshot_ids_json TEXT          NULL,
+                    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
     if seed_file.exists():
@@ -320,6 +349,9 @@ def update_run_field(run_id: int, **fields):
         "created_jira_children_count",
         # Phase 8
         "review_status", "review_required", "review_completed_at", "review_summary",
+        # Phase 9
+        "test_quality_status", "test_quality_required",
+        "test_quality_completed_at", "test_quality_summary",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -395,6 +427,72 @@ def store_agent_review(
         run_id, review_id, review_status,
     )
     return review_id
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Test Quality Agent helpers
+# ---------------------------------------------------------------------------
+
+def store_test_quality_review(
+    run_id: int,
+    verdict: dict,
+    pr_number: int | None = None,
+    pr_url: str | None = None,
+    repo_slug: str | None = None,
+    story_key: str | None = None,
+    model_used: str | None = "claude-sonnet-4-6",
+) -> int:
+    """Persist a Test Quality Agent verdict and update workflow_runs test_quality fields.
+
+    Inserts one row into agent_test_quality_reviews and sets test_quality_status
+    + test_quality_completed_at on the parent workflow_run. Returns the new row id.
+    """
+    from app.feedback import AgentName
+
+    quality_status = verdict.get("quality_status", "ERROR")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_test_quality_reviews
+                    (run_id, pr_number, pr_url, repo_slug, story_key,
+                     agent_name, quality_status, confidence_level, summary,
+                     coverage_findings_json, missing_tests_json,
+                     suspicious_tests_json, recommendations_json, model_used)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    run_id, pr_number, pr_url, repo_slug, story_key,
+                    AgentName.TEST_QUALITY_AGENT,
+                    quality_status,
+                    verdict.get("confidence_level"),
+                    verdict.get("summary"),
+                    json.dumps(verdict.get("coverage_findings") or []),
+                    json.dumps(verdict.get("missing_tests") or []),
+                    json.dumps(verdict.get("suspicious_tests") or []),
+                    json.dumps(verdict.get("recommendations") or []),
+                    model_used,
+                ),
+            )
+            tqr_id = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET test_quality_status = %s, test_quality_completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (quality_status, run_id),
+            )
+
+    logger.info(
+        "store_test_quality_review: run_id=%s tqr_id=%s status=%s",
+        run_id, tqr_id, quality_status,
+    )
+    return tqr_id
 
 
 # ---------------------------------------------------------------------------
