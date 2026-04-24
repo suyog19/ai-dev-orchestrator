@@ -10,6 +10,7 @@ from app.repo_profiler import (
     get_build_command_for_profile,
     get_lint_command_for_profile,
 )
+from app.test_runner import run_tests, run_build, run_lint
 
 logger = logging.getLogger("orchestrator")
 
@@ -46,29 +47,38 @@ def _clone_repo_readonly(run_id: int, repo_slug: str, base_branch: str) -> str:
 def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: str):
     """Execute the project onboarding workflow.
 
-    Iteration 2: clone repo + detect capability profile.
-    Iterations 3+ will add command validation, structure scanning, Claude summaries, etc.
+    Steps so far:
+      1. Clone repo (read-only)
+      2. Detect capability profile
+      3. Command validation dry-run (test / build / lint)
+
+    Workspace is cleaned up in the finally block regardless of outcome.
     Status transitions are managed by the worker (_execute_onboarding).
     """
     work_dir = f"/tmp/onboarding/{onboarding_run_id}"
 
     try:
-        logger.info("Project onboarding started: repo_slug=%s branch=%s (run_id=%s)", repo_slug, base_branch, onboarding_run_id)
+        logger.info(
+            "Project onboarding started: repo_slug=%s branch=%s (run_id=%s)",
+            repo_slug, base_branch, onboarding_run_id,
+        )
 
-        # --- Step 1: clone ---
+        # ------------------------------------------------------------------
+        # Step 1: clone
+        # ------------------------------------------------------------------
         update_onboarding_run(onboarding_run_id, current_step="cloning")
         repo_path = _clone_repo_readonly(onboarding_run_id, repo_slug, base_branch)
 
-        # --- Step 2: detect capability profile ---
+        # ------------------------------------------------------------------
+        # Step 2: detect capability profile
+        # ------------------------------------------------------------------
         update_onboarding_run(onboarding_run_id, current_step="profile_detection")
         profile = detect_repo_capability_profile(repo_path, repo_slug)
         profile_name = profile["profile_name"]
 
-        # Persist to repo_capability_profiles table (same as story_implementation)
         upsert_capability_profile(repo_slug, profile)
         logger.info("Profile detected and stored for %s: %s", repo_slug, profile_name)
 
-        # Capture commands for the onboarding run record
         test_cmd = get_test_command_for_profile(profile)
         build_cmd = get_build_command_for_profile(profile)
         lint_cmd = get_lint_command_for_profile(profile)
@@ -82,7 +92,58 @@ def run_project_onboarding(onboarding_run_id: int, repo_slug: str, base_branch: 
             lint_command=lint_cmd,
         )
 
-        logger.info("Project onboarding phase 2 complete: run_id=%s profile=%s", onboarding_run_id, profile_name)
+        # ------------------------------------------------------------------
+        # Step 3: command validation dry-run
+        # ------------------------------------------------------------------
+        update_onboarding_run(onboarding_run_id, current_step="command_validation")
+
+        # Test: always attempt if the profile says it supports tests
+        test_result = "NOT_RUN"
+        if test_cmd:
+            logger.info("Onboarding command validation: running tests for %s", repo_slug)
+            tr = run_tests(
+                repo_path=repo_path,
+                timeout=300,
+                profile_command=test_cmd,
+                profile_name=profile_name,
+            )
+            test_result = tr["status"]
+            logger.info("Onboarding test result: %s", test_result)
+        else:
+            logger.info("Onboarding command validation: no test command — skipping")
+
+        # Build: attempt if profile supports it
+        build_result = "NOT_RUN"
+        if build_cmd:
+            logger.info("Onboarding command validation: running build for %s", repo_slug)
+            br = run_build(repo_path=repo_path, build_command=build_cmd, profile_name=profile_name, timeout=300)
+            build_result = br["status"]
+            logger.info("Onboarding build result: %s", build_result)
+        else:
+            logger.info("Onboarding command validation: no build command — skipping")
+
+        # Lint: attempt if configured
+        lint_result = "NOT_RUN"
+        if lint_cmd:
+            logger.info("Onboarding command validation: running lint for %s", repo_slug)
+            lr = run_lint(repo_path=repo_path, lint_command=lint_cmd, profile_name=profile_name, timeout=120)
+            lint_result = lr["status"]
+            logger.info("Onboarding lint result: %s", lint_result)
+        else:
+            logger.info("Onboarding command validation: no lint command — skipping")
+
+        update_onboarding_run(
+            onboarding_run_id,
+            current_step="commands_validated",
+            test_result=test_result,
+            build_result=build_result,
+            lint_result=lint_result,
+        )
+
+        logger.info(
+            "Project onboarding command validation done: run_id=%s test=%s build=%s lint=%s",
+            onboarding_run_id, test_result, build_result, lint_result,
+        )
 
     finally:
         if os.path.isdir(work_dir):
