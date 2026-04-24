@@ -510,11 +510,14 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
 
     # --- Auto-merge policy ---
     pr_title = f"ai: {issue_key} — {suggestion_description}"
+    review_status = verdict.get("review_status", ReviewStatus.ERROR)
+
     auto_merge_ok = (
         mapping.get("auto_merge_enabled")
         and final_test_result["status"] == "PASSED"
         and applied.get("applied", False)
         and applied.get("count", 0) <= MAX_FILES_FOR_AUTOMERGE
+        and review_status == ReviewStatus.APPROVED_BY_AI
     )
 
     update_run_step(run_id, "merge_check")
@@ -528,6 +531,15 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             update_run_field(run_id, merge_status="FAILED")
             send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
             logger.error("story_implementation: auto-merge failed — %s", exc)
+    elif review_status == ReviewStatus.BLOCKED:
+        blocking = "; ".join(verdict.get("blocking_reasons") or ["review blocked merge"])
+        update_run_field(run_id, merge_status="BLOCKED_BY_REVIEW")
+        send_message(
+            "merge_blocked_by_review", "BLOCKED",
+            f"{issue_key}: PR #{pr['number']} merge blocked by Reviewer Agent\n"
+            f"Reasons: {blocking}",
+        )
+        logger.info("story_implementation: merge blocked by review — %s", blocking)
     else:
         reasons = []
         if not mapping.get("auto_merge_enabled"):
@@ -538,6 +550,10 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             reasons.append("fallback apply used")
         if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
             reasons.append(f"{applied.get('count')} files > {MAX_FILES_FOR_AUTOMERGE} limit")
+        if review_status == ReviewStatus.NEEDS_CHANGES:
+            reasons.append("review needs changes")
+        elif review_status not in (ReviewStatus.APPROVED_BY_AI,):
+            reasons.append(f"review status: {review_status}")
         reason_str = "; ".join(reasons) if reasons else "conditions not met"
         update_run_field(run_id, merge_status="SKIPPED")
         send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: auto-merge skipped ({reason_str})")
