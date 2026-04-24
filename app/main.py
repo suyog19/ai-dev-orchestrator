@@ -914,6 +914,57 @@ def audit_branch_protection(repo_slug: str, branch: str = "main"):
         raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
 
 
+class ValidateRequiredChecksRequest(BaseModel):
+    repo_slug: str
+    branch: str = "main"
+
+
+@app.post("/admin/github/branch-protection/validate-required-checks")
+def validate_required_checks(body: ValidateRequiredChecksRequest):
+    """Dry-run assessment of whether required orchestrator status checks are configured.
+
+    Read-only — does not mutate GitHub branch protection settings.
+    Returns: valid (bool), missing_required_contexts, recommendations.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.github_api import get_branch_protection
+    from app.feedback import GITHUB_REQUIRED_CHECK
+
+    try:
+        audit = get_branch_protection(body.repo_slug, body.branch)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
+
+    orch_status = audit.get("orchestrator_check_status", {})
+    missing = orch_status.get("missing_required", [])
+    valid = len(missing) == 0
+
+    recommendations = []
+    if not audit.get("protected"):
+        recommendations.append(
+            f"Branch '{body.branch}' has no protection rules. Enable branch protection "
+            "and require the orchestrator/release-gate status check."
+        )
+    elif not valid:
+        recommendations.append(
+            f"Add '{GITHUB_REQUIRED_CHECK}' as a required status check in GitHub → "
+            f"Settings → Branches → {body.branch} → Required status checks."
+        )
+    if audit.get("allow_force_pushes"):
+        recommendations.append("Disable force pushes to prevent bypassing required checks.")
+
+    return {
+        "repo_slug":                body.repo_slug,
+        "branch":                   body.branch,
+        "valid":                    valid,
+        "protected":                audit.get("protected", False),
+        "missing_required_contexts": missing,
+        "optional_configured":      orch_status.get("optional_configured", []),
+        "current_required_checks":  audit.get("required_status_checks", []),
+        "recommendations":          recommendations,
+    }
+
+
 @app.post("/admin/resume", status_code=200)
 def resume_orchestrator(request: Request):
     """Resume automation — re-enables Jira workflows and Telegram commands."""
