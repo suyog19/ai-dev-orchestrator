@@ -93,6 +93,11 @@ def init_db(retries: int = 5, delay: int = 3):
                 # Phase 6 Iteration 8 — store planning metadata for API inspection
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS assumptions_json    TEXT NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS open_questions_json TEXT NULL",
+                # Phase 8 — Reviewer Agent
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_status       VARCHAR(30)  NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_required     BOOLEAN      NOT NULL DEFAULT TRUE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMP    NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS review_summary      TEXT         NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -196,6 +201,29 @@ def init_db(retries: int = 5, delay: int = 3):
                 "source VARCHAR(20) NOT NULL DEFAULT 'derived'"
             )
 
+            # Phase 8 — Reviewer Agent reviews
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agent_reviews (
+                    id                       SERIAL PRIMARY KEY,
+                    run_id                   INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    pr_number                INTEGER       NULL,
+                    pr_url                   VARCHAR(500)  NULL,
+                    repo_slug                VARCHAR(200)  NULL,
+                    story_key                VARCHAR(100)  NULL,
+                    agent_name               VARCHAR(100)  NOT NULL DEFAULT 'reviewer_agent',
+                    review_status            VARCHAR(30)   NOT NULL,
+                    risk_level               VARCHAR(20)   NULL,
+                    summary                  TEXT          NULL,
+                    findings_json            TEXT          NULL,
+                    recommendations_json     TEXT          NULL,
+                    blocking_reasons_json    TEXT          NULL,
+                    model_used               VARCHAR(100)  NULL,
+                    memory_snapshot_ids_json TEXT          NULL,
+                    created_at               TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    updated_at               TIMESTAMP     NOT NULL DEFAULT NOW()
+                )
+            """)
+
     # Seed mappings from config/seed_mappings.json
     seed_file = Path(__file__).parent.parent / "config" / "seed_mappings.json"
     if seed_file.exists():
@@ -290,6 +318,8 @@ def update_run_field(run_id: int, **fields):
         "parent_issue_key", "approval_status",
         "approval_requested_at", "approval_received_at",
         "created_jira_children_count",
+        # Phase 8
+        "review_status", "review_required", "review_completed_at", "review_summary",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

@@ -4,14 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the App
 
+**Local (uvicorn):**
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+**Docker (preferred for full stack):**
+```bash
+docker compose up -d --build          # start all services
+docker compose logs -f app            # tail app logs
+docker compose logs -f worker         # tail worker logs
+docker compose down                   # stop everything
+```
+
 Verify with: `curl http://localhost:8000/healthz` → `{"status": "ok"}`
 
 No test suite or linting config exists for this repo itself (the orchestrator). Tests run against the *target* sandbox repo (`suyog19/sandbox-fastapi-app`) as part of `story_implementation`.
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in secrets. All values are required unless noted.
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL DSN — default: `postgresql://orchestrator:orchestrator@db:5432/orchestrator` |
+| `REDIS_URL` | Redis DSN — default: `redis://redis:6379/0` |
+| `ANTHROPIC_API_KEY` | Claude API key (`claude-sonnet-4-6` is the model used) |
+| `GITHUB_TOKEN` | PAT with repo write, PR create/merge, label permissions |
+| `JIRA_HOST` | Jira instance URL (e.g. `https://yourorg.atlassian.net`) |
+| `JIRA_USERNAME` | Jira API user (email) |
+| `JIRA_API_TOKEN` | Jira API token |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | Chat ID for notifications |
+| `MAX_WORKERS` | Worker thread concurrency (default: `2`) |
+| `ENV_NAME` | `DEV` or `PROD` — prepended to all Telegram messages |
+| `PUBLIC_BASE_URL` | Public URL of this service (used when registering Telegram webhook) |
+| `JIRA_CUSTOM_FIELD_EPIC_LINK` | Jira epic link custom field ID (default: `customfield_10014`) |
 
 ## Architecture
 
@@ -19,11 +48,14 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 
 **Key files:**
 - `app/main.py` — FastAPI app, all HTTP endpoints
-- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2)
+- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan)
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts
 - `app/database.py` — all DB access; schema migrations in `init_db()`
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
+- `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
+- `app/file_modifier.py` — applies code patches returned by Claude (original → replacement matching)
+- `app/repo_analysis.py` — introspects cloned repos (language detection, entry points, file counts) before Claude calls
 - `app/webhooks.py` — Jira and Telegram webhook receivers
 - `app/jira_client.py` — Jira REST API v3 calls
 - `app/github_api.py` — GitHub API calls (PR creation, labels, merge)
@@ -52,12 +84,12 @@ Telegram Webhook → POST /webhooks/telegram → APPROVE/REJECT/REGENERATE handl
 **Workflow triggers:**
 | Jira status | Issue type | Workflow |
 |---|---|---|
-| `Ready for Dev` | Story | `story_implementation` |
-| `Ready for Breakdown` | Epic | `epic_breakdown` |
+| `Ready for Dev` (case-insensitive) | Story | `story_implementation` |
+| `Ready for Breakdown` (case-insensitive) | Epic | `epic_breakdown` |
 
 ## Data Model
 
-All tables are created (and migrated) by `init_db()` in `app/database.py`.
+All tables are created (and migrated) by `init_db()` in `app/database.py`. First startup also seeds `repo_mappings` from `config/seed_mappings.json`.
 
 | Table | Purpose |
 |---|---|
@@ -109,53 +141,67 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/debug/feedback-events` | List raw feedback events (filter: source_type, repo_slug, feedback_type, source_run_id) |
 | POST | `/debug/memory/recompute` | Force-refresh a derived snapshot (scope_type=repo\|epic) |
 
+## Workflow Configuration
+
+### story_implementation
+
+| Setting | Value |
+|---|---|
+| Test command | `pytest -q` (after `pip install -r requirements.txt`) |
+| Max fix attempts | 1 (max 2 total coding passes per run) |
+| Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
+| Auto-merge conditions | tests PASSED + PR created + `auto_merge_enabled=true` + ≤3 files changed |
+| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
+| Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
+
+File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-test files + up to 2 Python import dependencies + best test file (max 6 files total).
+
+### epic_breakdown
+
+| Setting | Value |
+|---|---|
+| Max Stories per Epic | 8 |
+| Output issue type | `Story` |
+| Approval commands | `APPROVE <run_id>` / `REJECT <run_id>` / `REGENERATE <run_id>` |
+| Idempotency guard | Blocks if the Epic already has Jira children |
+
+### Memory injection
+
+| Setting | Value |
+|---|---|
+| Max bullets injected | 5 |
+| Max chars injected | 1000 |
+| Scopes | `repo` (execution guidance), `epic` (planning guidance) |
+| Refresh | Triggered on every feedback write (`on_write`) |
+
+### Failure categories (defined in `app/feedback.py`)
+
+| Category | When applied |
+|---|---|
+| `test_failure` | Tests ran and failed |
+| `syntax_failure` | Python syntax/parse error in generated code |
+| `apply_validation_failure` | File apply guard rejected the change |
+| `jira_creation_failure` | Jira API error during child creation |
+| `merge_failure` | PR creation or auto-merge failed |
+| `duplicate_blocked` | Breakdown blocked by idempotency guard |
+| `approval_rejected` | User rejected a planning proposal |
+| `approval_regenerated` | User requested regeneration |
+| `worker_interrupted` | Run was RUNNING when worker restarted |
+| `unknown` | Error does not match any known pattern |
+
 ## Telegram Message Format
 
 ```
+[DEV|PROD]
 [Orchestrator]
 Event: <type>
 Status: <status>
 Details: <short summary>
 ```
 
-## Phase Completion Status
+Approval commands for epic_breakdown are sent as plain text to the bot: `APPROVE <run_id>`, `REJECT <run_id>`, `REGENERATE <run_id>`.
 
-| Phase | Description | Status |
-|---|---|---|
-| 1 | Project skeleton, health check, Docker, VM, CI/CD | ✅ Complete |
-| 2 | PostgreSQL, Redis, worker, Telegram, Jira webhook, dispatcher | ✅ Complete |
-| 3 | Dev/prod VM split, branch-based deploy, env model | ✅ Complete |
-| 4 | Real Claude code generation, GitHub PR creation, apply/validate | ✅ Complete |
-| 5 | Tests, fix loop, auto-merge, repo analysis, file selection | ✅ Complete |
-| 6 | Epic breakdown, Claude planning, Telegram approval gate, Jira Story creation | ✅ Complete |
-| 7 | Feedback capture, failure categorisation, memory snapshots, prompt enrichment, manual notes | ✅ Complete |
-
-## Working Style
-
-Implement one iteration at a time. After each: confirm it runs, provide test steps, wait for user confirmation before moving to the next step.
-
-When a decision affects architecture, multiple valid approaches exist, credentials are needed, or external services require setup — ask before proceeding, using this format:
-
-```
-QUESTION: <clear question>
-OPTIONS:
-1. Option A
-2. Option B
-RECOMMENDATION: <recommendation + why>
-```
-
-## Deferred / Out of Scope
-
-- Feature-level Jira hierarchy (locked: Epic → Story only, no Feature or Task levels)
-- Global-scope memory (deferred — no cross-repo patterns exist yet)
-- Run-scope memory injection (single-run signals not worth feeding back into the same run)
-- Memory pruning / decay (snapshots are recomputed from raw events — no TTL needed)
-- Semantic/vector search for memory retrieval (rule-based aggregation is sufficient)
-- UI or dashboard
-- Production security hardening
-- Multi-agent planning
-
-## Environment Model (Phase 3+)
+## Environment Model
 
 Two separate VMs. Never share a VM between dev and prod.
 
@@ -189,132 +235,28 @@ docker compose up -d --force-recreate
 docker exec <container-name> env | grep <VAR_NAME>
 ```
 
-## Phase 5 Configuration
+## Working Style
 
-### Environment naming (Phase 5+)
+Implement one iteration at a time. After each: confirm it runs, provide test steps, wait for user confirmation before moving to the next step.
 
-Each VM's `/home/ubuntu/.env.orchestrator` must include `ENV_NAME`:
+When a decision affects architecture, multiple valid approaches exist, credentials are needed, or external services require setup — ask before proceeding, using this format:
 
-- Dev VM: `ENV_NAME=DEV`
-- Prod VM: `ENV_NAME=PROD`
+```
+QUESTION: <clear question>
+OPTIONS:
+1. Option A
+2. Option B
+RECOMMENDATION: <recommendation + why>
+```
 
-This value is prepended to every Telegram message as `[DEV]` or `[PROD]`.
+## Deferred / Out of Scope
 
-### Sandbox repo policy (Phase 5+)
-
-**Policy: Option A — Controlled merge-forward.**
-
-The sandbox repo (`suyog19/sandbox-fastapi-app`) is long-lived. Approved PRs are merged
-between sessions so the codebase gradually improves. Auto-merge is enabled for this repo
-(`auto_merge_enabled: true` in `config/seed_mappings.json`).
-
-Auto-merge conditions:
-- tests passed (`test_status = PASSED`)
-- PR created successfully
-- `auto_merge_enabled = true` on the repo mapping
-- `files_changed_count` within configured threshold
-- no skipped or failed tests
-
-### Trigger definitions (Phase 5+)
-
-| Field | Value |
-|---|---|
-| Jira trigger status | `Ready for Dev` (case-insensitive) |
-| Supported issue type | `Story` |
-| Test-enabled repo | `suyog19/sandbox-fastapi-app` |
-| Test command | `pytest -q` |
-| Dependency install | `pip install -r requirements.txt` (run in workspace before pytest) |
-| Auto-merge enabled | `suyog19/sandbox-fastapi-app` only |
-| Max fix attempts | 1 (max 2 total coding passes per workflow) |
-| Max changed files | 3 |
-
-## Phase 6 Configuration
-
-### Jira hierarchy (Phase 6+)
-
-**Locked decision: Epic → Story (2 levels, no Feature, no Task)**
-
-This uses the default Jira hierarchy. Tasks are not used — Stories are the atomic unit of implementation. Features and Tasks are skipped entirely.
-
-### Planning workflow trigger (Phase 6+)
-
-| Field | Value |
-|---|---|
-| Jira trigger status | `Ready for Breakdown` (case-insensitive) |
-| Supported issue type | `Epic` |
-| Workflow type | `epic_breakdown` |
-| Max Stories per Epic | 8 |
-| Output issue type | `Story` |
-
-### Approval gate (Phase 6+)
-
-The orchestrator proposes a Story breakdown and sends it to Telegram awaiting approval before creating Jira children. Approval commands are sent via Telegram message to the bot:
-
-| Command | Effect |
-|---|---|
-| `APPROVE <run_id>` | Accept proposed Stories and create them in Jira |
-| `REJECT <run_id>` | Discard the proposal; run marked FAILED |
-| `REGENERATE <run_id>` | Discard the proposal; re-run planning with a new Claude call |
-
-The run's `approval_status` field tracks the gate: `PENDING` → `APPROVED` / `REJECTED` / `REGENERATE_REQUESTED`.
-
-### Planning Telegram event types (Phase 6+)
-
-| Event type | When sent |
-|---|---|
-| `epic_breakdown_started` | Planning workflow begins |
-| `epic_breakdown_proposed` | Stories proposed, awaiting approval |
-| `epic_breakdown_approved` | User approved; Jira creation begins |
-| `epic_breakdown_rejected` | User rejected the proposal |
-| `epic_breakdown_regenerate` | User requested regeneration |
-| `epic_breakdown_complete` | All Jira Stories created successfully |
-| `epic_breakdown_failed` | Unrecoverable error |
-
-## Phase 7 Configuration
-
-### Jira hierarchy — LOCKED CONSTRAINT (Phase 7+)
-
-**Epic → Story is the only planning hierarchy in this project. This must not change unless explicitly instructed.**
-
-- Feature level does NOT exist and must not be added
-- Task level is not used
+- Feature-level Jira hierarchy (locked: Epic → Story only, no Feature or Task levels)
 - No code path should reference or route to a `feature_breakdown` workflow
-- No planning prompt should treat Feature as an intermediate decomposition level
-- Stories are the atomic unit of implementation
-
-### Memory and feedback (Phase 7+)
-
-| Setting | Value |
-|---|---|
-| Memory enabled | `true` |
-| Max memory bullets injected into prompts | `5` |
-| Max memory chars injected into prompts | `1000` |
-| Memory scopes | `run`, `epic`, `repo` |
-| Memory refresh mode | `on_write` |
-
-### Failure categories (Phase 7+)
-
-All failure categories are defined in `app/feedback.py` (`FailureCategory` class).
-
-| Category | When applied |
-|---|---|
-| `test_failure` | Tests ran and failed |
-| `syntax_failure` | Python syntax/parse error in generated code |
-| `apply_validation_failure` | File apply guard rejected the change |
-| `jira_creation_failure` | Jira API returned an error during child creation |
-| `merge_failure` | PR creation or auto-merge failed |
-| `duplicate_blocked` | Breakdown run blocked by idempotency guard |
-| `approval_rejected` | User rejected a planning proposal |
-| `approval_regenerated` | User requested regeneration of a proposal |
-| `worker_interrupted` | Run was RUNNING when worker restarted |
-| `unknown` | Error does not match any known pattern |
-
-### Phase 7 Telegram event types
-
-| Event type | When sent |
-|---|---|
-| `planning_feedback_recorded` | Feedback events written for a planning run |
-| `execution_feedback_recorded` | Feedback events written for an execution run |
-| `memory_snapshot_updated` | A memory snapshot was created or refreshed |
-| `epic_outcome_ready` | Epic-level outcome rollup generated |
-| `manual_memory_added` | A human-authored memory note was added |
+- Global-scope memory (deferred — no cross-repo patterns exist yet)
+- Run-scope memory injection (single-run signals not worth feeding back into the same run)
+- Memory pruning / decay (snapshots are recomputed from raw events — no TTL needed)
+- Semantic/vector search for memory retrieval (rule-based aggregation is sufficient)
+- UI or dashboard
+- Production security hardening
+- Multi-agent planning
