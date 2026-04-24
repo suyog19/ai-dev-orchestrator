@@ -8,9 +8,13 @@ Detection is explicit and conservative: if evidence is ambiguous or missing,
 we fall back to generic_unknown and disable auto-merge.
 """
 
+import copy
 import json
 import logging
 import os
+from pathlib import Path
+
+import yaml
 
 from app.feedback import CapabilityProfile
 
@@ -144,6 +148,68 @@ _PROFILE_DEFAULTS: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------
+# Command hints loader
+# ---------------------------------------------------------------------------
+
+_HINTS_PATH = Path(__file__).parent.parent / "config" / "repo_command_hints.yaml"
+_hints_cache: dict | None = None
+
+
+def _load_hints() -> dict:
+    """Load repo command hints from config/repo_command_hints.yaml.
+
+    Cached after first load. Returns empty dict if file is missing or invalid.
+    """
+    global _hints_cache
+    if _hints_cache is not None:
+        return _hints_cache
+    try:
+        with open(_HINTS_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        _hints_cache = data.get("repos", {}) or {}
+    except FileNotFoundError:
+        _hints_cache = {}
+    except Exception as exc:
+        logger.warning("Failed to load repo_command_hints.yaml: %s", exc)
+        _hints_cache = {}
+    return _hints_cache
+
+
+def _apply_hints(profile: dict, repo_slug: str) -> dict:
+    """Apply command hints for repo_slug to profile if an entry exists.
+
+    Returns the (possibly modified) profile. Sets profile_source to
+    'configured_hint' if hints were applied, 'auto_detected' otherwise.
+    """
+    hints = _load_hints()
+    hint = hints.get(repo_slug)
+    if not hint:
+        profile["profile_source"] = "auto_detected"
+        return profile
+
+    overrideable = {
+        "profile_name", "test_command", "build_command", "lint_command",
+        "source_patterns", "test_patterns", "primary_language", "framework",
+    }
+    for key in overrideable:
+        if key in hint:
+            profile[key] = hint[key]
+
+    # Update capabilities based on what's now present
+    if hint.get("test_command"):
+        profile.setdefault("capabilities", {})["supports_tests"] = True
+    if hint.get("build_command"):
+        profile.setdefault("capabilities", {})["supports_build"] = True
+    if hint.get("lint_command"):
+        profile.setdefault("capabilities", {})["supports_lint"] = True
+
+    profile["profile_source"] = "configured_hint"
+    profile["auto_detected"] = False
+    logger.info("Command hints applied for %s: profile=%s", repo_slug, profile.get("profile_name"))
+    return profile
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -267,7 +333,6 @@ def detect_repo_capability_profile(workspace_path: str, repo_slug: str) -> dict:
     else:
         profile_name = CapabilityProfile.GENERIC_UNKNOWN
 
-    import copy
     profile = copy.deepcopy(_PROFILE_DEFAULTS[profile_name])
     profile["profile_name"] = profile_name
     profile["auto_detected"] = True
@@ -291,9 +356,12 @@ def detect_repo_capability_profile(workspace_path: str, repo_slug: str) -> dict:
             profile["test_command"] = "gradle test"
             profile["build_command"] = "gradle build"
 
+    # Apply repo-specific command hints (overrides auto-detection if entry exists)
+    profile = _apply_hints(profile, repo_slug)
+
     logger.info(
-        "Profile detection for %s: %s (language=%s, test_cmd=%s)",
-        repo_slug, profile_name,
+        "Profile detection for %s: %s (source=%s, language=%s, test_cmd=%s)",
+        repo_slug, profile.get("profile_name"), profile.get("profile_source"),
         profile.get("primary_language"),
         profile.get("test_command"),
     )

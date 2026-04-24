@@ -3453,6 +3453,7 @@ def get_active_capability_profile(repo_slug: str) -> dict | None:
                 "auto_detected": row[12], "is_active": row[13],
                 "created_at": row[14].isoformat() if row[14] else None,
                 "updated_at": row[15].isoformat() if row[15] else None,
+                "profile_source": "auto_detected" if row[12] else "configured_hint",
             }
 
 

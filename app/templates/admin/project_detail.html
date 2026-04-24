@@ -160,6 +160,13 @@
     <tr><th>Test Command</th><td><code>{{ capability_profile.test_command or "—" }}</code></td></tr>
     <tr><th>Build Command</th><td><code>{{ capability_profile.build_command or "—" }}</code></td></tr>
     <tr><th>Lint Command</th><td><code>{{ capability_profile.lint_command or "—" }}</code></td></tr>
+    <tr><th>Profile Source</th><td>
+      {% if capability_profile.profile_source == "configured_hint" %}
+        <span class="badge badge-running">configured hint</span>
+      {% else %}
+        auto-detected
+      {% endif %}
+    </td></tr>
   </table>
 </section>
 {% endif %}
