@@ -3407,7 +3407,7 @@ def get_deployment_profile(repo_slug: str, environment: str = "dev") -> dict | N
                 SELECT id, repo_slug, environment, deployment_type, base_url,
                        healthcheck_path, smoke_tests_json, enabled, created_at, updated_at
                 FROM deployment_profiles
-                WHERE repo_slug=%s AND environment=%s AND enabled=TRUE
+                WHERE repo_slug=%s AND environment=%s
                 ORDER BY id DESC LIMIT 1
                 """,
                 (repo_slug, environment),
