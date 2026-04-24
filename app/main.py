@@ -3,10 +3,13 @@ import json
 import logging
 import sys
 from fastapi import FastAPI
+from fastapi.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 from fastapi import HTTPException
 from pydantic import BaseModel
+
+from app.security import admin_key_middleware
 
 from app.database import (
     init_db, get_conn,
@@ -41,6 +44,7 @@ logger = logging.getLogger("orchestrator")
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
+app.add_middleware(BaseHTTPMiddleware, dispatch=admin_key_middleware)
 app.include_router(webhooks_router)
 
 
