@@ -46,6 +46,60 @@ def _actor(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# ---------------------------------------------------------------------------
+# GitHub write guard
+# ---------------------------------------------------------------------------
+
+_GITHUB_WRITE_ACTIONS = {"push", "create_pr", "post_comment", "add_label", "merge_pr"}
+
+
+def ensure_github_writes_allowed(action: str, repo_slug: str = "", run_id: int | None = None) -> None:
+    """Raise RuntimeError if GitHub writes are globally disabled or the orchestrator is paused.
+
+    Call this before any GitHub write action (push, PR creation, merge, etc.).
+    Raises RuntimeError so the workflow's existing try/except catches it cleanly.
+    """
+    import os as _os
+    # Check pause state first (cheapest — env var, no DB call)
+    paused = _os.environ.get("ORCHESTRATOR_PAUSED", "false").lower() == "true"
+    if not paused:
+        try:
+            from app.database import is_paused
+            paused = is_paused()
+        except Exception:
+            pass
+    if paused:
+        _log_github_block(action, repo_slug, run_id, "orchestrator_paused")
+        raise RuntimeError(f"GitHub write blocked — orchestrator is paused (action={action})")
+
+    # Check ALLOW_GITHUB_WRITES flag
+    if _os.environ.get("ALLOW_GITHUB_WRITES", "true").lower() != "true":
+        _log_github_block(action, repo_slug, run_id, "allow_github_writes=false")
+        raise RuntimeError(f"GitHub writes disabled (action={action})")
+
+    # For auto-merge, also check ALLOW_AUTO_MERGE
+    if action == "merge_pr" and _os.environ.get("ALLOW_AUTO_MERGE", "true").lower() != "true":
+        _log_github_block(action, repo_slug, run_id, "allow_auto_merge=false")
+        raise RuntimeError("Auto-merge disabled by ALLOW_AUTO_MERGE=false")
+
+
+def _log_github_block(action: str, repo_slug: str, run_id: int | None, reason: str) -> None:
+    logger.warning("GitHub write blocked: action=%s repo=%s run_id=%s reason=%s", action, repo_slug, run_id, reason)
+    try:
+        from app.database import record_security_event
+        record_security_event(
+            event_type="github_write_blocked",
+            source="workflow",
+            actor=repo_slug or "unknown",
+            endpoint=f"github/{action}",
+            method="WRITE",
+            status="BLOCKED",
+            details={"action": action, "repo_slug": repo_slug, "run_id": run_id, "reason": reason},
+        )
+    except Exception:
+        pass
+
+
 async def admin_key_middleware(request: Request, call_next):
     """Middleware: enforce admin key on /debug/* and /admin/* paths."""
     path = request.url.path

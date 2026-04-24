@@ -23,6 +23,7 @@ from app.database import (
 )
 from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision
 from app.test_runner import run_tests
+from app.security import ensure_github_writes_allowed
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -633,6 +634,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     commit_message = f"ai: {issue_key} — {suggestion_description}"
 
     update_run_step(run_id, "pushing")
+    ensure_github_writes_allowed("push", mapping["repo_slug"], run_id)
     branch = commit_and_push(
         repo_path=repo_path,
         issue_key=issue_key,
@@ -726,6 +728,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     )
 
     update_run_step(run_id, "creating_pr")
+    ensure_github_writes_allowed("create_pr", mapping["repo_slug"], run_id)
     ensure_label(mapping["repo_slug"], AI_LABEL, color=AI_LABEL_COLOR, description="Opened by AI Dev Orchestrator")
     pr = create_pull_request(
         repo_name=mapping["repo_slug"],
@@ -1015,6 +1018,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     update_run_step(run_id, "merge_check")
     if release["can_auto_merge"]:
         try:
+            ensure_github_writes_allowed("merge_pr", mapping["repo_slug"], run_id)
             merge_pull_request(mapping["repo_slug"], pr["number"], pr_title)
             update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
             send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr['number']} auto-merged (squash)")
