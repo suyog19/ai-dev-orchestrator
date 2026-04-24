@@ -59,9 +59,9 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 
 **Key files:**
 - `app/main.py` — FastAPI app, all HTTP endpoints
-- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
+- `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup; Phase 17 adds `_execute_onboarding()` path for `project_onboarding` jobs that manages `project_onboarding_runs` status independently
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: there is a stale one-argument `_is_test_file()` near the top of the file that is dead code (overridden by the profile-aware version further down); `_TEST_FILE_PATTERNS` defined alongside it is also unused
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output; Phase 17 adds `generate_onboarding_architecture_summary()` and `generate_onboarding_coding_conventions()` with forced tool_use for structured onboarding snapshots
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
@@ -84,6 +84,8 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/github_status_mapper.py` — pure functions mapping internal verdicts → GitHub commit status payloads (state, description, context); one function per gate
 - `app/github_status_publisher.py` — `publish_github_statuses_for_run(run_id, repo_slug, pr_number)`: publishes all 5 pre-merge statuses after Release Gate, non-fatal; `publish_deployment_validation_status()` publishes the 6th (`orchestrator/deployment-validation`) after post-merge validation
 - `app/deployment_validator.py` — `run_http_smoke_test()` (HTTP check with expected_status + expected_contains); `run_deployment_validation()` (loads profile, runs smoke tests with retries, stores result); status values: `NOT_CONFIGURED | SKIPPED | PASSED | FAILED | ERROR`
+- `app/onboarding.py` — `run_project_onboarding(run_id, repo_slug, base_branch)`: 7-step onboarding workflow (clone → profile → command validation → structure scan → architecture summary → conventions → deployment check); workspace at `/tmp/onboarding/<run_id>/repo`
+- `app/repo_scanner.py` — `scan_repo_structure(workspace_path, profile_name)`: classifies repo files into top_level, config, deploy, routing, model, service, test, doc categories; all lists capped at 20 entries; path-based only (no file content)
 
 **Event flow:**
 ```
@@ -145,6 +147,11 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `clarification_requests` | One row per clarification issued; FK to `workflow_runs`; status: PENDING / ANSWERED / CANCELLED / EXPIRED |
 | `deployment_profiles` | Per-repo/environment smoke test configuration; unique on (repo_slug, environment); seeded from `config/deployment_profiles.yaml` |
 | `deployment_validations` | One row per post-merge validation run (FK to workflow_runs); stores smoke_results_json, status, timing |
+| `project_onboarding_runs` | One row per onboarding execution; tracks status, profile, command results, architecture_summary, structure_scan_json, deployment_profile_status |
+| `project_knowledge_snapshots` | One row per (repo_slug, snapshot_kind); snapshot kinds: architecture, commands, testing, deployment, coding_conventions, open_questions, onboarding_retrospective; updated on each onboarding run |
+
+**`project_onboarding_runs` status flow:** `PENDING → RUNNING → COMPLETED | FAILED`
+**`project_onboarding_runs.deployment_profile_status` values:** `CONFIGURED_ENABLED | CONFIGURED_DISABLED | DRAFT_CREATED | NOT_CONFIGURED`
 
 **`workflow_runs` status flow:**
 ```
@@ -251,6 +258,14 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/admin/ui/control/resume` | Resume orchestrator (CSRF-protected) |
 | GET | `/admin/ui/deployments` | Deployment profiles + recent validations list (filter: repo_slug, status, limit) |
 | POST | `/admin/ui/runs/{run_id}/run-deployment-validation` | Re-run deployment validation for a run (CSRF-protected) |
+| GET | `/admin/ui/projects` | Project onboarding list (all repos with onboarding data) |
+| GET | `/admin/ui/projects/{repo_slug}` | Project detail: latest run, capability profile, all knowledge snapshots, run history |
+| POST | `/admin/project-onboarding/start` | Start onboarding for a repo (body: repo_slug, base_branch) |
+| GET | `/admin/project-onboarding/runs` | List onboarding runs (filter: repo_slug) |
+| GET | `/admin/project-onboarding/runs/{run_id}` | Single onboarding run detail |
+| POST | `/admin/project-onboarding/{repo_slug}/create-jira-mapping` | Create repo mapping after onboarding (body: jira_project_key, base_branch, environment, auto_merge_enabled) |
+| GET | `/debug/project-knowledge` | List knowledge snapshots for a repo (query: repo_slug) |
+| POST | `/debug/project-knowledge/{repo_slug}/refresh` | Placeholder for future knowledge refresh |
 
 ## Workflow Configuration
 
@@ -587,6 +602,28 @@ Browser-based operations console at `/admin/ui`. Served as server-rendered HTML 
 - `get_workflow_run_detail(run_id)` — full run + all agent reviews + clarification + GitHub statuses
 - `list_memory_snapshots(scope_type, scope_key)` — filterable memory listing
 - `list_feedback_events(source_type, repo_slug, limit)` — feedback log
+
+## Project Onboarding (Phase 17)
+
+`app/onboarding.py` — `run_project_onboarding(run_id, repo_slug, base_branch)`: 7-step pipeline executed by the worker's `_execute_onboarding()` path.
+
+| Step | current_step value | What happens |
+|---|---|---|
+| 1 | cloning | `git clone --depth=1` into `/tmp/onboarding/<run_id>/repo` |
+| 2 | profile_detection | `detect_repo_capability_profile()` → upserts `repo_capability_profiles` |
+| 3 | command_validation | Runs test/build/lint commands; stores NOT_RUN for missing commands |
+| 4 | structure_scan | `scan_repo_structure()` → stored as `structure_scan_json` |
+| 5 | architecture_summary | Claude (`generate_onboarding_architecture_summary()`) → upserts `architecture` + `open_questions` snapshots |
+| 6 | coding_conventions | Claude (`generate_onboarding_coding_conventions()`) → upserts `coding_conventions` snapshot |
+| 7 | deployment_check | `_check_deployment_profile()` → upserts `deployment` snapshot; creates disabled draft if no profile exists |
+
+Workspace: `/tmp/onboarding/<run_id>/` — cleaned up in `finally` block regardless of outcome.
+
+**Project knowledge injection** (non-fatal): `get_project_knowledge_for_prompt(repo_slug)` in `app/database.py` fetches `architecture` + `coding_conventions` + `deployment` snapshots, returns a bounded string (≤5 bullets, ≤1200 chars). Injected into `suggest_memory` (story_implementation) and `memory_context` (epic_breakdown) before Claude calls. Wrapped in try/except so missing data never breaks existing workflows.
+
+**Jira mapping helper**: `POST /admin/project-onboarding/{repo_slug}/create-jira-mapping` — creates a `repo_mappings` entry after onboarding; returns error if capability profile is missing or mapping already exists.
+
+**Dashboard**: `/admin/ui/projects` lists all repos with onboarding data; `/admin/ui/projects/{repo_slug}` shows latest run, capability profile, architecture, conventions, open questions, and deployment profile in a structured view.
 
 ## Deferred / Out of Scope
 
