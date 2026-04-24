@@ -2677,6 +2677,70 @@ def record_github_status_update(
             return cur.fetchone()[0]
 
 
+def find_runs_eligible_for_status_backfill(
+    repo_slug: str | None = None,
+    limit: int = 20,
+    only_missing: bool = True,
+) -> list[dict]:
+    """Return runs that have a PR URL, a release decision, and a head_sha.
+
+    Optionally filter to only runs that have not yet published statuses.
+    Returns list of dicts with run_id, repo_slug (from mapping), head_sha, pr_url,
+    release_decision, github_statuses_published.
+    """
+    conditions = [
+        "wr.pr_url IS NOT NULL",
+        "wr.release_decision IS NOT NULL",
+        "wr.head_sha IS NOT NULL",
+    ]
+    params: list = []
+
+    if only_missing:
+        conditions.append("(wr.github_statuses_published = FALSE OR wr.github_statuses_published IS NULL)")
+
+    where_clause = " AND ".join(conditions)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT wr.id, wr.issue_key, wr.pr_url, wr.head_sha,
+                       wr.release_decision, wr.github_statuses_published,
+                       wr.test_status, wr.review_status, wr.test_quality_status,
+                       wr.architecture_status
+                FROM workflow_runs wr
+                WHERE {where_clause}
+                ORDER BY wr.id DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+
+    results = []
+    for r in rows:
+        pr_url = r[2] or ""
+        # Derive repo_slug from PR URL: https://github.com/owner/repo/pull/N
+        parts = pr_url.replace("https://github.com/", "").split("/")
+        derived_slug = f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else ""
+        if repo_slug and derived_slug != repo_slug:
+            continue
+        results.append({
+            "run_id":                    r[0],
+            "issue_key":                 r[1],
+            "pr_url":                    pr_url,
+            "head_sha":                  r[3],
+            "release_decision":          r[4],
+            "github_statuses_published": r[5],
+            "test_status":               r[6],
+            "review_status":             r[7],
+            "test_quality_status":       r[8],
+            "architecture_status":       r[9],
+            "repo_slug":                 derived_slug,
+        })
+    return results
+
+
 def list_github_status_updates(run_id: int) -> list[dict]:
     """Return all github_status_updates rows for a run, newest first."""
     with get_conn() as conn:

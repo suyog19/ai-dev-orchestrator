@@ -26,7 +26,7 @@ from app.telegram import send_message
 from app.webhooks import router as webhooks_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
-from app.database import list_github_status_updates
+from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill
 
 load_dotenv()
 
@@ -962,6 +962,62 @@ def validate_required_checks(body: ValidateRequiredChecksRequest):
         "optional_configured":      orch_status.get("optional_configured", []),
         "current_required_checks":  audit.get("required_status_checks", []),
         "recommendations":          recommendations,
+    }
+
+
+class BackfillRequest(BaseModel):
+    repo_slug: str | None = None
+    limit: int = 20
+    only_missing: bool = True
+
+
+@app.post("/admin/github/statuses/backfill")
+def backfill_github_statuses(body: BackfillRequest):
+    """Backfill GitHub commit statuses for recent eligible runs.
+
+    Eligible runs: have a PR URL, release decision, and head_sha.
+    Ineligible runs (no head_sha) are reported as skipped with reason.
+    Safe to rerun — GitHub keeps the latest status per context, DB records each attempt.
+    Requires: X-Orchestrator-Admin-Key header.
+    """
+    from app.github_status_publisher import publish_github_statuses_for_run
+    from app.security import ensure_github_writes_allowed
+
+    eligible = find_runs_eligible_for_status_backfill(
+        repo_slug=body.repo_slug,
+        limit=body.limit,
+        only_missing=body.only_missing,
+    )
+
+    published_runs = []
+    skipped_runs = []
+    failed_runs = []
+
+    for run in eligible:
+        run_id = run["run_id"]
+        repo_slug = run["repo_slug"]
+        try:
+            ensure_github_writes_allowed("status", repo_slug, run_id)
+        except RuntimeError as exc:
+            skipped_runs.append({"run_id": run_id, "reason": str(exc)})
+            continue
+
+        result = publish_github_statuses_for_run(run_id, repo_slug)
+        if result["skipped"]:
+            skipped_runs.append({"run_id": run_id, "reason": result["errors"][0] if result["errors"] else "skipped"})
+        elif result["failed"] > 0:
+            failed_runs.append({"run_id": run_id, "errors": result["errors"]})
+        else:
+            published_runs.append({"run_id": run_id, "published": result["published"]})
+
+    return {
+        "eligible_found":   len(eligible),
+        "published_count":  len(published_runs),
+        "skipped_count":    len(skipped_runs),
+        "failed_count":     len(failed_runs),
+        "published_runs":   published_runs,
+        "skipped_runs":     skipped_runs,
+        "failed_runs":      failed_runs,
     }
 
 
