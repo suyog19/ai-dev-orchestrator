@@ -1,0 +1,60 @@
+{% extends "admin/base.html" %}
+{% block title %}Projects — Orchestrator{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Projects</h1>
+  <p class="subtitle">Onboarded repos and project knowledge snapshots</p>
+</div>
+
+<form method="get" class="filter-form">
+  <input type="text" name="repo_slug" value="{{ filter_repo_slug }}" placeholder="Filter by repo slug">
+  <button type="submit">Filter</button>
+  {% if filter_repo_slug %}<a href="/admin/ui/projects" class="btn-reset">Clear</a>{% endif %}
+</form>
+
+{% if repos %}
+<section>
+  <h2>Onboarded Repos</h2>
+  <table>
+    <thead><tr><th>Repo Slug</th><th>Action</th></tr></thead>
+    <tbody>
+    {% for slug in repos %}
+      <tr>
+        <td><a href="/admin/ui/projects/{{ slug }}">{{ slug }}</a></td>
+        <td><a href="/admin/ui/projects/{{ slug }}">View Details →</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section>
+  <h2>Recent Onboarding Runs</h2>
+  {% if runs %}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th><th>Repo Slug</th><th>Branch</th><th>Status</th>
+        <th>Profile</th><th>Step</th><th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for run in runs %}
+      <tr>
+        <td>{{ run.id }}</td>
+        <td><a href="/admin/ui/projects/{{ run.repo_slug }}">{{ run.repo_slug }}</a></td>
+        <td>{{ run.base_branch }}</td>
+        <td><span class="badge badge-{{ run.status | lower }}">{{ run.status }}</span></td>
+        <td>{{ run.capability_profile_name or "—" }}</td>
+        <td>{{ run.current_step or "—" }}</td>
+        <td>{{ run.created_at[:16] if run.created_at else "—" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state">No onboarding runs yet. Use <code>POST /admin/project-onboarding/start</code> to begin.</p>
+  {% endif %}
+</section>
+{% endblock %}

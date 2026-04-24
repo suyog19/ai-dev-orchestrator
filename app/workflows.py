@@ -16,7 +16,7 @@ from app.database import (
     request_planning_approval, set_run_waiting_for_approval, complete_planning_run,
     get_created_children_for_epic, store_planning_metadata,
     record_planning_feedback, record_execution_feedback,
-    get_planning_memory, get_execution_memory,
+    get_planning_memory, get_execution_memory, get_project_knowledge_for_prompt,
     store_agent_review,
     store_test_quality_review,
     store_architecture_review,
@@ -1020,6 +1020,18 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     except Exception as mem_exc:
         logger.warning("story_implementation: get_execution_memory failed (non-fatal): %s", mem_exc)
 
+    # Phase 17 — inject project knowledge (architecture + conventions + deployment) if available
+    project_knowledge = ""
+    try:
+        project_knowledge = get_project_knowledge_for_prompt(mapping["repo_slug"])
+        if project_knowledge:
+            logger.info(
+                "story_implementation: injecting %d chars of project knowledge (run_id=%s)",
+                len(project_knowledge), run_id,
+            )
+    except Exception as pk_exc:
+        logger.warning("story_implementation: get_project_knowledge_for_prompt failed (non-fatal): %s", pk_exc)
+
     update_run_step(run_id, "cloning")
     repo_path = clone_repo(
         run_id=run_id,
@@ -1093,8 +1105,11 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             )
             # pause_for_clarification raises ClarificationRequested — execution stops here
 
-    # Inject clarification answer into memory context for Developer Agent
+    # Inject clarification answer + project knowledge into memory context for Developer Agent
     suggest_memory = execution_memory
+    if project_knowledge:
+        pk_block = f"Project knowledge for {mapping['repo_slug']}:\n{project_knowledge}"
+        suggest_memory = f"{suggest_memory}\n\n{pk_block}" if suggest_memory else pk_block
     if clarification_answer_text:
         answer_note = f"User clarification for this story: {clarification_answer_text}"
         suggest_memory = f"{suggest_memory}\n\n{answer_note}" if suggest_memory else answer_note
@@ -1799,6 +1814,20 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
                 )
     except Exception as mem_exc:
         logger.warning("epic_breakdown: get_planning_memory failed (non-fatal): %s", mem_exc)
+
+    # Phase 17 — inject project knowledge into epic planning if available
+    try:
+        if story_mapping:
+            pk = get_project_knowledge_for_prompt(story_mapping["repo_slug"])
+            if pk:
+                pk_block = f"Project knowledge for {story_mapping['repo_slug']}:\n{pk}"
+                memory_context = f"{memory_context}\n\n{pk_block}" if memory_context else pk_block
+                logger.info(
+                    "epic_breakdown: injecting %d chars of project knowledge (run_id=%s)",
+                    len(pk), run_id,
+                )
+    except Exception as pk_exc:
+        logger.warning("epic_breakdown: get_project_knowledge_for_prompt failed (non-fatal): %s", pk_exc)
 
     # --- Fetch Epic details for vagueness check ---
     epic_description: str | None = None

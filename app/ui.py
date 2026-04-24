@@ -770,3 +770,73 @@ async def ui_rerun_deployment_validation(
         )
 
     return RedirectResponse(url=f"/admin/ui/runs/{run_id}", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Phase 17 — Project Onboarding Dashboard (placeholder, expanded in Iteration 8)
+# ---------------------------------------------------------------------------
+
+@router.get("/projects", response_class=HTMLResponse)
+async def ui_projects(request: Request, repo_slug: str | None = None):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    from app.database import list_onboarding_runs, list_knowledge_snapshots
+    runs = list_onboarding_runs(repo_slug=repo_slug, limit=50)
+    # Collect distinct repos that have onboarding runs
+    seen: set[str] = set()
+    repos = []
+    for r in runs:
+        if r["repo_slug"] not in seen:
+            seen.add(r["repo_slug"])
+            repos.append(r["repo_slug"])
+
+    return templates.TemplateResponse("admin/projects.html", {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": "projects",
+        "runs": runs,
+        "repos": repos,
+        "filter_repo_slug": repo_slug or "",
+    })
+
+
+@router.get("/projects/{repo_slug:path}", response_class=HTMLResponse)
+async def ui_project_detail(request: Request, repo_slug: str):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    from app.database import (
+        list_onboarding_runs, get_onboarding_run, list_knowledge_snapshots,
+        get_active_capability_profile, get_deployment_profile,
+    )
+    runs = list_onboarding_runs(repo_slug=repo_slug, limit=10)
+    snapshots = list_knowledge_snapshots(repo_slug=repo_slug)
+    capability_profile = get_active_capability_profile(repo_slug)
+    deployment_profile = get_deployment_profile(repo_slug, environment="dev")
+
+    # Get full detail for latest run (includes architecture_summary, structure_scan_json, etc.)
+    latest_run = None
+    if runs:
+        latest_run = get_onboarding_run(runs[0]["id"])
+
+    snaps_by_kind = {s["snapshot_kind"]: s for s in snapshots}
+
+    return templates.TemplateResponse("admin/project_detail.html", {
+        "request": request,
+        "csrf": csrf_token(token),
+        "env_name": _env_name(),
+        "page": "projects",
+        "repo_slug": repo_slug,
+        "runs": runs,
+        "latest_run": latest_run,
+        "snapshots": snapshots,
+        "snapshots_by_kind": snaps_by_kind,
+        "capability_profile": capability_profile,
+        "deployment_profile": deployment_profile,
+    })

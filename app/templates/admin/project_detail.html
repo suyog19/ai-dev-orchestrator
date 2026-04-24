@@ -1,0 +1,151 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ repo_slug }} — Projects — Orchestrator{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>{{ repo_slug }}</h1>
+  <p class="subtitle"><a href="/admin/ui/projects">← Projects</a></p>
+</div>
+
+{% if latest_run %}
+<section>
+  <h2>Latest Onboarding Run #{{ latest_run.id }}</h2>
+  <table>
+    <tr><th>Status</th><td><span class="badge badge-{{ latest_run.status | lower }}">{{ latest_run.status }}</span></td></tr>
+    <tr><th>Branch</th><td>{{ latest_run.base_branch }}</td></tr>
+    <tr><th>Current Step</th><td>{{ latest_run.current_step or "—" }}</td></tr>
+    <tr><th>Capability Profile</th><td>{{ latest_run.capability_profile_name or "—" }}</td></tr>
+    <tr><th>Test Command</th><td><code>{{ latest_run.test_command or "—" }}</code></td></tr>
+    <tr><th>Build Command</th><td><code>{{ latest_run.build_command or "—" }}</code></td></tr>
+    <tr><th>Lint Command</th><td><code>{{ latest_run.lint_command or "—" }}</code></td></tr>
+    <tr><th>Test Result</th><td>{{ latest_run.test_result or "—" }}</td></tr>
+    <tr><th>Build Result</th><td>{{ latest_run.build_result or "—" }}</td></tr>
+    <tr><th>Lint Result</th><td>{{ latest_run.lint_result or "—" }}</td></tr>
+    <tr><th>Deployment Profile</th><td>{{ latest_run.deployment_profile_status or "—" }}</td></tr>
+    <tr><th>Completed</th><td>{{ latest_run.completed_at[:16] if latest_run.completed_at else "—" }}</td></tr>
+    {% if latest_run.error_detail %}
+    <tr><th>Error</th><td class="error-text">{{ latest_run.error_detail }}</td></tr>
+    {% endif %}
+  </table>
+</section>
+{% endif %}
+
+{% if capability_profile %}
+<section>
+  <h2>Capability Profile</h2>
+  <table>
+    <tr><th>Profile</th><td>{{ capability_profile.profile_name }}</td></tr>
+    <tr><th>Language</th><td>{{ capability_profile.primary_language or "—" }} / {{ capability_profile.framework or "—" }}</td></tr>
+    <tr><th>Test Command</th><td><code>{{ capability_profile.test_command or "—" }}</code></td></tr>
+    <tr><th>Build Command</th><td><code>{{ capability_profile.build_command or "—" }}</code></td></tr>
+    <tr><th>Lint Command</th><td><code>{{ capability_profile.lint_command or "—" }}</code></td></tr>
+  </table>
+</section>
+{% endif %}
+
+{% if snapshots_by_kind.architecture %}
+{% set arch = snapshots_by_kind.architecture %}
+<section>
+  <h2>Architecture Summary</h2>
+  <p style="line-height:1.6">{{ arch.summary }}</p>
+  {% if arch.details and arch.details.main_modules %}
+  <h3 style="margin-top:12px">Main Modules</h3>
+  <ul>{% for m in arch.details.main_modules %}<li>{{ m }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if arch.details and arch.details.risks %}
+  <h3 style="margin-top:12px">Risks</h3>
+  <ul>{% for r in arch.details.risks %}<li>{{ r }}</li>{% endfor %}</ul>
+  {% endif %}
+  <p class="text-muted" style="font-size:0.8em;margin-top:8px">Updated {{ arch.updated_at[:16] if arch.updated_at else "—" }}</p>
+</section>
+{% endif %}
+
+{% if snapshots_by_kind.coding_conventions %}
+{% set conv = snapshots_by_kind.coding_conventions %}
+<section>
+  <h2>Coding Conventions</h2>
+  <p style="line-height:1.6">{{ conv.summary }}</p>
+  {% if conv.details and conv.details.patterns_to_follow %}
+  <h3 style="margin-top:12px">Patterns to Follow</h3>
+  <ul>{% for p in conv.details.patterns_to_follow %}<li>{{ p }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if conv.details and conv.details.patterns_to_avoid %}
+  <h3 style="margin-top:12px">Patterns to Avoid</h3>
+  <ul>{% for p in conv.details.patterns_to_avoid %}<li>{{ p }}</li>{% endfor %}</ul>
+  {% endif %}
+  <p class="text-muted" style="font-size:0.8em;margin-top:8px">Updated {{ conv.updated_at[:16] if conv.updated_at else "—" }}</p>
+</section>
+{% endif %}
+
+{% if snapshots_by_kind.open_questions %}
+{% set oq = snapshots_by_kind.open_questions %}
+<section>
+  <h2>Open Questions</h2>
+  <pre style="white-space:pre-wrap;word-break:break-word;font-size:0.9em;line-height:1.5">{{ oq.summary }}</pre>
+  <p class="text-muted" style="font-size:0.8em">Updated {{ oq.updated_at[:16] if oq.updated_at else "—" }}</p>
+</section>
+{% endif %}
+
+{% if snapshots_by_kind.deployment %}
+{% set dep = snapshots_by_kind.deployment %}
+<section>
+  <h2>Deployment Profile</h2>
+  <p>{{ dep.summary }}</p>
+  {% if deployment_profile %}
+  <table>
+    <tr><th>Type</th><td>{{ deployment_profile.deployment_type or "—" }}</td></tr>
+    <tr><th>Base URL</th><td>{{ deployment_profile.base_url or "—" }}</td></tr>
+    <tr><th>Enabled</th><td>{{ "Yes" if deployment_profile.enabled else "No" }}</td></tr>
+  </table>
+  {% endif %}
+  {% if dep.details and dep.details.recommendations %}
+  <h3 style="margin-top:12px">Recommendations</h3>
+  <ul>{% for r in dep.details.recommendations %}<li>{{ r }}</li>{% endfor %}</ul>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if snapshots %}
+<section>
+  <h2>All Knowledge Snapshots</h2>
+  {% for snap in snapshots %}
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-header">
+      <strong>{{ snap.snapshot_kind }}</strong>
+      <span class="text-muted" style="font-size:0.85em">Updated {{ snap.updated_at[:16] if snap.updated_at else "—" }}</span>
+    </div>
+    <div class="card-body">
+      <pre style="white-space:pre-wrap;word-break:break-word;font-size:0.85em">{{ snap.summary }}</pre>
+    </div>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if runs | length > 1 %}
+<section>
+  <h2>All Onboarding Runs</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Status</th><th>Profile</th><th>Test</th><th>Build</th><th>Lint</th><th>Deploy</th><th>Created</th><th>Completed</th></tr></thead>
+    <tbody>
+    {% for run in runs %}
+    <tr>
+      <td>{{ run.id }}</td>
+      <td><span class="badge badge-{{ run.status | lower }}">{{ run.status }}</span></td>
+      <td>{{ run.capability_profile_name or "—" }}</td>
+      <td>{{ run.test_result or "—" }}</td>
+      <td>{{ run.build_result or "—" }}</td>
+      <td>{{ run.lint_result or "—" }}</td>
+      <td>{{ run.deployment_profile_status or "—" }}</td>
+      <td>{{ run.created_at[:16] if run.created_at else "—" }}</td>
+      <td>{{ run.completed_at[:16] if run.completed_at else "—" }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+{% if not latest_run and not snapshots %}
+<p class="empty-state">No onboarding data yet for this repo. Use <code>POST /admin/project-onboarding/start</code> with <code>repo_slug={{ repo_slug }}</code> to begin.</p>
+{% endif %}
+{% endblock %}
