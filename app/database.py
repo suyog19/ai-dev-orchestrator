@@ -1922,6 +1922,69 @@ def list_test_quality_reviews(
     ]
 
 
+def list_architecture_reviews(
+    run_id: int | None = None,
+    repo_slug: str | None = None,
+    architecture_status: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """Return agent_architecture_reviews rows, optionally filtered, newest first."""
+    conditions = []
+    params: list = []
+
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    if repo_slug is not None:
+        conditions.append("repo_slug = %s")
+        params.append(repo_slug)
+    if architecture_status is not None:
+        conditions.append("architecture_status = %s")
+        params.append(architecture_status)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, pr_number, pr_url, repo_slug, story_key,
+                       agent_name, architecture_status, risk_level, summary,
+                       impact_areas_json, blocking_reasons_json, recommendations_json,
+                       model_used, created_at, updated_at
+                FROM agent_architecture_reviews
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id":                    r[0],
+            "run_id":                r[1],
+            "pr_number":             r[2],
+            "pr_url":                r[3],
+            "repo_slug":             r[4],
+            "story_key":             r[5],
+            "agent_name":            r[6],
+            "architecture_status":   r[7],
+            "risk_level":            r[8],
+            "summary":               r[9],
+            "impact_areas":          json.loads(r[10]) if r[10] else [],
+            "blocking_reasons":      json.loads(r[11]) if r[11] else [],
+            "recommendations":       json.loads(r[12]) if r[12] else [],
+            "model_used":            r[13],
+            "created_at":            r[14].isoformat() if r[14] else None,
+            "updated_at":            r[15].isoformat() if r[15] else None,
+        }
+        for r in rows
+    ]
+
+
 def list_agent_reviews(
     run_id: int | None = None,
     repo_slug: str | None = None,
