@@ -2540,4 +2540,3 @@ def list_clarifications(status: str | None = None, limit: int = 50) -> list[dict
         }
         for r in rows
     ]
-    ]
