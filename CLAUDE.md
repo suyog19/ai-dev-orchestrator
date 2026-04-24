@@ -50,7 +50,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/main.py` — FastAPI app, all HTTP endpoints
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()` and `review_test_quality()` both use forced `tool_choice` for structured output
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
@@ -75,10 +75,11 @@ Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
     → run tests → [fix attempt if failed] → commit/push → PR
     → Reviewer Agent (review_pr) → store verdict → post PR comment → Telegram
     → Test Quality Agent (review_test_quality) → store verdict → post PR comment → Telegram
-    → merge gate (APPROVED_BY_AI + TEST_QUALITY_APPROVED → merge
-                 | BLOCKED → BLOCKED_BY_REVIEW
-                 | TESTS_BLOCKING → BLOCKED_BY_TEST_QUALITY
-                 | else → SKIPPED)
+    → Architecture Agent (review_architecture) → store verdict → post PR comment → Telegram
+    → Unified Release Gate (evaluate_release_decision) → persist release_decision
+      RELEASE_APPROVED → merge
+      RELEASE_BLOCKED  → BLOCKED_BY_REVIEW | BLOCKED_BY_TEST_QUALITY | BLOCKED_BY_ARCHITECTURE
+      RELEASE_SKIPPED  → SKIPPED
 
   epic_breakdown:
     fetch planning memory → Claude decompose (+ memory) → store proposals
@@ -109,6 +110,7 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `memory_snapshots` | Derived and human-authored guidance; one row per (scope_type, scope_key, memory_kind) |
 | `agent_reviews` | One row per Reviewer Agent verdict; FK to `workflow_runs` |
 | `agent_test_quality_reviews` | One row per Test Quality Agent verdict; FK to `workflow_runs` |
+| `agent_architecture_reviews` | One row per Architecture Agent verdict; FK to `workflow_runs` |
 
 **`workflow_runs` status flow:**
 ```
@@ -118,9 +120,11 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
                                                     → FAILED    (after REJECT/REGENERATE)
 ```
 
-**`workflow_runs.merge_status` values:** `MERGED` | `SKIPPED` | `BLOCKED_BY_REVIEW` | `BLOCKED_BY_TEST_QUALITY` | `FAILED`
+**`workflow_runs.merge_status` values:** `MERGED` | `SKIPPED` | `BLOCKED_BY_REVIEW` | `BLOCKED_BY_TEST_QUALITY` | `BLOCKED_BY_ARCHITECTURE` | `FAILED`
 **`workflow_runs.review_status` values:** `APPROVED_BY_AI` | `NEEDS_CHANGES` | `BLOCKED` | `ERROR` (NULL until review completes)
 **`workflow_runs.test_quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR` (NULL until TQ review completes)
+**`workflow_runs.architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR` (NULL until arch review completes)
+**`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
 
 **`memory_snapshots` kinds:** `planning_guidance`, `execution_guidance`, `manual_note`
 **`memory_snapshots` scopes:** `repo` (scope_key = repo_slug), `epic` (scope_key = epic_key)
@@ -157,6 +161,9 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/debug/workflow-runs/{run_id}/reviews` | All Reviewer Agent verdicts for one run |
 | GET | `/debug/test-quality-reviews` | List Test Quality Agent verdicts (filter: run_id, repo_slug, quality_status) |
 | GET | `/debug/workflow-runs/{run_id}/test-quality` | All Test Quality Agent verdicts for one run |
+| GET | `/debug/architecture-reviews` | List Architecture Agent verdicts (filter: run_id, repo_slug, architecture_status) |
+| GET | `/debug/workflow-runs/{run_id}/architecture` | All Architecture Agent verdicts for one run |
+| GET | `/debug/workflow-runs/{run_id}/release-decision` | Release Gate decision + all agent statuses for one run |
 
 ## Workflow Configuration
 
@@ -167,7 +174,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | Test command | `pytest -q` (after `pip install -r requirements.txt`) |
 | Max fix attempts | 1 (max 2 total coding passes per run) |
 | Max changed files | 3 (enforced by Claude tool schema; auto-merge blocks if exceeded) |
-| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed |
+| Auto-merge conditions | tests PASSED + `review_status=APPROVED_BY_AI` + `test_quality_status=TEST_QUALITY_APPROVED` + `architecture_status=ARCHITECTURE_APPROVED` + PR created + `auto_merge_enabled=true` + ≤3 files changed; all evaluated by `evaluate_release_decision()` in `workflows.py` |
 | Test-enabled repo | `suyog19/sandbox-fastapi-app` |
 | Workspace | `/tmp/workflows/{run_id}` (cleaned up after run) |
 
@@ -241,6 +248,42 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
 
 **Test Quality feedback events:** `test_quality_status`, `test_quality_confidence`, `test_quality_approved`, `tests_weak`, `tests_blocking`, `missing_test_count`, `suspicious_test_count`
+
+### Architecture Agent
+
+**`architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR`
+**`risk_level` values:** `LOW` | `MEDIUM` | `HIGH`
+
+| Setting | Value |
+|---|---|
+| Review required | `true` — every `story_implementation` run triggers a review |
+| Review blocks merge | `true` — `ARCHITECTURE_APPROVED` required for auto-merge |
+| Architecture Agent prompt | `ARCHITECTURE_PROMPT` in `app/claude_client.py` |
+| Output format | Forced tool_use (`submit_architecture_review`) with architecture_status, risk_level, summary, impact_areas, blocking_reasons, recommendations |
+| GitHub action | Top-level PR comment with emoji verdict summary |
+| Merge on `ARCHITECTURE_NEEDS_REVIEW` | `merge_status=SKIPPED` |
+| Merge on `ARCHITECTURE_BLOCKED` | `merge_status=BLOCKED_BY_ARCHITECTURE` |
+| Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
+| File classification | `_classify_changed_files()` in `workflows.py` — api, model, storage, config, test, doc |
+
+**Architecture feedback events:** `architecture_status`, `architecture_risk_level`, `architecture_approved`, `architecture_needs_review`, `architecture_blocked`
+
+### Unified Release Gate
+
+`evaluate_release_decision(mapping, final_test_result, applied, review_status, test_quality_status, architecture_status) -> dict` (pure function in `workflows.py`)
+
+Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
+
+| Gate | BLOCKED if | SKIPPED if |
+|---|---|---|
+| Tests | `status != PASSED` (hard block) | `status != PASSED` (soft) |
+| Reviewer | `BLOCKED` | `NEEDS_CHANGES` or `ERROR` |
+| Test Quality | `TESTS_BLOCKING` | `TESTS_WEAK` or `ERROR` |
+| Architecture | `ARCHITECTURE_BLOCKED` | `ARCHITECTURE_NEEDS_REVIEW` or `ERROR` |
+| Auto-merge | — | `auto_merge_enabled=False` |
+| File count | — | `count > 3` |
+
+**Release feedback events:** `release_decision`, `release_blocking_gate_count`
 
 ## Telegram Message Format
 
