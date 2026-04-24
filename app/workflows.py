@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
-from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment
+from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment, get_pr_diff
 from app.repo_analysis import analyze_repo, format_telegram_summary
 from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
 from app.jira_client import get_issue_details
@@ -20,10 +20,13 @@ from app.database import (
     store_agent_review,
     store_test_quality_review,
     store_architecture_review,
+    get_active_clarification,
+    get_run_state,
 )
-from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision
+from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision, ClarificationContextKey
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
+from app.clarification import pause_for_clarification, ClarificationRequested, is_clarification_enabled
 
 AI_LABEL = "ai-generated"
 AI_LABEL_COLOR = "6f42c1"  # purple
@@ -357,6 +360,48 @@ def _format_architecture_comment(verdict: dict) -> str:
     )
 
 
+def _check_epic_vagueness(summary: str, description: str | None) -> str | None:
+    """Return a clarification question if the Epic is too vague for safe decomposition, else None."""
+    summary_words = (summary or "").split()
+    desc = (description or "").strip()
+
+    if len(summary_words) < 4 and not desc:
+        return (
+            f"The Epic summary '{summary}' is very short and has no description. "
+            f"What is the detailed scope and expected outcomes? "
+            f"Options: 1. Describe the full goal  2. List key deliverables  3. Specify target users and success criteria"
+        )
+
+    if not desc or len(desc) < 50:
+        return (
+            f"The Epic '{summary}' has no detailed description or acceptance criteria. "
+            f"What are the expected deliverables and how should completion be measured?"
+        )
+
+    return None
+
+
+def _check_story_ambiguity(summary: str, story_details: dict) -> str | None:
+    """Return a clarification question if the Story is too ambiguous for safe implementation, else None."""
+    description = (story_details.get("description") or "").strip()
+    acceptance_criteria = story_details.get("acceptance_criteria") or []
+    summary_words = (summary or "").split()
+
+    if len(summary_words) < 4 and not description and not acceptance_criteria:
+        return (
+            f"Story '{summary}' has a very short summary and no description or acceptance criteria. "
+            f"What specific change should be made and what is the expected behaviour after implementation?"
+        )
+
+    if not acceptance_criteria and not description:
+        return (
+            f"Story '{summary}' has no acceptance criteria or description. "
+            f"What is the expected behaviour after implementation, and how should it be tested?"
+        )
+
+    return None
+
+
 def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     status = test_result["status"]
     output = (test_result.get("output") or "").strip()
@@ -466,6 +511,169 @@ def evaluate_release_decision(
     }
 
 
+def _story_review_and_release(
+    run_id: int,
+    issue_key: str,
+    summary: str,
+    mapping: dict,
+    run_state: dict,
+    clarification_answer: str | None = None,
+) -> None:
+    """Run review agents and release gate for a story that already has a PR.
+
+    Used on resume after a review-stage clarification is answered.
+    Reconstructs context from DB + GitHub diff instead of re-running implementation.
+    """
+    pr_url = run_state["pr_url"]
+    pr_number_match = __import__("re").search(r"/pull/(\d+)$", pr_url or "")
+    if not pr_number_match:
+        logger.error("_story_review_and_release: cannot extract PR number from url=%s", pr_url)
+        fail_run(run_id, f"Review resume failed: cannot parse PR number from {pr_url}")
+        return
+    pr_number = int(pr_number_match.group(1))
+    pr = {"number": pr_number, "url": pr_url, "title": f"ai: {issue_key} — {summary}", "body": ""}
+
+    execution_memory = ""
+    try:
+        execution_memory = get_execution_memory(mapping["repo_slug"])
+    except Exception:
+        pass
+    if clarification_answer:
+        note = f"User clarification for review: {clarification_answer}"
+        execution_memory = f"{execution_memory}\n\n{note}" if execution_memory else note
+
+    story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("_story_review_and_release: get_issue_details failed (non-fatal) — %s", exc)
+
+    diff_block = ""
+    try:
+        diff_block = get_pr_diff(mapping["repo_slug"], pr_number)
+    except Exception as exc:
+        logger.warning("_story_review_and_release: get_pr_diff failed (non-fatal) — %s", exc)
+
+    final_test_result = {
+        "status": run_state.get("test_status") or "NOT_RUN",
+        "command": run_state.get("test_command") or "",
+        "output": run_state.get("test_output") or "",
+    }
+
+    review_package = _build_review_package(
+        issue_key=issue_key,
+        summary=summary,
+        story_details=story_details,
+        mapping=mapping,
+        branch=run_state.get("working_branch", ""),
+        pr=pr,
+        commit_message=f"ai: {issue_key} — {summary}",
+        final_changes=[],
+        diff_block=diff_block,
+        final_test_result=final_test_result,
+        retry_count=0,
+        execution_memory=execution_memory,
+    )
+
+    send_message(
+        "review_resumed", "RUNNING",
+        f"{issue_key}: re-running review agents after clarification answer",
+    )
+
+    # --- Reviewer Agent ---
+    update_run_step(run_id, "reviewing")
+    verdict: dict = {}
+    try:
+        verdict = review_pr(**review_package)
+        store_agent_review(
+            run_id=run_id, verdict=verdict, pr_number=pr_number,
+            pr_url=pr_url, repo_slug=mapping["repo_slug"], story_key=issue_key,
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr_number, _format_review_comment(verdict))
+        except Exception:
+            pass
+        send_message(
+            "review_completed", verdict.get("review_status", "UNKNOWN"),
+            f"{issue_key}: PR #{pr_number} verdict={verdict.get('review_status')} risk={verdict.get('risk_level')}",
+        )
+    except Exception as exc:
+        verdict = {
+            "review_status": ReviewStatus.ERROR, "risk_level": "HIGH",
+            "summary": f"Reviewer Agent error: {exc}",
+            "findings": [], "blocking_reasons": [str(exc)], "recommendations": [],
+        }
+        logger.error("_story_review_and_release: Reviewer Agent failed — %s", exc)
+
+    # --- Architecture Agent ---
+    update_run_step(run_id, "architecture_review")
+    arch_verdict: dict = {}
+    try:
+        arch_package = _build_architecture_review_package(
+            issue_key=issue_key, summary=summary, story_details=story_details,
+            mapping=mapping, pr=pr, final_changes=[], diff_block=diff_block,
+            final_test_result=final_test_result, verdict=verdict, tq_verdict={},
+            retry_count=0, execution_memory=execution_memory, repo_analysis={},
+        )
+        arch_verdict = review_architecture(**arch_package)
+        store_architecture_review(
+            run_id=run_id, verdict=arch_verdict, pr_number=pr_number,
+            pr_url=pr_url, repo_slug=mapping["repo_slug"], story_key=issue_key,
+        )
+        try:
+            post_pr_comment(mapping["repo_slug"], pr_number, _format_architecture_comment(arch_verdict))
+        except Exception:
+            pass
+        send_message(
+            "architecture_review_completed", arch_verdict.get("architecture_status", "UNKNOWN"),
+            f"{issue_key}: arch={arch_verdict.get('architecture_status')} risk={arch_verdict.get('risk_level')}",
+        )
+    except Exception as exc:
+        arch_verdict = {
+            "architecture_status": ArchitectureStatus.ERROR, "risk_level": "HIGH",
+            "summary": f"Architecture Agent error: {exc}",
+            "impact_areas": [], "blocking_reasons": [str(exc)], "recommendations": [],
+        }
+        logger.error("_story_review_and_release: Architecture Agent failed — %s", exc)
+
+    # --- Release Gate ---
+    review_status = verdict.get("review_status", ReviewStatus.ERROR)
+    test_quality_status = TestQualityStatus.ERROR
+    architecture_status = arch_verdict.get("architecture_status", ArchitectureStatus.ERROR)
+
+    update_run_step(run_id, "release_gate")
+    release = evaluate_release_decision(
+        mapping=mapping,
+        final_test_result=final_test_result,
+        applied={"applied": True, "count": 0, "files": []},
+        review_status=review_status,
+        test_quality_status=test_quality_status,
+        architecture_status=architecture_status,
+    )
+    update_run_field(
+        run_id,
+        release_decision=release["release_decision"],
+        release_decision_reason=release["reason"],
+        release_decided_at=datetime.now(timezone.utc),
+    )
+
+    update_run_step(run_id, "merge_check")
+    if release["can_auto_merge"]:
+        try:
+            ensure_github_writes_allowed("merge_pr", mapping["repo_slug"], run_id)
+            merge_pull_request(mapping["repo_slug"], pr_number, pr["title"])
+            update_run_field(run_id, merge_status="MERGED", merged_at=datetime.now(timezone.utc))
+            send_message("pr_merged", "COMPLETE", f"{issue_key}: PR #{pr_number} auto-merged after clarification")
+        except Exception as exc:
+            update_run_field(run_id, merge_status="FAILED")
+            send_message("pr_merge_failed", "FAILED", f"{issue_key}: auto-merge failed — {exc}")
+    else:
+        update_run_field(run_id, merge_status="SKIPPED")
+        send_message("pr_merge_skipped", "COMPLETE", f"{issue_key}: merge skipped ({release['reason']})")
+
+    update_run_step(run_id, "done")
+
+
 def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: str) -> None:
     logger.info("story_implementation: starting %s (%s) — %s", issue_key, issue_type, summary)
 
@@ -476,6 +684,29 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     if not mapping:
         logger.warning("No repo mapping found for project=%s issue_type=%s — aborting", jira_project_key, issue_type)
         return
+
+    # --- Skip to review if resuming after a review-stage clarification ---
+    # If pr_url is already set in the run AND there's an answered PRE_REVIEW clarification,
+    # skip re-implementation and jump straight to the review agents with injected answer.
+    try:
+        run_state = get_run_state(run_id)
+        if run_state and run_state.get("pr_url"):
+            review_clar = get_active_clarification(run_id)
+            if review_clar and review_clar["status"] == "ANSWERED" and review_clar.get("context_key") == ClarificationContextKey.PRE_REVIEW:
+                logger.info(
+                    "story_implementation: review-stage resume detected (pr_url set, PRE_REVIEW answered) — skipping to review",
+                )
+                _story_review_and_release(
+                    run_id=run_id,
+                    issue_key=issue_key,
+                    summary=summary,
+                    mapping=mapping,
+                    run_state=run_state,
+                    clarification_answer=review_clar.get("answer_text"),
+                )
+                return
+    except Exception as exc:
+        logger.warning("story_implementation: review-resume pre-check failed (non-fatal) — %s", exc)
 
     # --- Memory context for execution prompts ---
     execution_memory = ""
@@ -509,8 +740,54 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
     logger.info("story_implementation: Claude summary sent to Telegram")
 
+    # --- Fetch story details early for clarification check ---
+    early_story_details: dict = {"key": issue_key, "summary": summary, "description": None, "acceptance_criteria": []}
+    try:
+        early_story_details = get_issue_details(issue_key)
+    except Exception as exc:
+        logger.warning("story_implementation: early get_issue_details failed (non-fatal) — %s", exc)
+
+    # --- Resume detection: inject answered clarification into suggestion context ---
+    clarification_answer_text: str | None = None
+    try:
+        active_clar = get_active_clarification(run_id)
+        if active_clar and active_clar["status"] == "ANSWERED":
+            clarification_answer_text = active_clar.get("answer_text")
+            logger.info(
+                "story_implementation: resumed with answered clarification %s — injecting answer",
+                active_clar["id"],
+            )
+            send_message(
+                "clarification_resumed", "RUNNING",
+                f"{issue_key}: resuming with clarification answer — {clarification_answer_text}",
+            )
+    except Exception as exc:
+        logger.warning("story_implementation: clarification resume check failed (non-fatal) — %s", exc)
+
+    # --- Clarification checkpoint: pause if Story is too ambiguous ---
+    if clarification_answer_text is None and is_clarification_enabled():
+        vague_question = _check_story_ambiguity(summary, early_story_details)
+        if vague_question:
+            logger.info("story_implementation: Story ambiguous — pausing for clarification (run_id=%s)", run_id)
+            pause_for_clarification(
+                run_id=run_id,
+                question=vague_question,
+                context_key=ClarificationContextKey.PRE_SUGGEST,
+                context_summary=f"Story {issue_key}: {summary}",
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
+
+    # Inject clarification answer into memory context for Developer Agent
+    suggest_memory = execution_memory
+    if clarification_answer_text:
+        answer_note = f"User clarification for this story: {clarification_answer_text}"
+        suggest_memory = f"{suggest_memory}\n\n{answer_note}" if suggest_memory else answer_note
+
     update_run_step(run_id, "suggesting")
-    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=execution_memory)
+    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=suggest_memory)
     changes = suggestion_result.get("changes", [])
     suggestion_summary = suggestion_result.get("summary", "")
     files_str = ", ".join(c.get("file", "") for c in changes)
@@ -806,6 +1083,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
                 f"{verdict.get('summary', '')}"
             ),
         )
+        # Reviewer requests clarification — pause workflow
+        if verdict.get("needs_clarification") and is_clarification_enabled():
+            pause_for_clarification(
+                run_id=run_id,
+                question=verdict.get("clarification_question", "Reviewer needs clarification to proceed."),
+                context_key=ClarificationContextKey.PRE_REVIEW,
+                context_summary=verdict.get("clarification_context_summary") or f"PR #{pr['number']} review",
+                options=verdict.get("clarification_options"),
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
     except Exception as exc:
         logger.error("story_implementation: Reviewer Agent failed — %s", exc)
         error_verdict = {
@@ -959,6 +1249,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
                 f"{arch_verdict.get('summary', '')}"
             ),
         )
+        # Architecture Agent requests clarification — pause workflow
+        if arch_verdict.get("needs_clarification") and is_clarification_enabled():
+            pause_for_clarification(
+                run_id=run_id,
+                question=arch_verdict.get("clarification_question", "Architecture Agent needs clarification."),
+                context_key=ClarificationContextKey.PRE_REVIEW,
+                context_summary=arch_verdict.get("clarification_context_summary") or f"PR #{pr['number']} arch review",
+                options=arch_verdict.get("clarification_options"),
+                workflow_type="story_implementation",
+                issue_key=issue_key,
+                repo_slug=mapping["repo_slug"],
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
     except Exception as exc:
         logger.error("story_implementation: Architecture Agent failed — %s", exc)
         arch_verdict = {
@@ -1101,10 +1404,56 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     except Exception as mem_exc:
         logger.warning("epic_breakdown: get_planning_memory failed (non-fatal): %s", mem_exc)
 
+    # --- Fetch Epic details for vagueness check ---
+    epic_description: str | None = None
+    try:
+        epic_details = get_issue_details(issue_key)
+        epic_description = epic_details.get("description")
+    except Exception as exc:
+        logger.warning("epic_breakdown: get_issue_details failed (non-fatal) — %s", exc)
+
+    # --- Resume detection: inject answered clarification into planning context ---
+    clarification_answer_text: str | None = None
+    try:
+        active_clar = get_active_clarification(run_id)
+        if active_clar and active_clar["status"] == "ANSWERED":
+            clarification_answer_text = active_clar.get("answer_text")
+            logger.info(
+                "epic_breakdown: resumed with answered clarification %s — injecting answer",
+                active_clar["id"],
+            )
+            send_message(
+                "clarification_resumed", "RUNNING",
+                f"{issue_key}: resuming epic planning with clarification answer — {clarification_answer_text}",
+            )
+    except Exception as exc:
+        logger.warning("epic_breakdown: clarification resume check failed (non-fatal) — %s", exc)
+
+    # --- Clarification checkpoint: pause if Epic is too vague ---
+    if clarification_answer_text is None and is_clarification_enabled():
+        vague_question = _check_epic_vagueness(summary, epic_description)
+        if vague_question:
+            logger.info("epic_breakdown: Epic vague — pausing for clarification (run_id=%s)", run_id)
+            pause_for_clarification(
+                run_id=run_id,
+                question=vague_question,
+                context_key=ClarificationContextKey.PRE_PLANNING,
+                context_summary=f"Epic {issue_key}: {summary}",
+                workflow_type="epic_breakdown",
+                issue_key=issue_key,
+            )
+            # pause_for_clarification raises ClarificationRequested — execution stops here
+
+    # Inject clarification answer into memory context for planning prompt
+    plan_memory = memory_context
+    if clarification_answer_text:
+        answer_note = f"User clarification for this epic: {clarification_answer_text}"
+        plan_memory = f"{plan_memory}\n\n{answer_note}" if plan_memory else answer_note
+
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")
     try:
-        plan = plan_epic_breakdown(issue_key, summary, memory_context=memory_context)
+        plan = plan_epic_breakdown(issue_key, summary, memory_context=plan_memory)
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")

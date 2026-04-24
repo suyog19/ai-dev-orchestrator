@@ -111,6 +111,10 @@ def init_db(retries: int = 5, delay: int = 3):
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision           VARCHAR(30)  NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decision_reason    TEXT         NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS release_decided_at         TIMESTAMP    NULL",
+                # Phase 12 — Clarification loop
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS waiting_for_clarification  BOOLEAN      NOT NULL DEFAULT FALSE",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS active_clarification_id    INTEGER      NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS summary                    TEXT         NULL",
             ]:
                 cur.execute(col_sql)
 
@@ -305,6 +309,31 @@ def init_db(retries: int = 5, delay: int = 3):
                     updated_at TIMESTAMP    NOT NULL DEFAULT NOW()
                 )
             """)
+            # Phase 12 — Clarification requests
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS clarification_requests (
+                    id                  SERIAL PRIMARY KEY,
+                    run_id              INTEGER       NOT NULL REFERENCES workflow_runs(id),
+                    workflow_type       VARCHAR(100)  NULL,
+                    issue_key           VARCHAR(100)  NULL,
+                    repo_slug           VARCHAR(200)  NULL,
+                    context_key         VARCHAR(50)   NULL,
+                    question            TEXT          NOT NULL,
+                    context_summary     TEXT          NULL,
+                    options_json        TEXT          NULL,
+                    status              VARCHAR(40)   NOT NULL DEFAULT 'PENDING',
+                    answer_text         TEXT          NULL,
+                    answered_at         TIMESTAMP     NULL,
+                    telegram_message_id VARCHAR(100)  NULL,
+                    created_at          TIMESTAMP     NOT NULL DEFAULT NOW(),
+                    expires_at          TIMESTAMP     NULL
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_clarification_run_id "
+                "ON clarification_requests (run_id)"
+            )
+
             # Seed default control flags from env (only if not already set)
             import os as _os
             _defaults = {
@@ -313,6 +342,7 @@ def init_db(retries: int = 5, delay: int = 3):
                 "allow_telegram_commands": _os.environ.get("ALLOW_TELEGRAM_COMMANDS", "true"),
                 "allow_github_writes":     _os.environ.get("ALLOW_GITHUB_WRITES", "true"),
                 "allow_auto_merge":        _os.environ.get("ALLOW_AUTO_MERGE", "true"),
+                "clarification_enabled":   _os.environ.get("CLARIFICATION_ENABLED", "true"),
             }
             for k, v in _defaults.items():
                 cur.execute(
@@ -1541,6 +1571,24 @@ def record_execution_feedback(run_id: int) -> int:
             if release_decision:
                 _ev(FeedbackType.RELEASE_DECISION, release_decision)
 
+            # Clarification signals (Phase 12)
+            cur.execute(
+                "SELECT status FROM clarification_requests WHERE run_id = %s",
+                (run_id,),
+            )
+            clar_rows = cur.fetchall()
+            if clar_rows:
+                _ev(FeedbackType.CLARIFICATION_COUNT, len(clar_rows))
+                statuses = [r[0] for r in clar_rows]
+                if any(s == "PENDING" or s == "ANSWERED" or s == "EXPIRED" or s == "CANCELLED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_REQUESTED, "true")
+                if any(s == "ANSWERED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_ANSWERED, "true")
+                if any(s == "CANCELLED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_CANCELLED, "true")
+                if any(s == "EXPIRED" for s in statuses):
+                    _ev(FeedbackType.CLARIFICATION_EXPIRED, "true")
+
             if not events:
                 return 0
 
@@ -2198,6 +2246,345 @@ def list_agent_reviews(
             "model_used":          r[13],
             "created_at":          r[14].isoformat() if r[14] else None,
             "updated_at":          r[15].isoformat() if r[15] else None,
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 — Clarification service layer
+# ---------------------------------------------------------------------------
+
+def create_clarification_request(
+    run_id: int,
+    question: str,
+    context_key: str = "",
+    context_summary: str | None = None,
+    options: list[str] | None = None,
+    workflow_type: str | None = None,
+    issue_key: str | None = None,
+    repo_slug: str | None = None,
+    timeout_hours: int = 24,
+) -> int:
+    """Insert a PENDING clarification_request and link it to the run. Returns new id."""
+    options_json = json.dumps(options) if options else None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO clarification_requests
+                    (run_id, workflow_type, issue_key, repo_slug, context_key,
+                     question, context_summary, options_json, status,
+                     expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'PENDING',
+                        NOW() + INTERVAL '%s hours')
+                RETURNING id
+                """,
+                (run_id, workflow_type, issue_key, repo_slug, context_key,
+                 question, context_summary, options_json, timeout_hours),
+            )
+            clarification_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                UPDATE workflow_runs
+                SET waiting_for_clarification = TRUE,
+                    active_clarification_id = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (clarification_id, run_id),
+            )
+    return clarification_id
+
+
+def mark_clarification_answered(clarification_id: int, answer_text: str) -> bool:
+    """Mark a clarification as ANSWERED. Returns True if it was PENDING."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE clarification_requests
+                SET status = 'ANSWERED', answer_text = %s, answered_at = NOW()
+                WHERE id = %s AND status = 'PENDING'
+                RETURNING run_id
+                """,
+                (answer_text, clarification_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            run_id = row[0]
+            cur.execute(
+                "UPDATE workflow_runs SET waiting_for_clarification = FALSE, updated_at = NOW() WHERE id = %s",
+                (run_id,),
+            )
+    return True
+
+
+def mark_clarification_cancelled(clarification_id: int) -> bool:
+    """Mark a clarification as CANCELLED. Returns True if it was PENDING."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE clarification_requests
+                SET status = 'CANCELLED'
+                WHERE id = %s AND status = 'PENDING'
+                RETURNING run_id
+                """,
+                (clarification_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            run_id = row[0]
+            cur.execute(
+                "UPDATE workflow_runs SET waiting_for_clarification = FALSE, updated_at = NOW() WHERE id = %s",
+                (run_id,),
+            )
+    return True
+
+
+def mark_clarification_expired(clarification_id: int) -> int | None:
+    """Mark a clarification as EXPIRED. Returns run_id if it was PENDING, else None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE clarification_requests
+                SET status = 'EXPIRED'
+                WHERE id = %s AND status = 'PENDING'
+                RETURNING run_id
+                """,
+                (clarification_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            run_id = row[0]
+            cur.execute(
+                "UPDATE workflow_runs SET waiting_for_clarification = FALSE, updated_at = NOW() WHERE id = %s",
+                (run_id,),
+            )
+            return run_id
+
+
+def get_active_clarification(run_id: int) -> dict | None:
+    """Return the active (PENDING or ANSWERED) clarification for a run, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, workflow_type, issue_key, repo_slug, context_key,
+                       question, context_summary, options_json, status, answer_text,
+                       answered_at, telegram_message_id, created_at, expires_at
+                FROM clarification_requests
+                WHERE run_id = %s AND status IN ('PENDING', 'ANSWERED')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id":                  row[0],
+        "run_id":              row[1],
+        "workflow_type":       row[2],
+        "issue_key":           row[3],
+        "repo_slug":           row[4],
+        "context_key":         row[5],
+        "question":            row[6],
+        "context_summary":     row[7],
+        "options":             json.loads(row[8]) if row[8] else None,
+        "status":              row[9],
+        "answer_text":         row[10],
+        "answered_at":         row[11].isoformat() if row[11] else None,
+        "telegram_message_id": row[12],
+        "created_at":          row[13].isoformat() if row[13] else None,
+        "expires_at":          row[14].isoformat() if row[14] else None,
+    }
+
+
+def get_clarification_by_id(clarification_id: int) -> dict | None:
+    """Return a clarification row by id, or None."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, workflow_type, issue_key, repo_slug, context_key,
+                       question, context_summary, options_json, status, answer_text,
+                       answered_at, telegram_message_id, created_at, expires_at
+                FROM clarification_requests WHERE id = %s
+                """,
+                (clarification_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id":                  row[0],
+        "run_id":              row[1],
+        "workflow_type":       row[2],
+        "issue_key":           row[3],
+        "repo_slug":           row[4],
+        "context_key":         row[5],
+        "question":            row[6],
+        "context_summary":     row[7],
+        "options":             json.loads(row[8]) if row[8] else None,
+        "status":              row[9],
+        "answer_text":         row[10],
+        "answered_at":         row[11].isoformat() if row[11] else None,
+        "telegram_message_id": row[12],
+        "created_at":          row[13].isoformat() if row[13] else None,
+        "expires_at":          row[14].isoformat() if row[14] else None,
+    }
+
+
+def get_run_state(run_id: int) -> dict | None:
+    """Return pr_url, working_branch and test fields for a run — used for review-stage resume."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pr_url, working_branch, test_status, test_command, test_output
+                FROM workflow_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "pr_url":         row[0],
+        "working_branch": row[1],
+        "test_status":    row[2],
+        "test_command":   row[3],
+        "test_output":    row[4],
+    }
+
+
+def list_pending_clarifications(limit: int = 50) -> list[dict]:
+    """Return all PENDING clarification_requests, oldest first."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, workflow_type, issue_key, repo_slug, context_key,
+                       question, context_summary, options_json, status, created_at, expires_at
+                FROM clarification_requests
+                WHERE status = 'PENDING'
+                ORDER BY id ASC LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":             r[0],
+            "run_id":         r[1],
+            "workflow_type":  r[2],
+            "issue_key":      r[3],
+            "repo_slug":      r[4],
+            "context_key":    r[5],
+            "question":       r[6],
+            "context_summary":r[7],
+            "options":        json.loads(r[8]) if r[8] else None,
+            "status":         r[9],
+            "created_at":     r[10].isoformat() if r[10] else None,
+            "expires_at":     r[11].isoformat() if r[11] else None,
+        }
+        for r in rows
+    ]
+
+
+def expire_stale_clarifications() -> list[int]:
+    """Mark PENDING clarifications past their expires_at as EXPIRED and fail their runs.
+
+    Returns list of expired run_ids.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE clarification_requests
+                SET status = 'EXPIRED'
+                WHERE status = 'PENDING'
+                  AND expires_at IS NOT NULL AND expires_at < NOW()
+                RETURNING id, run_id
+                """,
+            )
+            expired_rows = cur.fetchall()
+            run_ids = []
+            for _, run_id in expired_rows:
+                cur.execute(
+                    """
+                    UPDATE workflow_runs
+                    SET waiting_for_clarification = FALSE,
+                        status = 'FAILED',
+                        error_detail = 'Clarification timed out — no answer received',
+                        completed_at = NOW(), updated_at = NOW()
+                    WHERE id = %s AND status = 'WAITING_FOR_USER_INPUT'
+                    """,
+                    (run_id,),
+                )
+                run_ids.append(run_id)
+    return run_ids
+
+
+def update_clarification_telegram_id(clarification_id: int, telegram_message_id: str) -> None:
+    """Store the Telegram message_id on a clarification after sending."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE clarification_requests SET telegram_message_id = %s WHERE id = %s",
+                (telegram_message_id, clarification_id),
+            )
+
+
+def list_clarifications(status: str | None = None, run_id: int | None = None, limit: int = 50) -> list[dict]:
+    """Return clarification_requests, optionally filtered by status and/or run_id, newest first."""
+    conditions = []
+    params: list = []
+    if status:
+        conditions.append("status = %s")
+        params.append(status)
+    if run_id is not None:
+        conditions.append("run_id = %s")
+        params.append(run_id)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, run_id, workflow_type, issue_key, repo_slug, context_key,
+                       question, context_summary, options_json, status, answer_text,
+                       answered_at, telegram_message_id, created_at, expires_at
+                FROM clarification_requests
+                {where}
+                ORDER BY id DESC LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id":                  r[0],
+            "run_id":              r[1],
+            "workflow_type":       r[2],
+            "issue_key":           r[3],
+            "repo_slug":           r[4],
+            "context_key":         r[5],
+            "question":            r[6],
+            "context_summary":     r[7],
+            "options":             json.loads(r[8]) if r[8] else None,
+            "status":              r[9],
+            "answer_text":         r[10],
+            "answered_at":         r[11].isoformat() if r[11] else None,
+            "telegram_message_id": r[12],
+            "created_at":          r[13].isoformat() if r[13] else None,
+            "expires_at":          r[14].isoformat() if r[14] else None,
         }
         for r in rows
     ]

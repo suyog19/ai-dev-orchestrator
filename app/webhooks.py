@@ -9,15 +9,110 @@ from app.database import (
     request_regeneration, create_planning_run,
     get_planning_run_for_regeneration, record_planning_feedback,
     is_paused, record_security_event,
+    mark_clarification_answered, mark_clarification_cancelled,
+    get_clarification_by_id, update_clarification_telegram_id,
 )
 from app.dispatcher import dispatch
 from app.security import check_rate_limit
-from app.telegram import send_message, parse_approval_command
+from app.telegram import send_message, parse_approval_command, parse_clarification_command, send_clarification_request
 from app.queue import enqueue
 from app.workflows import create_jira_stories_for_run
 
 logger = logging.getLogger("orchestrator")
 router = APIRouter()
+
+
+async def _handle_clarification_command(cmd: tuple, incoming_chat_id: str) -> dict:
+    """Handle ANSWER / CANCEL / CLARIFY commands from Telegram."""
+    action, clarification_id, answer_text = cmd
+
+    # Validation: clarification_id must be positive
+    if clarification_id <= 0 or clarification_id > 10_000_000:
+        logger.warning("Telegram: malformed clarification_id %s — rejected", clarification_id)
+        record_security_event(
+            event_type="telegram_rejected", source="telegram", actor=incoming_chat_id,
+            endpoint="/webhooks/telegram", method="POST", status="REJECTED",
+            details={"reason": "malformed_clarification_id", "clarification_id": clarification_id},
+        )
+        return {"ok": True}
+
+    clarification = get_clarification_by_id(clarification_id)
+    if not clarification:
+        logger.warning("Telegram: clarification_id %s not found", clarification_id)
+        send_message("clarification_error", "ERROR", f"Clarification {clarification_id} not found.")
+        return {"ok": True}
+
+    if clarification["status"] not in ("PENDING",):
+        logger.warning(
+            "Telegram: clarification %s status=%s — cannot act (action=%s)",
+            clarification_id, clarification["status"], action,
+        )
+        send_message(
+            "clarification_error", "ERROR",
+            f"Clarification {clarification_id} is already {clarification['status']} — cannot {action}.",
+        )
+        return {"ok": True}
+
+    if action == "ANSWER":
+        if not answer_text or not answer_text.strip():
+            logger.warning("Telegram: ANSWER %s has empty answer_text — rejected", clarification_id)
+            record_security_event(
+                event_type="telegram_rejected", source="telegram", actor=incoming_chat_id,
+                endpoint="/webhooks/telegram", method="POST", status="REJECTED",
+                details={"reason": "empty_answer", "clarification_id": clarification_id},
+            )
+            send_message("clarification_error", "ERROR", f"ANSWER {clarification_id}: answer text is empty.")
+            return {"ok": True}
+
+        ok = mark_clarification_answered(clarification_id, answer_text.strip())
+        if ok:
+            logger.info("Clarification %s answered (run_id=%s)", clarification_id, clarification["run_id"])
+            send_message(
+                "clarification_answered", "ANSWERED",
+                f"Clarification {clarification_id} answered.\n"
+                f"Run {clarification['run_id']} will resume shortly.",
+            )
+            # Resume the workflow
+            try:
+                from app.clarification import resume_workflow_after_clarification
+                resume_workflow_after_clarification(clarification["run_id"])
+            except Exception as exc:
+                logger.error("Failed to resume workflow after clarification: %s", exc)
+                send_message("clarification_resume_error", "ERROR", f"Run {clarification['run_id']}: resume failed — {exc}")
+        else:
+            send_message("clarification_error", "ERROR", f"Clarification {clarification_id}: could not mark answered.")
+
+    elif action == "CANCEL":
+        ok = mark_clarification_cancelled(clarification_id)
+        if ok:
+            run_id = clarification["run_id"]
+            logger.info("Clarification %s cancelled (run_id=%s)", clarification_id, run_id)
+            record_security_event(
+                event_type="clarification_cancelled", source="telegram", actor=incoming_chat_id,
+                endpoint="/webhooks/telegram", method="POST", status="CANCELLED",
+                details={"clarification_id": clarification_id, "run_id": run_id},
+            )
+            # Fail the run since user explicitly cancelled
+            from app.database import fail_run
+            fail_run(run_id, f"Clarification {clarification_id} cancelled by user")
+            send_message(
+                "clarification_cancelled", "CANCELLED",
+                f"Clarification {clarification_id} cancelled.\nRun {run_id} marked FAILED.",
+            )
+        else:
+            send_message("clarification_error", "ERROR", f"Clarification {clarification_id}: could not cancel.")
+
+    elif action == "CLARIFY":
+        # Resend the question
+        msg_id = send_clarification_request(clarification)
+        if msg_id:
+            update_clarification_telegram_id(clarification_id, msg_id)
+        send_message(
+            "clarification_resent", "PENDING",
+            f"Clarification {clarification_id} question resent.",
+        )
+
+    return {"ok": True}
 
 
 @router.post("/webhooks/jira")
@@ -145,6 +240,12 @@ async def telegram_webhook(request: Request):
     if not text:
         return {"ok": True}
 
+    # --- Clarification commands: ANSWER / CANCEL / CLARIFY ---
+    clarification_cmd = parse_clarification_command(text)
+    if clarification_cmd:
+        return await _handle_clarification_command(clarification_cmd, incoming_chat_id)
+
+    # --- Planning approval commands: APPROVE / REJECT / REGENERATE ---
     cmd = parse_approval_command(text)
     if not cmd:
         logger.info("Telegram webhook: non-approval message ignored (%r)", text[:60])

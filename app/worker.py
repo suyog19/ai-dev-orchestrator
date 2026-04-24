@@ -16,10 +16,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("worker")
 
-from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback
+from app.database import init_db, get_conn, fail_run, update_run_step, recover_stale_runs, record_execution_feedback, expire_stale_clarifications
 from app.queue import dequeue, queue_length
 from app.telegram import send_message
 from app.workflows import story_implementation, epic_breakdown
+from app.clarification import ClarificationRequested
 
 WORKFLOW_HANDLERS = {
     "story_implementation": story_implementation,
@@ -65,6 +66,17 @@ def _execute(job: dict):
 
         try:
             handler(run_id, issue_key, issue_type, summary)
+        except ClarificationRequested as cr:
+            # Workflow paused for user input — status already set to WAITING_FOR_USER_INPUT
+            logger.info(
+                "Workflow WAITING_FOR_USER_INPUT: %s (run_id=%s) — clarification_id=%s",
+                workflow_type, run_id, cr.clarification_id,
+            )
+            send_message(
+                "clarification_requested", "WAITING_FOR_USER_INPUT",
+                f"{issue_key}: waiting for answer to clarification {cr.clarification_id}",
+            )
+            return
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
             logger.error("Workflow FAILED: %s (run_id=%s) — %s", workflow_type, run_id, error_msg)
@@ -87,7 +99,7 @@ def _execute(job: dict):
             with conn.cursor() as cur:
                 cur.execute("SELECT status FROM workflow_runs WHERE id=%s", (run_id,))
                 row = cur.fetchone()
-        if row and row[0] in ("FAILED", "WAITING_FOR_APPROVAL"):
+        if row and row[0] in ("FAILED", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER_INPUT"):
             logger.info(
                 "Workflow handler set terminal status %s (run_id=%s) — not overwriting with COMPLETED",
                 row[0], run_id,
@@ -114,6 +126,14 @@ def main():
     else:
         logger.info("Startup recovery: no stale runs found")
 
+    expired_runs = expire_stale_clarifications()
+    if expired_runs:
+        logger.warning("Startup recovery: expired %d stale clarification(s) for runs %s", len(expired_runs), expired_runs)
+        send_message("startup", "RECOVERY", f"{len(expired_runs)} stale clarification(s) expired and their runs failed")
+
+    _EXPIRY_CHECK_INTERVAL = 720  # ~1 hour at 5s per loop iteration
+    _loop_count = 0
+
     while True:
         try:
             job = dequeue(timeout=5)
@@ -123,6 +143,18 @@ def main():
                     logger.info("%s job(s) still waiting in queue", pending)
                     send_message("queue", "WAITING", f"{pending} job(s) pending in queue")
                 threading.Thread(target=_execute, args=(job,), daemon=True).start()
+
+            # Periodic stale clarification expiry (every ~1 hour)
+            _loop_count += 1
+            if _loop_count % _EXPIRY_CHECK_INTERVAL == 0:
+                try:
+                    expired = expire_stale_clarifications()
+                    if expired:
+                        logger.warning("Periodic expiry: expired %d stale clarification(s) for runs %s", len(expired), expired)
+                        send_message("clarification_expiry", "RECOVERY", f"{len(expired)} stale clarification(s) expired")
+                except Exception as expiry_exc:
+                    logger.error("Periodic expiry check failed: %s", expiry_exc)
+
         except Exception as exc:
             logger.error("Worker error: %s", exc)
             time.sleep(2)

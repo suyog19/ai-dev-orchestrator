@@ -185,6 +185,18 @@ def get_branch_protection(repo_name: str, branch: str = "main") -> dict:
     }
 
 
+def get_pr_diff(repo_name: str, pr_number: int) -> str:
+    """Fetch the unified diff for a GitHub PR (used for review resume after clarification)."""
+    slug = _normalize_slug(repo_name)
+    response = requests.get(
+        f"{GITHUB_API}/repos/{slug}/pulls/{pr_number}",
+        headers={**_headers(), "Accept": "application/vnd.github.v3.diff"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.text
+
+
 def merge_pull_request(repo_name: str, pr_number: int, commit_title: str) -> dict:
     """Squash-merge a PR. Returns {"sha": str, "merged": bool, "message": str}.
 
