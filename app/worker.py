@@ -131,6 +131,9 @@ def main():
         logger.warning("Startup recovery: expired %d stale clarification(s) for runs %s", len(expired_runs), expired_runs)
         send_message("startup", "RECOVERY", f"{len(expired_runs)} stale clarification(s) expired and their runs failed")
 
+    _EXPIRY_CHECK_INTERVAL = 720  # ~1 hour at 5s per loop iteration
+    _loop_count = 0
+
     while True:
         try:
             job = dequeue(timeout=5)
@@ -140,6 +143,18 @@ def main():
                     logger.info("%s job(s) still waiting in queue", pending)
                     send_message("queue", "WAITING", f"{pending} job(s) pending in queue")
                 threading.Thread(target=_execute, args=(job,), daemon=True).start()
+
+            # Periodic stale clarification expiry (every ~1 hour)
+            _loop_count += 1
+            if _loop_count % _EXPIRY_CHECK_INTERVAL == 0:
+                try:
+                    expired = expire_stale_clarifications()
+                    if expired:
+                        logger.warning("Periodic expiry: expired %d stale clarification(s) for runs %s", len(expired), expired)
+                        send_message("clarification_expiry", "RECOVERY", f"{len(expired)} stale clarification(s) expired")
+                except Exception as expiry_exc:
+                    logger.error("Periodic expiry check failed: %s", expiry_exc)
+
         except Exception as exc:
             logger.error("Worker error: %s", exc)
             time.sleep(2)
