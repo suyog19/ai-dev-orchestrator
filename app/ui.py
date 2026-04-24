@@ -811,11 +811,21 @@ async def ui_project_detail(request: Request, repo_slug: str):
     except _LoginRedirect as exc:
         return redirect_to_login(exc.next_url)
 
-    from app.database import list_onboarding_runs, list_knowledge_snapshots, get_active_capability_profile
+    from app.database import (
+        list_onboarding_runs, get_onboarding_run, list_knowledge_snapshots,
+        get_active_capability_profile, get_deployment_profile,
+    )
     runs = list_onboarding_runs(repo_slug=repo_slug, limit=10)
     snapshots = list_knowledge_snapshots(repo_slug=repo_slug)
-    latest_run = runs[0] if runs else None
     capability_profile = get_active_capability_profile(repo_slug)
+    deployment_profile = get_deployment_profile(repo_slug, environment="dev")
+
+    # Get full detail for latest run (includes architecture_summary, structure_scan_json, etc.)
+    latest_run = None
+    if runs:
+        latest_run = get_onboarding_run(runs[0]["id"])
+
+    snaps_by_kind = {s["snapshot_kind"]: s for s in snapshots}
 
     return templates.TemplateResponse("admin/project_detail.html", {
         "request": request,
@@ -826,6 +836,7 @@ async def ui_project_detail(request: Request, repo_slug: str):
         "runs": runs,
         "latest_run": latest_run,
         "snapshots": snapshots,
-        "snapshots_by_kind": {s["snapshot_kind"]: s for s in snapshots},
+        "snapshots_by_kind": snaps_by_kind,
         "capability_profile": capability_profile,
+        "deployment_profile": deployment_profile,
     })
