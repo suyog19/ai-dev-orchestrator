@@ -4010,6 +4010,26 @@ def get_knowledge_snapshot(repo_slug: str, snapshot_kind: str) -> dict | None:
     }
 
 
+def count_completed_workflow_runs_for_repo(repo_slug: str) -> int:
+    """Count completed story_implementation runs for a repo (for first-use mode check)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM workflow_runs wr
+                JOIN repo_mappings rm
+                  ON wr.issue_key LIKE rm.jira_project_key || '-%'
+                WHERE rm.repo_slug = %s
+                  AND rm.is_active = TRUE
+                  AND wr.workflow_type = 'story_implementation'
+                  AND wr.status = 'COMPLETED'
+                """,
+                (repo_slug,),
+            )
+            row = cur.fetchone()
+    return row[0] if row else 0
+
+
 def list_knowledge_snapshots(repo_slug: str) -> list[dict]:
     """Return all project_knowledge_snapshots for a repo."""
     with get_conn() as conn:

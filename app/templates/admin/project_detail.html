@@ -70,6 +70,19 @@
       </td>
     </tr>
     <tr>
+      <th>First-Use Mode</th>
+      <td>
+        {% if first_use_mode_active %}
+          <span class="badge badge-running">ACTIVE</span>
+          <span class="text-muted" style="font-size:0.85em">
+            — first {{ first_use_run_count }} runs require manual merge ({{ completed_run_count }}/{{ first_use_run_count }} completed)
+          </span>
+        {% else %}
+          <span class="text-muted">Inactive — sufficient completed runs</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
       <th>Recommended Action</th>
       <td>
         {% if not onboarding_completed %}

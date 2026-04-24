@@ -1,5 +1,6 @@
 import difflib
 import logging
+import os
 from datetime import datetime, timezone
 from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
@@ -581,6 +582,22 @@ def get_deployment_policy_for_profile(profile_name: str | None) -> dict:
     return _PROFILE_DEPLOYMENT_POLICY.get(profile_name or "", _DEFAULT_DEPLOYMENT_POLICY)
 
 
+def is_first_use_mode_active(repo_slug: str) -> bool:
+    """Return True if first-use safety mode applies to this repo.
+
+    Active when:
+    - FIRST_USE_MODE_ENABLED=true (default: true)
+    - Repo has fewer than FIRST_USE_RUN_COUNT completed workflow runs (default: 3)
+    """
+    enabled = os.environ.get("FIRST_USE_MODE_ENABLED", "true").lower() == "true"
+    if not enabled:
+        return False
+    threshold = int(os.environ.get("FIRST_USE_RUN_COUNT", "3"))
+    from app.database import count_completed_workflow_runs_for_repo
+    completed = count_completed_workflow_runs_for_repo(repo_slug)
+    return completed < threshold
+
+
 def evaluate_release_decision(
     mapping: dict,
     final_test_result: dict,
@@ -591,6 +608,7 @@ def evaluate_release_decision(
     build_status: str = "NOT_RUN",
     lint_status: str = "NOT_RUN",
     capability_profile: dict | None = None,
+    first_use_mode_active: bool = False,
 ) -> dict:
     """Evaluate all agent gates and return a unified release decision.
 
@@ -630,6 +648,8 @@ def evaluate_release_decision(
 
     # Soft skips — auto-merge disabled or agent concerns
     skip_reasons = []
+    if first_use_mode_active:
+        skip_reasons.append("first-use safety mode active (first N runs require manual review)")
     if not mapping.get("auto_merge_enabled"):
         skip_reasons.append("auto_merge disabled for repo")
     # Phase 15: profile policy — no auto-merge for Java/Node/unknown stacks
@@ -922,6 +942,7 @@ def _story_review_and_release(
     architecture_status = arch_verdict.get("architecture_status", ArchitectureStatus.ERROR)
 
     update_run_step(run_id, "release_gate")
+    _first_use = is_first_use_mode_active(mapping.get("repo_slug", ""))
     release = evaluate_release_decision(
         mapping=mapping,
         final_test_result=final_test_result,
@@ -929,6 +950,7 @@ def _story_review_and_release(
         review_status=review_status,
         test_quality_status=test_quality_status,
         architecture_status=architecture_status,
+        first_use_mode_active=_first_use,
     )
     update_run_field(
         run_id,
@@ -1680,6 +1702,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     architecture_status = arch_verdict.get("architecture_status", ArchitectureStatus.ERROR)
 
     update_run_step(run_id, "release_gate")
+    _first_use = is_first_use_mode_active(mapping.get("repo_slug", ""))
     release = evaluate_release_decision(
         mapping=mapping,
         final_test_result=final_test_result,
@@ -1690,6 +1713,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         build_status=_build_status,
         lint_status=_lint_status,
         capability_profile=capability_profile,
+        first_use_mode_active=_first_use,
     )
     update_run_field(
         run_id,
@@ -1698,8 +1722,8 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         release_decided_at=datetime.now(timezone.utc),
     )
     logger.info(
-        "story_implementation: release_gate — decision=%s reason=%s",
-        release["release_decision"], release["reason"],
+        "story_implementation: release_gate — decision=%s reason=%s first_use=%s",
+        release["release_decision"], release["reason"], _first_use,
     )
 
     # --- Publish GitHub commit statuses (Phase 13) ---

@@ -811,9 +811,11 @@ async def ui_project_detail(request: Request, repo_slug: str):
     except _LoginRedirect as exc:
         return redirect_to_login(exc.next_url)
 
+    import os as _os
     from app.database import (
         list_onboarding_runs, get_onboarding_run, list_knowledge_snapshots,
         get_active_capability_profile, get_deployment_profile,
+        count_completed_workflow_runs_for_repo,
     )
     from app.repo_mapping import get_all_mappings
 
@@ -837,6 +839,12 @@ async def ui_project_detail(request: Request, repo_slug: str):
     )
     onboarding_completed = any(r["status"] == "COMPLETED" for r in runs)
 
+    # First-use mode status
+    first_use_enabled = _os.environ.get("FIRST_USE_MODE_ENABLED", "true").lower() == "true"
+    first_use_run_count = int(_os.environ.get("FIRST_USE_RUN_COUNT", "3"))
+    completed_run_count = count_completed_workflow_runs_for_repo(repo_slug)
+    first_use_mode_active = first_use_enabled and completed_run_count < first_use_run_count
+
     return templates.TemplateResponse("admin/project_detail.html", {
         "request": request,
         "csrf": csrf_token(token),
@@ -852,6 +860,9 @@ async def ui_project_detail(request: Request, repo_slug: str):
         "active_mapping": active_mapping,
         "onboarding_completed": onboarding_completed,
         "activation_result": None,
+        "first_use_mode_active": first_use_mode_active,
+        "first_use_run_count": first_use_run_count,
+        "completed_run_count": completed_run_count,
     })
 
 
@@ -920,9 +931,16 @@ async def ui_activate_project(request: Request, repo_slug: str):
         if not auto_merge:
             activation_result["recommendations"].append("auto_merge is off — all PRs require manual review (safe default).")
 
+    import os as _os
+    from app.database import count_completed_workflow_runs_for_repo
     snaps_by_kind = {s["snapshot_kind"]: s for s in snapshots}
     onboarding_completed = any(r["status"] == "COMPLETED" for r in runs)
     latest_run = get_onboarding_run(runs[0]["id"]) if runs else None
+
+    first_use_enabled = _os.environ.get("FIRST_USE_MODE_ENABLED", "true").lower() == "true"
+    first_use_run_count = int(_os.environ.get("FIRST_USE_RUN_COUNT", "3"))
+    completed_run_count = count_completed_workflow_runs_for_repo(repo_slug)
+    first_use_mode_active = first_use_enabled and completed_run_count < first_use_run_count
 
     return templates.TemplateResponse("admin/project_detail.html", {
         "request": request,
@@ -939,4 +957,7 @@ async def ui_activate_project(request: Request, repo_slug: str):
         "active_mapping": active_mapping,
         "onboarding_completed": onboarding_completed,
         "activation_result": activation_result,
+        "first_use_mode_active": first_use_mode_active,
+        "first_use_run_count": first_use_run_count,
+        "completed_run_count": completed_run_count,
     })
