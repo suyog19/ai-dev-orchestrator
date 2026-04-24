@@ -8,8 +8,10 @@ from app.database import (
     get_pending_planning_run, approve_planning_run, reject_planning_run,
     request_regeneration, create_planning_run,
     get_planning_run_for_regeneration, record_planning_feedback,
+    is_paused, record_security_event,
 )
 from app.dispatcher import dispatch
+from app.security import check_rate_limit
 from app.telegram import send_message, parse_approval_command
 from app.queue import enqueue
 from app.workflows import create_jira_stories_for_run
@@ -19,7 +21,32 @@ router = APIRouter()
 
 
 @router.post("/webhooks/jira")
-async def jira_webhook(request: Request):
+async def jira_webhook(request: Request, token: str | None = None):
+    # Jira webhook secret validation (if JIRA_WEBHOOK_SECRET is configured)
+    expected_secret = os.environ.get("JIRA_WEBHOOK_SECRET", "")
+    if expected_secret:
+        if not token or token != expected_secret:
+            logger.warning(
+                "Jira webhook: invalid or missing token from %s",
+                request.client.host if request.client else "unknown",
+            )
+            record_security_event(
+                event_type="webhook_rejected",
+                source="jira",
+                actor=request.client.host if request.client else "unknown",
+                endpoint="/webhooks/jira",
+                method="POST",
+                status="REJECTED",
+                details={"reason": "invalid_token"},
+            )
+            raise HTTPException(status_code=401, detail="Invalid or missing webhook token")
+
+    # Rate limiting
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate_limit("/webhooks/jira", client_ip):
+        logger.warning("Jira webhook rate limit exceeded from %s", client_ip)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     try:
         payload = await request.json()
     except Exception:
@@ -60,6 +87,20 @@ async def jira_webhook(request: Request):
         details=f"{issue_key}: {summary}",
     )
 
+    # Pause check — log and drop the dispatch if orchestrator is paused
+    if is_paused():
+        logger.warning("Orchestrator is PAUSED — Jira webhook received but not dispatched: %s", issue_key)
+        record_security_event(
+            event_type="automation_paused_jira_blocked",
+            source="jira",
+            actor=issue_key,
+            endpoint="/webhooks/jira",
+            method="POST",
+            status="BLOCKED",
+            details={"issue_key": issue_key, "new_status": new_status},
+        )
+        return {"received": True, "processed": False, "reason": "orchestrator_paused"}
+
     dispatch(issue_type, new_status, event_id, issue_key=issue_key, summary=summary)
 
     return {"received": True, "processed": True}
@@ -81,10 +122,24 @@ async def telegram_webhook(request: Request):
     text = (message.get("text") or "").strip()
     incoming_chat_id = str(message.get("chat", {}).get("id", ""))
 
+    # Rate limiting per chat_id
+    if not check_rate_limit("/webhooks/telegram", incoming_chat_id or "unknown"):
+        logger.warning("Telegram webhook rate limit exceeded for chat %s", incoming_chat_id)
+        return {"ok": True}  # Telegram expects 200 even on rejection
+
     # Only process messages from the configured chat
     expected_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if expected_chat_id and incoming_chat_id != expected_chat_id:
-        logger.warning("Telegram webhook: message from unexpected chat %s — ignored", incoming_chat_id)
+        logger.warning("Telegram webhook: message from unexpected chat %s — rejected", incoming_chat_id)
+        record_security_event(
+            event_type="telegram_rejected",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="REJECTED",
+            details={"reason": "unexpected_chat_id"},
+        )
         return {"ok": True}
 
     if not text:
@@ -96,6 +151,35 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     action, run_id = cmd
+
+    # Sanity check run_id (must be positive and reasonable)
+    if run_id <= 0 or run_id > 10_000_000:
+        logger.warning("Telegram webhook: malformed run_id %s in command %s — rejected", run_id, action)
+        record_security_event(
+            event_type="telegram_rejected",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="REJECTED",
+            details={"reason": "malformed_run_id", "run_id": run_id, "action": action},
+        )
+        return {"ok": True}
+
+    # Pause check — block approval commands when paused
+    if is_paused():
+        logger.warning("Orchestrator is PAUSED — Telegram command blocked: %s %s", action, run_id)
+        record_security_event(
+            event_type="automation_paused_telegram_blocked",
+            source="telegram",
+            actor=incoming_chat_id,
+            endpoint="/webhooks/telegram",
+            method="POST",
+            status="BLOCKED",
+            details={"action": action, "run_id": run_id},
+        )
+        send_message("control", "PAUSED", f"Command {action} {run_id} blocked — orchestrator is paused.")
+        return {"ok": True}
     logger.info("Telegram approval command received: %s %s", action, run_id)
 
     # REGENERATE accepts both pending and completed runs; APPROVE/REJECT only accept pending.

@@ -3,10 +3,13 @@ import json
 import logging
 import sys
 from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel
+
+from app.security import admin_key_middleware
 
 from app.database import (
     init_db, get_conn,
@@ -16,6 +19,8 @@ from app.database import (
     list_agent_reviews,
     list_test_quality_reviews,
     list_architecture_reviews,
+    list_security_events,
+    get_all_control_flags, set_control_flag, record_security_event, is_paused,
 )
 from app.telegram import send_message
 from app.webhooks import router as webhooks_router
@@ -41,6 +46,7 @@ logger = logging.getLogger("orchestrator")
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="AI Dev Orchestrator", version="0.2.0")
+app.add_middleware(BaseHTTPMiddleware, dispatch=admin_key_middleware)
 app.include_router(webhooks_router)
 
 
@@ -697,3 +703,73 @@ def recompute_memory(scope_type: str, scope_key: str):
         status_code=400,
         detail=f"Unsupported scope_type '{scope_type}'. Use 'repo' or 'epic'.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin — Security events inspection
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/security-events")
+def get_security_events(
+    event_type: str | None = None,
+    source: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List security audit events. Protected by admin key. Filter by event_type, source, status."""
+    return list_security_events(event_type=event_type, source=source, status=status, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Admin — Emergency pause / resume / control status
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/control-status")
+def get_control_status():
+    """Return current runtime control flags."""
+    flags = get_all_control_flags()
+    return {"paused": is_paused(), "flags": flags}
+
+
+@app.post("/admin/pause", status_code=200)
+def pause_orchestrator(request: Request):
+    """Pause automation — blocks new Jira workflows and Telegram commands."""
+    set_control_flag("orchestrator_paused", "true")
+    actor = request.client.host if request.client else "unknown"
+    record_security_event(
+        event_type="automation_paused",
+        source="http",
+        actor=actor,
+        endpoint="/admin/pause",
+        method="POST",
+        status="PAUSED",
+    )
+    logger.warning("Orchestrator PAUSED by %s", actor)
+    return {"paused": True, "message": "Orchestrator is now paused. New workflows and Telegram commands will be blocked."}
+
+
+@app.get("/admin/github/branch-protection")
+def audit_branch_protection(repo_slug: str, branch: str = "main"):
+    """Fetch GitHub branch protection rules for the given repo and branch."""
+    from app.github_api import get_branch_protection
+    try:
+        return get_branch_protection(repo_slug, branch)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub API error: {exc}")
+
+
+@app.post("/admin/resume", status_code=200)
+def resume_orchestrator(request: Request):
+    """Resume automation — re-enables Jira workflows and Telegram commands."""
+    set_control_flag("orchestrator_paused", "false")
+    actor = request.client.host if request.client else "unknown"
+    record_security_event(
+        event_type="automation_resumed",
+        source="http",
+        actor=actor,
+        endpoint="/admin/resume",
+        method="POST",
+        status="RESUMED",
+    )
+    logger.info("Orchestrator RESUMED by %s", actor)
+    return {"paused": False, "message": "Orchestrator is now running. New workflows will be accepted."}
