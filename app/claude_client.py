@@ -986,6 +986,16 @@ def review_test_quality(
     output_excerpt = (test_context.get("output_excerpt") or "").strip()
     output_lines = "\n".join(f"    {ln}" for ln in output_excerpt.splitlines()[-30:])
     skipped_flag = "YES" if test_context.get("skipped_tests_detected") else "NO"
+    profile_name = test_context.get("profile_name") or "python_fastapi"
+
+    # Phase 15: stack-aware test conventions hint
+    _STACK_TEST_HINTS = {
+        "java_maven":   "JUnit 4/5 (annotations: @Test, @Disabled, @Ignore; assertions: assertEquals, assertThat)",
+        "java_gradle":  "JUnit 4/5 (annotations: @Test, @Disabled, @Ignore; assertions: assertEquals, assertThat)",
+        "node_react":   "Jest or Vitest (it(), test(), describe(), expect(); skip: it.skip, xtest, describe.skip)",
+        "python_fastapi": "pytest (def test_*, @pytest.mark.skip, pytest.raises, assert)",
+    }
+    stack_hint = _STACK_TEST_HINTS.get(profile_name, "unknown stack — use generic best practices")
 
     diff_trimmed = (diff_context.get("full_diff") or "").strip()
     if len(diff_trimmed) > 8000:
@@ -998,6 +1008,7 @@ def review_test_quality(
 
     user_content = (
         f"{story_block}\n\n"
+        f"Repo stack: {profile_name} — {stack_hint}\n\n"
         f"PR #{pr_context.get('number', '')} — {pr_context.get('title', '')}\n"
         f"PR URL: {pr_context.get('url', '')}\n"
         f"PR body:\n{pr_body or '  (none)'}\n\n"
@@ -1013,7 +1024,8 @@ def review_test_quality(
         f"  Output (last 30 lines):\n{output_lines or '    (none)'}\n\n"
         f"Unified diff:\n```\n{diff_trimmed}\n```\n\n"
         f"{memory_block}"
-        f"Assess the test quality and call submit_test_quality_review with your structured verdict."
+        f"Assess the test quality using {profile_name} conventions "
+        f"and call submit_test_quality_review with your structured verdict."
     )
 
     response = _CLIENT.messages.create(

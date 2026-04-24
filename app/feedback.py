@@ -196,6 +196,51 @@ GITHUB_REQUIRED_CHECK = GitHubStatusContext.RELEASE_GATE
 MEMORY_MAX_BULLETS = 5
 MEMORY_MAX_CHARS   = 1000
 
+# Phase 15 — Multi-Stack Capability Profiles
+
+class CapabilityProfile:
+    PYTHON_FASTAPI  = "python_fastapi"
+    JAVA_MAVEN      = "java_maven"
+    JAVA_GRADLE     = "java_gradle"
+    NODE_REACT      = "node_react"
+    GENERIC_UNKNOWN = "generic_unknown"
+
+
+class CommandStatus:
+    PASSED  = "PASSED"
+    FAILED  = "FAILED"
+    NOT_RUN = "NOT_RUN"
+    ERROR   = "ERROR"
+
+
+class BuildStatus:
+    PASSED  = "PASSED"
+    FAILED  = "FAILED"
+    NOT_RUN = "NOT_RUN"
+    ERROR   = "ERROR"
+
+
+class LintStatus:
+    PASSED  = "PASSED"
+    FAILED  = "FAILED"
+    NOT_RUN = "NOT_RUN"
+    ERROR   = "ERROR"
+
+
+class DependencyInstallStatus:
+    PASSED  = "PASSED"
+    FAILED  = "FAILED"
+    NOT_RUN = "NOT_RUN"
+    ERROR   = "ERROR"
+
+
+# Phase 15 feedback types
+class FeedbackTypeP15:
+    CAPABILITY_PROFILE      = "capability_profile"
+    BUILD_STATUS            = "build_status"
+    LINT_STATUS             = "lint_status"
+    DEPENDENCY_INSTALL      = "dependency_install_status"
+
 
 def categorize_execution_failure(
     test_status: str | None,

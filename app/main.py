@@ -29,6 +29,7 @@ from app.ui import router as ui_router
 from app.repo_mapping import get_all_mappings, get_mapping_by_id, add_mapping, update_mapping, disable_mapping
 from app.database import add_manual_memory, generate_repo_memory_snapshot
 from app.database import list_github_status_updates, find_runs_eligible_for_status_backfill, get_overview_stats
+from app.database import list_capability_profiles, get_active_capability_profile
 
 load_dotenv()
 
@@ -1040,3 +1041,24 @@ def resume_orchestrator(request: Request):
     )
     logger.info("Orchestrator RESUMED by %s", actor)
     return {"paused": False, "message": "Orchestrator is now running. New workflows will be accepted."}
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 — Capability profiles
+# ---------------------------------------------------------------------------
+
+@app.get("/debug/repo-capability-profiles")
+def list_repo_capability_profiles(repo_slug: str | None = None):
+    """List capability profiles. Optionally filter by repo_slug."""
+    profiles = list_capability_profiles(repo_slug=repo_slug)
+    return {"profiles": profiles, "count": len(profiles)}
+
+
+@app.get("/debug/repo-capability-profiles/{repo_slug:path}")
+def get_repo_capability_profile(repo_slug: str):
+    """Return the active capability profile for a repo_slug."""
+    profile = get_active_capability_profile(repo_slug)
+    if not profile:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"No active profile for {repo_slug}")
+    return profile

@@ -22,7 +22,9 @@ from app.database import (
     store_architecture_review,
     get_active_clarification,
     get_run_state,
+    upsert_capability_profile,
 )
+from app.repo_profiler import detect_repo_capability_profile
 from app.feedback import ReviewStatus, TestQualityStatus, ArchitectureStatus, ReleaseDecision, ClarificationContextKey
 from app.test_runner import run_tests
 from app.security import ensure_github_writes_allowed
@@ -122,19 +124,34 @@ def _format_review_comment(verdict: dict) -> str:
 _TEST_FILE_PATTERNS = ("tests/", "test_", "_test.py", "/test")
 
 def _is_test_file(path: str) -> bool:
-    """Return True if a file path looks like a test file."""
-    return any(p in path for p in _TEST_FILE_PATTERNS)
+    """Return True if a file path looks like a test file (legacy — no profile context)."""
+    return any(p in path for p in _PYTHON_TEST_PATTERNS)
 
 
-_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", ".skip(", "skipTest(")
+# Phase 10 (Python) + Phase 15 (Java/Node) skip patterns
+_PYTHON_SKIP_PATTERNS = ("@pytest.mark.skip", "pytest.skip(", "skipTest(")
+_JAVA_SKIP_PATTERNS   = ("@Disabled", "@Ignore", "@IgnoreRest")
+_NODE_SKIP_PATTERNS   = ("it.skip(", "test.skip(", "describe.skip(", "xit(", "xdescribe(", "xtest(", ".todo(")
+_SKIP_PATTERNS = _PYTHON_SKIP_PATTERNS + _JAVA_SKIP_PATTERNS + _NODE_SKIP_PATTERNS
 
-def _detect_skipped_tests(diff: str, test_output: str) -> bool:
-    """Return True if skipped tests are detected in the diff or test output."""
+
+def _detect_skipped_tests(diff: str, test_output: str, profile_name: str | None = None) -> bool:
+    """Return True if skipped tests are detected in the diff or test output.
+
+    Uses profile-aware patterns: adds Java (@Disabled/@Ignore) and Node (it.skip, xtest, etc.)
+    patterns on top of the base Python patterns. The 'skipped' keyword check is preserved
+    for test runner output that already reports skipped counts.
+    """
     combined = (diff or "") + (test_output or "")
-    lower = combined.lower()
-    if "skipped" in lower:
+    if profile_name in ("java_maven", "java_gradle"):
+        patterns = _PYTHON_SKIP_PATTERNS + _JAVA_SKIP_PATTERNS
+    elif profile_name == "node_react":
+        patterns = _PYTHON_SKIP_PATTERNS + _NODE_SKIP_PATTERNS
+    else:
+        patterns = _PYTHON_SKIP_PATTERNS
+    if "skipped" in combined.lower():
         return True
-    return any(p in combined for p in _SKIP_PATTERNS)
+    return any(p in combined for p in patterns)
 
 
 def _build_test_quality_package(
@@ -148,6 +165,7 @@ def _build_test_quality_package(
     final_test_result: dict,
     retry_count: int,
     execution_memory: str,
+    profile_name: str | None = None,
 ) -> dict:
     """Assemble the full context package for the Test Quality Agent.
 
@@ -155,12 +173,12 @@ def _build_test_quality_package(
     No Claude call, no DB write, no secrets included.
     """
     all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
-    source_files = [f for f in all_files if not _is_test_file(f)]
-    test_files = [f for f in all_files if _is_test_file(f)]
+    source_files = [f for f in all_files if not _is_test_file(f, profile_name)]
+    test_files = [f for f in all_files if _is_test_file(f, profile_name)]
 
     output = (final_test_result.get("output") or "").strip()
     output_excerpt = "\n".join(output.splitlines()[-30:]) if output else ""
-    skipped = _detect_skipped_tests(diff_block, output)
+    skipped = _detect_skipped_tests(diff_block, output, profile_name)
 
     return {
         "story_context": {
@@ -185,6 +203,7 @@ def _build_test_quality_package(
             "output_excerpt": output_excerpt,
             "test_files_changed": test_files,
             "skipped_tests_detected": skipped,
+            "profile_name": profile_name or "python_fastapi",
         },
         "implementation_context": {
             "files_changed_count": len(all_files),
@@ -235,7 +254,7 @@ def _format_test_quality_comment(verdict: dict) -> str:
     )
 
 
-# --- Architecture / Impact Agent helpers (Phase 10) ---
+# --- Architecture / Impact Agent helpers (Phase 10 + Phase 15 profile-aware) ---
 
 _API_PATTERNS     = ("main.py", "routes", "router", "endpoints", "api", "views")
 _MODEL_PATTERNS   = ("model", "schema", "models", "schemas", "entity")
@@ -243,15 +262,98 @@ _STORAGE_PATTERNS = ("database", "db", "migration", "alembic", "repository", "re
 _CONFIG_PATTERNS  = (".env", "config", "settings", "constants")
 _DOC_PATTERNS     = ("readme", ".md", "docs/", "changelog")
 
+# Phase 15: Java-specific classification patterns
+_JAVA_BUILD_PATTERNS      = ("pom.xml", "build.gradle", "settings.gradle", "gradlew", "Makefile")
+_JAVA_CONTROLLER_PATTERNS = ("Controller",)
+_JAVA_SERVICE_PATTERNS    = ("Service", "ServiceImpl")
+_JAVA_REPO_PATTERNS       = ("Repository", "Dao", "Mapper")
+_JAVA_ENTITY_PATTERNS     = ("Entity", "Model", "Dto", "Request", "Response")
+_JAVA_CONFIG_PATTERNS     = ("Config", "Configuration", "Properties", "application.yml", "application.properties")
 
-def _classify_changed_files(files: list[str]) -> dict:
-    """Group changed files by architectural layer for the Architecture Agent."""
+# Phase 15: Node/React-specific classification patterns (lowercased for .lower() matching)
+_NODE_BUILD_PATTERNS   = ("package.json", "yarn.lock", "pnpm-lock", "package-lock", ".lock")
+_NODE_STATE_PATTERNS   = ("store", "slice", "context", "redux", "zustand", "recoil", "atom")
+_NODE_HOOK_PATTERNS    = ("/hooks/", "/hook/")
+_NODE_ROUTE_PATTERNS   = ("/routes/", "/route/", "/pages/", "/page/", "router")
+_NODE_API_PATTERNS     = ("/api/", "/services/", "/service/", "client", "fetch", "axios")
+_NODE_CONFIG_PATTERNS  = (".env", "vite.config", "tsconfig", "next.config", "jest.config", "vitest.config", ".eslintrc")
+
+# Phase 15: Profile-aware test file patterns
+_JAVA_TEST_PATTERNS   = ("src/test/", "Test.java", "Tests.java", "IT.java", "Spec.java")
+_NODE_TEST_PATTERNS   = (".test.ts", ".test.tsx", ".test.js", ".spec.ts", ".spec.tsx", ".spec.js", "__tests__/")
+_PYTHON_TEST_PATTERNS = ("tests/", "test_", "_test.py", "/test")
+
+
+def _is_test_file(path: str, profile_name: str | None = None) -> bool:
+    """Return True if a file path looks like a test file, using profile-aware patterns."""
+    if profile_name in ("java_maven", "java_gradle"):
+        return any(p in path for p in _JAVA_TEST_PATTERNS)
+    if profile_name == "node_react":
+        return any(p in path for p in _NODE_TEST_PATTERNS)
+    return any(p in path for p in _PYTHON_TEST_PATTERNS)
+
+
+def _classify_java_files(files: list[str]) -> dict:
+    """Classify changed files using Java layer patterns."""
+    groups: dict[str, list[str]] = {
+        "controller": [], "service": [], "repository": [], "entity": [], "config": [], "test": [], "build": [], "other": [],
+    }
+    for f in files:
+        if _is_test_file(f, "java_maven"):
+            groups["test"].append(f)
+        elif any(p in f for p in _JAVA_BUILD_PATTERNS):
+            groups["build"].append(f)
+        elif any(p in f for p in _JAVA_CONTROLLER_PATTERNS):
+            groups["controller"].append(f)
+        elif any(p in f for p in _JAVA_SERVICE_PATTERNS):
+            groups["service"].append(f)
+        elif any(p in f for p in _JAVA_REPO_PATTERNS):
+            groups["repository"].append(f)
+        elif any(p in f for p in _JAVA_ENTITY_PATTERNS):
+            groups["entity"].append(f)
+        elif any(p in f for p in _JAVA_CONFIG_PATTERNS):
+            groups["config"].append(f)
+        else:
+            groups["other"].append(f)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _classify_node_files(files: list[str]) -> dict:
+    """Classify changed files using Node/React layer patterns."""
+    groups: dict[str, list[str]] = {
+        "component": [], "hook": [], "route": [], "state": [], "api": [], "config": [], "test": [], "build": [], "other": [],
+    }
+    for f in files:
+        fl = f.lower()
+        if _is_test_file(f, "node_react"):
+            groups["test"].append(f)
+        elif any(p in fl for p in _NODE_BUILD_PATTERNS):
+            groups["build"].append(f)
+        elif any(p in fl for p in _NODE_STATE_PATTERNS):
+            groups["state"].append(f)
+        elif any(p in fl for p in _NODE_HOOK_PATTERNS):
+            groups["hook"].append(f)
+        elif any(p in fl for p in _NODE_ROUTE_PATTERNS):
+            groups["route"].append(f)
+        elif any(p in fl for p in _NODE_API_PATTERNS):
+            groups["api"].append(f)
+        elif any(p in fl for p in _NODE_CONFIG_PATTERNS):
+            groups["config"].append(f)
+        elif f.endswith((".tsx", ".jsx")):
+            groups["component"].append(f)
+        else:
+            groups["other"].append(f)
+    return {k: v for k, v in groups.items() if v}
+
+
+def _classify_python_files(files: list[str]) -> dict:
+    """Classify changed files using Python/FastAPI layer patterns."""
     groups: dict[str, list[str]] = {
         "api": [], "model": [], "storage": [], "config": [], "test": [], "docs": [], "other": [],
     }
     for f in files:
         fl = f.lower()
-        if _is_test_file(f):
+        if _is_test_file(f, "python_fastapi"):
             groups["test"].append(f)
         elif any(p in fl for p in _DOC_PATTERNS):
             groups["docs"].append(f)
@@ -268,6 +370,19 @@ def _classify_changed_files(files: list[str]) -> dict:
     return {k: v for k, v in groups.items() if v}
 
 
+def _classify_changed_files(files: list[str], profile_name: str | None = None) -> dict:
+    """Group changed files by architectural layer, profile-aware (Phase 15).
+
+    Routes to stack-specific classification for java_* and node_react profiles;
+    falls back to the original Python/FastAPI classification for everything else.
+    """
+    if profile_name in ("java_maven", "java_gradle"):
+        return _classify_java_files(files)
+    if profile_name == "node_react":
+        return _classify_node_files(files)
+    return _classify_python_files(files)
+
+
 def _build_architecture_review_package(
     issue_key: str,
     summary: str,
@@ -282,6 +397,7 @@ def _build_architecture_review_package(
     retry_count: int,
     execution_memory: str,
     repo_analysis: dict,
+    profile_name: str | None = None,
 ) -> dict:
     """Assemble context for the Architecture Agent.
 
@@ -291,6 +407,7 @@ def _build_architecture_review_package(
     all_files = [ch.get("file", "") for ch in final_changes if ch.get("file")]
     lang = repo_analysis.get("primary_language", "unknown")
     framework = repo_analysis.get("framework", "unknown")
+    file_classification = _classify_changed_files(all_files, profile_name)
 
     return {
         "story_context": {
@@ -303,6 +420,7 @@ def _build_architecture_review_package(
             "repo_slug": mapping.get("repo_slug", ""),
             "primary_language": lang,
             "framework": framework,
+            "profile_name": profile_name or "python_fastapi",
         },
         "pr_context": {
             "number": pr["number"],
@@ -313,6 +431,7 @@ def _build_architecture_review_package(
         "diff_context": {
             "full_diff": diff_block,
             "changed_files": all_files,
+            "file_classification": file_classification,
         },
         "signal_context": {
             "test_status": final_test_result["status"],
@@ -428,6 +547,21 @@ def _build_test_section(test_result: dict, attempt: int = 1) -> str:
     return f"## {label}\n- Tests not run (no supported test framework detected)\n"
 
 
+# Phase 15 — per-profile release gate policies
+# allow_auto_merge: if False, auto-merge is always skipped regardless of agent verdicts
+# require_tests:    if True, NOT_RUN tests = skip; if False, NOT_RUN is acceptable
+# require_build:    if True, NOT_RUN build = skip; FAILED is always a hard block regardless
+# require_lint:     if True, NOT_RUN lint = skip; FAILED is always a soft skip regardless
+_PROFILE_RELEASE_POLICY: dict[str, dict] = {
+    "python_fastapi":  {"allow_auto_merge": True,  "require_tests": True,  "require_build": False, "require_lint": False},
+    "java_maven":      {"allow_auto_merge": False, "require_tests": True,  "require_build": True,  "require_lint": False},
+    "java_gradle":     {"allow_auto_merge": False, "require_tests": True,  "require_build": True,  "require_lint": False},
+    "node_react":      {"allow_auto_merge": False, "require_tests": False, "require_build": True,  "require_lint": False},
+    "generic_unknown": {"allow_auto_merge": False, "require_tests": False, "require_build": False, "require_lint": False},
+}
+_DEFAULT_PROFILE_POLICY: dict = {"allow_auto_merge": True, "require_tests": True, "require_build": False, "require_lint": False}
+
+
 def evaluate_release_decision(
     mapping: dict,
     final_test_result: dict,
@@ -435,6 +569,9 @@ def evaluate_release_decision(
     review_status: str,
     test_quality_status: str,
     architecture_status: str,
+    build_status: str = "NOT_RUN",
+    lint_status: str = "NOT_RUN",
+    capability_profile: dict | None = None,
 ) -> dict:
     """Evaluate all agent gates and return a unified release decision.
 
@@ -445,6 +582,9 @@ def evaluate_release_decision(
     - blocking_gates: list[str]
     - warnings: list[str]
     """
+    profile_name = (capability_profile or {}).get("profile_name") if capability_profile else None
+    policy = _PROFILE_RELEASE_POLICY.get(profile_name, _DEFAULT_PROFILE_POLICY)
+
     blocking_gates = []
     warnings = []
 
@@ -457,6 +597,8 @@ def evaluate_release_decision(
         blocking_gates.append("test quality blocking")
     if architecture_status == ArchitectureStatus.BLOCKED:
         blocking_gates.append("architecture blocked")
+    if build_status == "FAILED":
+        blocking_gates.append("build failed")
 
     if blocking_gates:
         return {
@@ -471,8 +613,19 @@ def evaluate_release_decision(
     skip_reasons = []
     if not mapping.get("auto_merge_enabled"):
         skip_reasons.append("auto_merge disabled for repo")
-    if final_test_result.get("status") not in ("PASSED",):
-        skip_reasons.append(f"tests {final_test_result.get('status', 'NOT_RUN')}")
+    # Phase 15: profile policy — no auto-merge for Java/Node/unknown stacks
+    if not policy["allow_auto_merge"] and profile_name:
+        skip_reasons.append(f"profile policy: no auto-merge for {profile_name}")
+        warnings.append(f"auto-merge disabled by profile policy ({profile_name})")
+
+    # Tests: profile controls whether NOT_RUN is acceptable
+    test_status = final_test_result.get("status", "NOT_RUN")
+    if test_status not in ("PASSED",):
+        if test_status == "NOT_RUN" and not policy["require_tests"]:
+            pass  # tests not required for this profile — NOT_RUN is acceptable
+        else:
+            skip_reasons.append(f"tests {test_status}")
+
     if not applied.get("applied", False):
         skip_reasons.append("fallback apply used")
     if applied.get("count", 0) > MAX_FILES_FOR_AUTOMERGE:
@@ -491,6 +644,12 @@ def evaluate_release_decision(
         warnings.append("architecture needs human review")
     elif architecture_status not in (ArchitectureStatus.APPROVED,):
         skip_reasons.append(f"architecture status: {architecture_status}")
+    # Phase 15: build NOT_RUN when profile requires build
+    if policy["require_build"] and build_status == "NOT_RUN" and profile_name:
+        skip_reasons.append(f"build NOT_RUN (required for {profile_name})")
+    # Phase 15: lint failure is a soft skip
+    if lint_status == "FAILED":
+        skip_reasons.append("lint failed")
 
     if skip_reasons:
         return {
@@ -749,6 +908,19 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("repo_analysis", "COMPLETE", telegram_summary)
     logger.info("story_implementation: analysis sent to Telegram")
 
+    # Phase 15 — detect and persist capability profile (non-fatal)
+    capability_profile: dict = {}
+    try:
+        capability_profile = detect_repo_capability_profile(repo_path, mapping["repo_slug"])
+        upsert_capability_profile(mapping["repo_slug"], capability_profile)
+        update_run_field(run_id, capability_profile_name=capability_profile.get("profile_name"))
+        logger.info(
+            "story_implementation: capability profile=%s for %s",
+            capability_profile.get("profile_name"), mapping["repo_slug"],
+        )
+    except Exception as prof_exc:
+        logger.warning("story_implementation: profile detection failed (non-fatal): %s", prof_exc)
+
     update_run_step(run_id, "summarizing")
     claude_summary = summarize_repo(repo_path, mapping["repo_slug"], analysis)
     send_message("claude_summary", "COMPLETE", f"{issue_key}:\n{claude_summary}")
@@ -824,14 +996,21 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
     send_message("file_apply", "COMPLETE", f"{issue_key}: {change_detail}")
 
     # --- Attempt 1: run tests on the implementation ---
+    _profile_test_cmd = capability_profile.get("test_command") if capability_profile else None
+    _profile_name = capability_profile.get("profile_name") if capability_profile else None
     attempt_1_id = record_attempt(run_id, 1, "implement", "claude-sonnet-4-6")
     update_run_step(run_id, "testing")
-    test_result = run_tests(repo_path)
+    test_result = run_tests(
+        repo_path,
+        profile_command=_profile_test_cmd,
+        profile_name=_profile_name,
+    )
     update_run_field(
         run_id,
         test_status=test_result["status"],
         test_command=test_result["command"],
         test_output=test_result["output"],
+        dependency_install_status=test_result.get("dependency_install", "NOT_RUN"),
     )
     send_message("tests", test_result["status"], f"{issue_key}: {test_result['status']}")
     logger.info("story_implementation: tests %s", test_result["status"])
@@ -876,7 +1055,11 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         logger.info("story_implementation: fix applied — %s", fix_detail)
 
         update_run_step(run_id, "retesting")
-        retest_result = run_tests(repo_path)
+        retest_result = run_tests(
+            repo_path,
+            profile_command=_profile_test_cmd,
+            profile_name=_profile_name,
+        )
         update_run_field(
             run_id,
             test_status=retest_result["status"],
@@ -919,6 +1102,37 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         send_message("fix_attempt_passed", "COMPLETE", f"{issue_key}: fix succeeded — tests now passing")
         logger.info("story_implementation: fix attempt passed")
         final_test_result = retest_result
+
+    # --- Phase 15: Build and lint (run after tests pass, non-fatal) ---
+    _build_status = "NOT_RUN"
+    _lint_status = "NOT_RUN"
+    if capability_profile:
+        from app.repo_profiler import get_build_command_for_profile, get_lint_command_for_profile
+        from app.test_runner import run_build, run_lint
+        _build_cmd = get_build_command_for_profile(capability_profile)
+        _lint_cmd = get_lint_command_for_profile(capability_profile)
+        if _build_cmd:
+            update_run_step(run_id, "building")
+            _build_result = run_build(
+                repo_path=repo_path,
+                build_command=_build_cmd,
+                profile_name=_profile_name,
+            )
+            _build_status = _build_result["status"]
+            update_run_field(run_id, build_status=_build_status)
+            send_message("build", _build_status, f"{issue_key}: build {_build_status}")
+            logger.info("story_implementation: build %s", _build_status)
+        if _lint_cmd:
+            update_run_step(run_id, "linting")
+            _lint_result = run_lint(
+                repo_path=repo_path,
+                lint_command=_lint_cmd,
+                profile_name=_profile_name,
+            )
+            _lint_status = _lint_result["status"]
+            update_run_field(run_id, lint_status=_lint_status)
+            send_message("lint", _lint_status, f"{issue_key}: lint {_lint_status}")
+            logger.info("story_implementation: lint %s", _lint_status)
 
     # --- Commit and push ---
     suggestion_description = suggestion_summary or (changes[0].get("description", "") if changes else "") or summary
@@ -1165,6 +1379,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             final_test_result=final_test_result,
             retry_count=review_retry_count,
             execution_memory=execution_memory,
+            profile_name=_profile_name,
         )
         tq_verdict = review_test_quality(**tq_package)
         store_test_quality_review(
@@ -1243,6 +1458,7 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
             retry_count=review_retry_count,
             execution_memory=execution_memory,
             repo_analysis=analysis,
+            profile_name=_profile_name,
         )
         arch_verdict = review_architecture(**arch_package)
         store_architecture_review(
@@ -1329,6 +1545,9 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         review_status=review_status,
         test_quality_status=test_quality_status,
         architecture_status=architecture_status,
+        build_status=_build_status,
+        lint_status=_lint_status,
+        capability_profile=capability_profile,
     )
     update_run_field(
         run_id,
