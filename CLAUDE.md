@@ -66,13 +66,15 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/security.py` — admin key middleware, GitHub write guard, Redis rate limiting
 - `app/webhooks.py` — Jira and Telegram webhook receivers
 - `app/jira_client.py` — Jira REST API v3 calls; `get_issue_details()` fetches story summary + ADF-parsed description + acceptance criteria for the Reviewer Agent
-- `app/github_api.py` — GitHub API calls (PR creation, labels, merge, `post_pr_comment()`)
+- `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
 - `app/git_ops.py` — clone, commit, push
 - `app/repo_mapping.py` — CRUD for `repo_mappings` table
 - `app/test_runner.py` — runs `pytest -q` in a cloned workspace
 - `app/telegram.py` — `send_message(event_type, status, detail)` used by all workflow steps for Telegram notifications
 - `app/queue.py` — Redis queue enqueue/dequeue
 - `app/clarification.py` — clarification loop: detects vagueness/ambiguity, sends Telegram questions, suspends runs, resumes on answer
+- `app/github_status_mapper.py` — pure functions mapping internal verdicts → GitHub commit status payloads (state, description, context); one function per gate
+- `app/github_status_publisher.py` — `publish_github_statuses_for_run(run_id, repo_slug, pr_number)`: publishes all 5 statuses after Release Gate, records in DB, non-fatal on failure
 
 **Event flow:**
 ```
@@ -81,11 +83,12 @@ Jira Webhook → POST /webhooks/jira → workflow_events → Dispatcher
 
   story_implementation:
     clone repo → analyze → summarize → suggest change (+ memory) → apply
-    → run tests → [fix attempt if failed] → commit/push → PR
+    → run tests → [fix attempt if failed] → commit/push → PR (store head_sha)
     → Reviewer Agent (review_pr) → store verdict → post PR comment → Telegram
     → Test Quality Agent (review_test_quality) → store verdict → post PR comment → Telegram
     → Architecture Agent (review_architecture) → store verdict → post PR comment → Telegram
     → Unified Release Gate (evaluate_release_decision) → persist release_decision
+    → publish GitHub commit statuses (5 contexts via publish_github_statuses_for_run)
       RELEASE_APPROVED → merge
       RELEASE_BLOCKED  → BLOCKED_BY_REVIEW | BLOCKED_BY_TEST_QUALITY | BLOCKED_BY_ARCHITECTURE
       RELEASE_SKIPPED  → SKIPPED
@@ -122,6 +125,7 @@ All tables are created (and migrated) by `init_db()` in `app/database.py`. First
 | `agent_architecture_reviews` | One row per Architecture Agent verdict; FK to `workflow_runs` |
 | `security_events` | Append-only audit log of auth failures, webhook rejections, write blocks |
 | `control_flags` | Runtime control flags (paused state); DB takes precedence over env var |
+| `github_status_updates` | Append-only audit log of every GitHub commit status publish attempt; one row per gate per run per attempt |
 
 **`workflow_runs` status flow:**
 ```
@@ -136,6 +140,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 **`workflow_runs.test_quality_status` values:** `TEST_QUALITY_APPROVED` | `TESTS_WEAK` | `TESTS_BLOCKING` | `ERROR` (NULL until TQ review completes)
 **`workflow_runs.architecture_status` values:** `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` | `ARCHITECTURE_BLOCKED` | `ERROR` (NULL until arch review completes)
 **`workflow_runs.release_decision` values:** `RELEASE_APPROVED` | `RELEASE_SKIPPED` | `RELEASE_BLOCKED` (set by `evaluate_release_decision()`)
+**`workflow_runs` Phase 13 columns:** `head_sha` (fetched from GitHub after PR creation), `github_statuses_published` (bool), `github_statuses_published_at` (timestamp)
 
 **`clarification_requests.status` values:** `PENDING` | `ANSWERED` | `CANCELLED` | `EXPIRED`
 **Clarification context keys:** `pre_planning` (epic), `pre_suggest` (story implementation), `pre_review` (review agents)
@@ -187,7 +192,12 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/admin/control-status` | Current runtime control flags (paused state) |
 | POST | `/admin/pause` | Pause orchestrator — blocks Jira dispatch + Telegram commands |
 | POST | `/admin/resume` | Resume orchestrator |
-| GET | `/admin/github/branch-protection` | Audit branch protection for a repo (query: repo_slug, branch) |
+| GET | `/admin/github/branch-protection` | Audit branch protection; includes `orchestrator_check_status` (release_gate_required, missing_required) |
+| GET | `/debug/github-status-updates` | List GitHub status publish history for a run (query: run_id) |
+| GET | `/debug/workflow-runs/{run_id}/github-statuses` | Same, run-scoped path |
+| POST | `/debug/workflow-runs/{run_id}/republish-github-statuses` | Re-publish statuses idempotently (query: repo_slug) |
+| POST | `/admin/github/statuses/backfill` | Backfill statuses for recent eligible runs (body: repo_slug, limit, only_missing) |
+| POST | `/admin/github/branch-protection/validate-required-checks` | Dry-run check for required `orchestrator/release-gate` context (body: repo_slug, branch) |
 
 ## Workflow Configuration
 
@@ -312,6 +322,26 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 
 **Architecture feedback events:** `architecture_status`, `architecture_risk_level`, `architecture_approved`, `architecture_needs_review`, `architecture_blocked`
 
+### GitHub Status Publishing (Phase 13)
+
+After `evaluate_release_decision()` stores its verdict, `publish_github_statuses_for_run()` in `app/github_status_publisher.py` publishes five GitHub commit statuses using the PR's `head_sha`. Publishing is guarded by `ensure_github_writes_allowed("status", ...)` and is **non-fatal** — failures log a warning and send a Telegram alert but never abort the workflow.
+
+**Status contexts and mapping:**
+
+| Context | Internal field | success when | failure when |
+|---|---|---|---|
+| `orchestrator/tests` | `test_status` | `PASSED` | `FAILED` / `NOT_RUN` |
+| `orchestrator/reviewer-agent` | `review_status` | `APPROVED_BY_AI` | `NEEDS_CHANGES` / `BLOCKED` |
+| `orchestrator/test-quality-agent` | `test_quality_status` | `TEST_QUALITY_APPROVED` | `TESTS_WEAK` / `TESTS_BLOCKING` |
+| `orchestrator/architecture-agent` | `architecture_status` | `ARCHITECTURE_APPROVED` | `ARCHITECTURE_NEEDS_REVIEW` / `ARCHITECTURE_BLOCKED` |
+| `orchestrator/release-gate` | `release_decision` | `RELEASE_APPROVED` | `RELEASE_BLOCKED` / `RELEASE_SKIPPED` |
+
+`None` values map to `pending`; unknown values map to `error`. All mapping logic lives in `app/github_status_mapper.py` as pure functions.
+
+**Constants** in `app/feedback.py`: `GitHubStatusContext`, `GitHubState`, `GITHUB_REQUIRED_CHECK = "orchestrator/release-gate"`.
+
+**Branch protection:** Require only `orchestrator/release-gate` — it aggregates all agent verdicts. Setup instructions: `docs/security/github-required-checks.md`.
+
 ### Unified Release Gate
 
 `evaluate_release_decision(mapping, final_test_result, applied, review_status, test_quality_status, architecture_status) -> dict` (pure function in `workflows.py`)
@@ -391,6 +421,7 @@ Returns `True` (allow) or `False` (deny). Fails open on Redis errors. Returns 42
 
 - `docs/security/endpoint-inventory.md` — all endpoints with auth requirements
 - `docs/security/token-permissions.md` — minimum permission scopes for all secrets
+- `docs/security/github-required-checks.md` — how to configure branch protection to require `orchestrator/release-gate`
 - `docs/runbooks/orchestrator-ops.md` — operational runbook (pause, rotate secrets, recover stale runs)
 
 ## Two-File `.env` Rule — CRITICAL
