@@ -276,7 +276,7 @@ Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 
 | Gate | BLOCKED if | SKIPPED if |
 |---|---|---|
-| Tests | `status != PASSED` (hard block) | `status != PASSED` (soft) |
+| Tests | `status == "FAILED"` | `status not in ("PASSED", "FAILED")` e.g. NOT_RUN |
 | Reviewer | `BLOCKED` | `NEEDS_CHANGES` or `ERROR` |
 | Test Quality | `TESTS_BLOCKING` | `TESTS_WEAK` or `ERROR` |
 | Architecture | `ARCHITECTURE_BLOCKED` | `ARCHITECTURE_NEEDS_REVIEW` or `ERROR` |
@@ -334,6 +334,8 @@ docker exec <container-name> env | grep <VAR_NAME>
 ## Working Style
 
 Implement one iteration at a time. After each iteration: commit, push to `dev`, wait for CI/CD (`gh run watch`), then **validate autonomously on the dev EC2 instance** (SSH to `65.2.140.4`, exec into the app container, run validation scripts) before reporting the iteration complete. Do not rely on local Docker for validation. Only ask the user to proceed once the EC2 validation passes.
+
+**EC2 validation script pattern:** Write scripts to `/c/tmp/`, SCP to EC2, `docker cp` into the app container, run with `docker exec ... python3`. Any script that calls DB functions (`list_*`, `record_*`, `generate_*`) must call `from app.database import init_db; init_db()` first — the connection pool is `None` in standalone scripts and `get_conn()` will raise `AttributeError` otherwise. HTTP endpoints can be hit via `http://localhost:8000` from inside the container using `urllib.request`.
 
 When a decision affects architecture, multiple valid approaches exist, credentials are needed, or external services require setup — ask before proceeding, using this format:
 
