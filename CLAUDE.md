@@ -52,6 +52,9 @@ Copy `.env.example` to `.env` and fill in secrets. All values are required unles
 | `DEPLOYMENT_VALIDATION_TIMEOUT_SECONDS` | Per-smoke-test HTTP timeout (default: `120`) |
 | `DEPLOYMENT_VALIDATION_RETRY_COUNT` | Retries per smoke test before declaring FAILED (default: `3`) |
 | `DEPLOYMENT_VALIDATION_RETRY_DELAY_SECONDS` | Delay between retries (default: `10`) |
+| `FIRST_USE_MODE_ENABLED` | `true`/`false` — first-use safety mode; skips auto-merge until `FIRST_USE_RUN_COUNT` runs complete (default: `true`) |
+| `FIRST_USE_RUN_COUNT` | Number of completed runs before first-use mode deactivates per repo (default: `3`) |
+| `ORCHESTRATOR_SELF_REPO` | `owner/repo` slug of the orchestrator's own repo — permanently blocks auto-merge for that repo (default: `suyog19/ai-dev-orchestrator`) |
 
 ## Architecture
 
@@ -86,6 +89,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/deployment_validator.py` — `run_http_smoke_test()` (HTTP check with expected_status + expected_contains); `run_deployment_validation()` (loads profile, runs smoke tests with retries, stores result); status values: `NOT_CONFIGURED | SKIPPED | PASSED | FAILED | ERROR`
 - `app/onboarding.py` — `run_project_onboarding(run_id, repo_slug, base_branch)`: 7-step onboarding workflow (clone → profile → command validation → structure scan → architecture summary → conventions → deployment check); workspace at `/tmp/onboarding/<run_id>/repo`
 - `app/repo_scanner.py` — `scan_repo_structure(workspace_path, profile_name)`: classifies repo files into top_level, config, deploy, routing, model, service, test, doc categories; all lists capped at 20 entries; path-based only (no file content)
+- `app/bootstrap.py` — `run_project_bootstrap(repo_slug, project_type, description)`: scaffolds a new GitHub repo from templates; supported types: `python_fastapi`, `static_site`; `SUPPORTED_PROJECT_TYPES` constant
 
 **Event flow:**
 ```
@@ -272,7 +276,9 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/admin/project-onboarding/runs/{run_id}` | Single onboarding run detail |
 | POST | `/admin/project-onboarding/{repo_slug}/create-jira-mapping` | Create repo mapping after onboarding (body: jira_project_key, base_branch, environment, auto_merge_enabled) |
 | GET | `/debug/project-knowledge` | List knowledge snapshots for a repo (query: repo_slug) |
-| POST | `/debug/project-knowledge/{repo_slug}/refresh` | Placeholder for future knowledge refresh |
+| POST | `/debug/project-knowledge/{repo_slug}/refresh` | Re-run knowledge snapshots without re-detecting profile (query: base_branch); synchronous, 60-120s |
+| POST | `/admin/project-onboarding/{repo_slug}/activate` | 6-step activation report: profile, commands, knowledge, deployment, mapping, first-use status |
+| POST | `/admin/project-bootstrap/start` | Scaffold a new repo from template (body: repo_slug, project_type: `python_fastapi`\|`static_site`, description) |
 
 ## Workflow Configuration
 
@@ -444,7 +450,7 @@ After `evaluate_release_decision()` stores its verdict, `publish_github_statuses
 
 ### Unified Release Gate
 
-`evaluate_release_decision(mapping, final_test_result, applied, review_status, test_quality_status, architecture_status) -> dict` (pure function in `workflows.py`)
+`evaluate_release_decision(mapping, final_test_result, applied, review_status, test_quality_status, architecture_status, first_use_mode_active=False) -> dict` (pure function in `workflows.py`)
 
 Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 
@@ -456,6 +462,8 @@ Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 | Architecture | `ARCHITECTURE_BLOCKED` | `ARCHITECTURE_NEEDS_REVIEW` or `ERROR` |
 | Auto-merge | — | `auto_merge_enabled=False` |
 | File count | — | `count > 3` |
+| First-use | — | `first_use_mode_active=True` (skips merge; checked via `is_first_use_mode_active()`) |
+| Self-mod guard | always SKIPPED | repo_slug matches `ORCHESTRATOR_SELF_REPO` |
 
 **Release feedback events:** `release_decision`, `release_blocking_gate_count`
 
