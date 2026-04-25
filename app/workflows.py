@@ -1150,7 +1150,13 @@ def story_implementation(run_id: int, issue_key: str, issue_type: str, summary: 
         suggest_memory = f"{suggest_memory}\n\n{answer_note}" if suggest_memory else answer_note
 
     update_run_step(run_id, "suggesting")
-    suggestion_result = suggest_change(repo_path, analysis, issue_key=issue_key, issue_summary=summary, memory_context=suggest_memory)
+    suggestion_result = suggest_change(
+        repo_path, analysis,
+        issue_key=issue_key,
+        issue_summary=summary,
+        issue_description=early_story_details.get("description") or "",
+        memory_context=suggest_memory,
+    )
     changes = suggestion_result.get("changes", [])
     suggestion_summary = suggestion_result.get("summary", "")
     files_str = ", ".join(c.get("file", "") for c in changes)

@@ -638,17 +638,20 @@ def summarize_repo(repo_path: str, repo_name: str, analysis: dict) -> str:
     return summary
 
 
-def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "", memory_context: str = "") -> dict:
+def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_summary: str = "", issue_description: str = "", memory_context: str = "") -> dict:
     """Ask Claude Sonnet to suggest up to 3 code changes aligned with the Jira story.
 
-    Selects files by keyword overlap with the issue summary rather than a fixed entry-point
-    list, giving Claude context most relevant to the story intent.
+    Selects files by keyword overlap with the issue summary + description rather than a fixed
+    entry-point list, giving Claude context most relevant to the story intent.
     Returns a dict with keys: changes (list of {file, description, original, replacement}), summary.
     """
     client = _CLIENT
 
     primary_language = analysis.get("primary_language", "Python")
-    selected = _select_files_for_story(repo_path, primary_language, issue_summary)
+    # Combine title + description for richer keyword extraction — description often contains
+    # the exact text strings to find/change, which score the right file much more precisely.
+    keyword_text = f"{issue_summary} {issue_description}".strip()
+    selected = _select_files_for_story(repo_path, primary_language, keyword_text)
 
     if not selected:
         return {
