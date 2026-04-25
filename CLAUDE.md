@@ -274,6 +274,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/admin/ui/projects/new` | Wizard: validate, create mapping (with duplicate guard), start onboarding, redirect to status |
 | GET | `/admin/ui/projects/new/status/{run_id}` | Wizard: live progress page (auto-refreshes every 5s); shows JQL to paste into Jira webhook filter on completion |
 | GET | `/admin/ui/projects/{repo_slug}` | Project detail: latest run, capability profile, all knowledge snapshots, run history |
+| POST | `/admin/ui/projects/{repo_slug}/rescan` | Re-run full 7-step onboarding analysis for an existing repo; CSRF-protected; redirects to status page |
 | POST | `/admin/project-onboarding/start` | Start onboarding for a repo (body: repo_slug, base_branch) |
 | GET | `/admin/project-onboarding/runs` | List onboarding runs (filter: repo_slug) |
 | GET | `/admin/project-onboarding/runs/{run_id}` | Single onboarding run detail |
