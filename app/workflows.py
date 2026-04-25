@@ -1995,10 +1995,19 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     request_planning_approval(run_id)
     set_run_waiting_for_approval(run_id)
 
-    story_lines = "\n".join(
-        f"  {i}. {item.get('title', '?')} [{item.get('confidence', '?')}]"
-        for i, item in enumerate(items, 1)
-    )
+    def _story_block(i: int, item: dict) -> str:
+        title = item.get("title", "?")
+        conf = item.get("confidence", "?")
+        desc = (item.get("description") or "").strip()
+        # Truncate long descriptions so the message stays readable
+        if len(desc) > 300:
+            desc = desc[:297] + "..."
+        line = f"  {i}. {title} [{conf}]"
+        if desc:
+            line += f"\n     {desc}"
+        return line
+
+    story_lines = "\n".join(_story_block(i, item) for i, item in enumerate(items, 1))
     extra = ""
     if assumptions:
         extra += "\nAssumptions:\n" + "\n".join(f"  - {a}" for a in assumptions)
@@ -2014,7 +2023,7 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
         f"Reply with:\n"
         f"  APPROVE {run_id}\n"
         f"  REJECT {run_id}\n"
-        f"  REGENERATE {run_id}"
+        f"  REGENERATE {run_id} <optional feedback>"
     )
     send_message("epic_breakdown_proposed", "PENDING", approval_msg)
     logger.info("epic_breakdown: approval request sent to Telegram (run_id=%s)", run_id)
