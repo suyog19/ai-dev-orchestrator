@@ -4,6 +4,13 @@
 <div class="page-header">
   <h1>{{ repo_slug }}</h1>
   <p class="subtitle"><a href="/admin/ui/projects">← Projects</a></p>
+  <form method="POST" action="/admin/ui/projects/{{ repo_slug }}/rescan" style="display:inline;margin-top:8px">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="btn btn-secondary"
+            onclick="return confirm('Re-run full onboarding analysis for {{ repo_slug }}? This will clone the repo and run all 7 steps again.')">
+      Re-run Analysis
+    </button>
+  </form>
 </div>
 
 <!-- Activation Status Section -->
