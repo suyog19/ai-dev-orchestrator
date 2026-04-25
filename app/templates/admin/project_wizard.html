@@ -134,7 +134,7 @@
               <span class="pill pill-green">✓ {{ step_label }}</span>
             {% elif run.status == "FAILED" and current == step_key %}
               <span class="pill pill-red">✗ {{ step_label }}</span>
-            {% elif step_order.index(step_key) < step_order.index(current) if current in step_order else False %}
+            {% elif current in step_order and step_order.index(step_key) < step_order.index(current) %}
               <span class="pill pill-green">✓ {{ step_label }}</span>
             {% elif current == step_key %}
               <span class="pill pill-yellow">⟳ {{ step_label }}</span>
