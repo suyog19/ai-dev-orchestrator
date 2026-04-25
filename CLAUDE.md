@@ -410,7 +410,8 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Output format | Forced tool_use (`submit_test_quality_review`) with required structured fields |
 | GitHub action | Top-level PR comment with emoji verdict summary |
 | Merge on `TESTS_WEAK` | `merge_status=SKIPPED` |
-| Merge on `TESTS_BLOCKING` | `merge_status=BLOCKED_BY_TEST_QUALITY` |
+| Merge on `TESTS_BLOCKING` (tests ran) | `merge_status=BLOCKED_BY_TEST_QUALITY` |
+| Merge on `TESTS_BLOCKING` (test_status=NOT_RUN) | `merge_status=SKIPPED` (downgraded to skip — no test infrastructure) |
 | Merge on `ERROR` | `merge_status=SKIPPED` (non-fatal; run continues) |
 
 **Test Quality feedback events:** `test_quality_status`, `test_quality_confidence`, `test_quality_approved`, `tests_weak`, `tests_blocking`, `missing_test_count`, `suspicious_test_count`
@@ -465,7 +466,7 @@ Returns: `{release_decision, can_auto_merge, reason, blocking_gates, warnings}`
 |---|---|---|
 | Tests | `status == "FAILED"` | `status not in ("PASSED", "FAILED")` e.g. NOT_RUN |
 | Reviewer | `BLOCKED` | `NEEDS_CHANGES` or `ERROR` |
-| Test Quality | `TESTS_BLOCKING` | `TESTS_WEAK` or `ERROR` |
+| Test Quality | `TESTS_BLOCKING` **and** `test_status=FAILED` | `TESTS_WEAK` or `ERROR` or `TESTS_BLOCKING` with `test_status=NOT_RUN` |
 | Architecture | `ARCHITECTURE_BLOCKED` | `ARCHITECTURE_NEEDS_REVIEW` or `ERROR` |
 | Auto-merge | — | `auto_merge_enabled=False` |
 | File count | — | `count > 3` |

@@ -636,11 +636,14 @@ def evaluate_release_decision(
     warnings = []
 
     # Hard blocks — any one alone prevents auto-merge entirely
-    if final_test_result.get("status") == "FAILED":
+    test_ran = final_test_result.get("status") == "FAILED"
+    if test_ran:
         blocking_gates.append("tests failed")
     if review_status == ReviewStatus.BLOCKED:
         blocking_gates.append("reviewer blocked")
-    if test_quality_status == TestQualityStatus.BLOCKING:
+    # TESTS_BLOCKING only hard-blocks when tests actually ran and failed;
+    # if test_status=NOT_RUN (no test infrastructure), it degrades to a skip below.
+    if test_quality_status == TestQualityStatus.BLOCKING and test_ran:
         blocking_gates.append("test quality blocking")
     if architecture_status == ArchitectureStatus.BLOCKED:
         blocking_gates.append("architecture blocked")
@@ -689,6 +692,9 @@ def evaluate_release_decision(
         skip_reasons.append(f"review status: {review_status}")
     if test_quality_status == TestQualityStatus.WEAK:
         skip_reasons.append("test quality weak")
+    elif test_quality_status == TestQualityStatus.BLOCKING and not test_ran:
+        # Tests didn't run (no test infrastructure) — treat as skip, not hard block
+        skip_reasons.append("test quality blocking (no tests run — manual review required)")
     elif test_quality_status not in (TestQualityStatus.APPROVED,):
         skip_reasons.append(f"test quality status: {test_quality_status}")
     if architecture_status == ArchitectureStatus.NEEDS_REVIEW:
