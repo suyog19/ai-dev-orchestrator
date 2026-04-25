@@ -776,6 +776,133 @@ async def ui_rerun_deployment_validation(
 # Phase 17 — Project Onboarding Dashboard (placeholder, expanded in Iteration 8)
 # ---------------------------------------------------------------------------
 
+# NOTE: /projects/new and /projects/new/status/{run_id} must be registered
+# BEFORE /projects/{repo_slug:path} so FastAPI doesn't swallow "new" as a slug.
+
+@router.get("/projects/new", response_class=HTMLResponse)
+async def ui_new_project_form(request: Request):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+    return templates.TemplateResponse("admin/project_wizard.html", {
+        **_base_ctx(request, token, "projects"),
+        "step": "form",
+        "error": None,
+    })
+
+
+@router.post("/projects/new", response_class=HTMLResponse)
+async def ui_new_project_submit(
+    request: Request,
+    repo_slug: str = Form(...),
+    base_branch: str = Form("main"),
+    jira_space_key: str = Form(...),
+    auto_merge: str = Form(None),
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return templates.TemplateResponse("admin/project_wizard.html", {
+            **_base_ctx(request, token, "projects"),
+            "step": "form",
+            "error": "Invalid CSRF token — please try again.",
+        })
+
+    repo_slug = repo_slug.strip()
+    jira_space_key = jira_space_key.strip().upper()
+    base_branch = base_branch.strip() or "main"
+    auto_merge_enabled = auto_merge == "true"
+
+    if "/" not in repo_slug or len(repo_slug.split("/")) != 2:
+        return templates.TemplateResponse("admin/project_wizard.html", {
+            **_base_ctx(request, token, "projects"),
+            "step": "form",
+            "error": "Repo slug must be in owner/repo format.",
+            "repo_slug": repo_slug,
+            "base_branch": base_branch,
+            "jira_space_key": jira_space_key,
+        })
+
+    if not jira_space_key or not jira_space_key.isalpha():
+        return templates.TemplateResponse("admin/project_wizard.html", {
+            **_base_ctx(request, token, "projects"),
+            "step": "form",
+            "error": "Jira space key must contain only letters (e.g. APP, WEB).",
+            "repo_slug": repo_slug,
+            "base_branch": base_branch,
+            "jira_space_key": jira_space_key,
+        })
+
+    from app.repo_mapping import add_mapping, get_all_mappings
+    from app.database import create_onboarding_run
+    from app.queue import enqueue_onboarding_job
+
+    # Check if this exact mapping already exists (active)
+    existing = [
+        m for m in get_all_mappings()
+        if m["jira_project_key"] == jira_space_key
+        and m["repo_slug"] == repo_slug
+        and m["is_active"]
+    ]
+    if not existing:
+        add_mapping(
+            jira_project_key=jira_space_key,
+            repo_slug=repo_slug,
+            base_branch=base_branch,
+            auto_merge_enabled=auto_merge_enabled,
+            notes=f"Created via onboarding wizard",
+        )
+
+    run_id = create_onboarding_run(repo_slug=repo_slug, base_branch=base_branch)
+    enqueue_onboarding_job(onboarding_run_id=run_id, repo_slug=repo_slug, base_branch=base_branch)
+
+    return RedirectResponse(
+        url=f"/admin/ui/projects/new/status/{run_id}?repo_slug={repo_slug}&jira_key={jira_space_key}",
+        status_code=302,
+    )
+
+
+@router.get("/projects/new/status/{run_id}", response_class=HTMLResponse)
+async def ui_new_project_status(request: Request, run_id: int, repo_slug: str = "", jira_key: str = ""):
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    from app.database import get_onboarding_run
+    from app.repo_mapping import get_all_mappings
+
+    run = get_onboarding_run(run_id)
+    if not run:
+        return templates.TemplateResponse("admin/project_wizard.html", {
+            **_base_ctx(request, token, "projects"),
+            "step": "form",
+            "error": f"Onboarding run {run_id} not found.",
+        })
+
+    # Build JQL from all currently active mappings
+    all_mappings = get_all_mappings()
+    active_keys = sorted({m["jira_project_key"] for m in all_mappings if m["is_active"]})
+    jql = f"project in ({', '.join(active_keys)})" if active_keys else ""
+
+    auto_refresh = run["status"] in ("PENDING", "RUNNING")
+
+    return templates.TemplateResponse("admin/project_wizard.html", {
+        **_base_ctx(request, token, "projects"),
+        "step": "status",
+        "run": run,
+        "repo_slug": repo_slug or run.get("repo_slug", ""),
+        "jira_key": jira_key,
+        "jql": jql,
+        "auto_refresh": auto_refresh,
+    })
+
+
 @router.get("/projects", response_class=HTMLResponse)
 async def ui_projects(request: Request, repo_slug: str | None = None):
     try:

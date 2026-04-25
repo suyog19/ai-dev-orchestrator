@@ -1,0 +1,205 @@
+{% extends "admin/base.html" %}
+{% block title %}Onboard New Project{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Onboard New Project</h1>
+    <p class="text-muted">Analyse a repo, create its Jira space mapping, and get the webhook JQL to update.</p>
+  </div>
+  <a href="/admin/ui/projects" class="btn btn-ghost btn-sm">← All Projects</a>
+</div>
+
+{% if step == "form" %}
+<!-- ── Step 1: Setup form ─────────────────────────────────────────── -->
+
+<div class="card" style="max-width:560px">
+  <h2 style="margin-top:0">Project Details</h2>
+
+  {% if error %}
+  <div class="alert alert-error" style="margin-bottom:16px">{{ error }}</div>
+  {% endif %}
+
+  <p style="color:#555;margin-bottom:20px;font-size:0.9rem">
+    This wizard will: run the 7-step repo analysis, create the Jira space mapping,
+    and show you the exact JQL to paste into your Jira webhook filter.
+  </p>
+
+  <form method="post" action="/admin/ui/projects/new">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+
+    <div class="form-group">
+      <label>GitHub Repo Slug</label>
+      <input type="text" name="repo_slug" value="{{ repo_slug or '' }}"
+             placeholder="owner/repo-name" required
+             style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box">
+      <small class="text-muted">e.g. suyog19/my-api</small>
+    </div>
+
+    <div class="form-group">
+      <label>Base Branch</label>
+      <input type="text" name="base_branch" value="{{ base_branch or 'main' }}"
+             style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box">
+    </div>
+
+    <div class="form-group">
+      <label>Jira Space Key</label>
+      <input type="text" name="jira_space_key" value="{{ jira_space_key or '' }}"
+             placeholder="APP" required style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box"
+             oninput="this.value=this.value.toUpperCase()">
+      <small class="text-muted">The short uppercase key from your Jira space (e.g. APP, WEB, API)</small>
+    </div>
+
+    <div class="form-group">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal">
+        <input type="checkbox" name="auto_merge" value="true">
+        <span>Enable auto-merge <span class="text-muted">(leave off until first few runs validate correctly)</span></span>
+      </label>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Start Onboarding →</button>
+  </form>
+</div>
+
+<!-- Checklist preview -->
+<div class="card" style="max-width:560px;margin-top:16px">
+  <h3 style="margin-top:0;font-size:0.95rem;color:#555">What happens next</h3>
+  <ol style="margin:0;padding-left:20px;line-height:2;color:#444;font-size:0.9rem">
+    <li>Clone the repo and detect its capability profile (Python / Java / Node / Unknown)</li>
+    <li>Validate test, build, and lint commands</li>
+    <li>Scan repo structure and generate architecture + coding-conventions snapshots via Claude</li>
+    <li>Check / draft a deployment profile for smoke testing</li>
+    <li>Create the Jira space mapping in the orchestrator database</li>
+    <li>Show you the updated webhook JQL to paste into Jira</li>
+  </ol>
+</div>
+
+{% elif step == "status" %}
+<!-- ── Step 2: Progress + completion ──────────────────────────────── -->
+
+{% if auto_refresh %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+
+<div class="card" style="max-width:600px">
+
+  <!-- Header row -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px">
+    <div>
+      <h2 style="margin:0">{{ repo_slug }}</h2>
+      <span class="text-muted" style="font-size:0.85rem">Jira space: <strong>{{ jira_key }}</strong></span>
+    </div>
+    <span class="badge badge-{{ run.status | lower }}">{{ run.status }}</span>
+  </div>
+
+  <!-- Checklist -->
+  <div style="display:flex;flex-direction:column;gap:10px">
+
+    <!-- Step A: Repo details -->
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:1.1rem">✅</span>
+      <span>Repo details submitted &amp; Jira mapping created</span>
+    </div>
+
+    <!-- Step B: Onboarding pipeline -->
+    <div style="display:flex;align-items:flex-start;gap:10px">
+      {% if run.status == "COMPLETED" %}
+      <span style="font-size:1.1rem">✅</span>
+      {% elif run.status == "FAILED" %}
+      <span style="font-size:1.1rem">❌</span>
+      {% else %}
+      <span style="font-size:1.1rem;animation:spin 1s linear infinite">⟳</span>
+      {% endif %}
+      <div>
+        <div>7-step repo analysis
+          {% if run.status == "RUNNING" and run.current_step %}
+          <span class="text-muted">({{ run.current_step }}…)</span>
+          {% endif %}
+        </div>
+
+        <!-- Sub-step pills -->
+        {% set steps = [
+          ("cloning",            "Clone"),
+          ("profile_detection",  "Profile"),
+          ("command_validation", "Commands"),
+          ("structure_scan",     "Scan"),
+          ("architecture_summary","Architecture"),
+          ("coding_conventions", "Conventions"),
+          ("deployment_check",   "Deployment")
+        ] %}
+        {% set step_order = steps | map(attribute=0) | list %}
+        {% set current = run.current_step or "" %}
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+          {% for step_key, step_label in steps %}
+            {% if run.status == "COMPLETED" %}
+              <span class="pill pill-green">✓ {{ step_label }}</span>
+            {% elif run.status == "FAILED" and current == step_key %}
+              <span class="pill pill-red">✗ {{ step_label }}</span>
+            {% elif step_order.index(step_key) < step_order.index(current) if current in step_order else False %}
+              <span class="pill pill-green">✓ {{ step_label }}</span>
+            {% elif current == step_key %}
+              <span class="pill pill-yellow">⟳ {{ step_label }}</span>
+            {% else %}
+              <span class="pill pill-gray">{{ step_label }}</span>
+            {% endif %}
+          {% endfor %}
+        </div>
+
+        {% if run.status == "FAILED" and run.error_detail %}
+        <div class="alert alert-error" style="margin-top:10px;font-size:0.85rem">
+          <strong>Error:</strong> {{ run.error_detail }}
+          <div style="margin-top:8px">
+            <a href="/admin/ui/projects/new" class="btn btn-ghost btn-sm">Retry →</a>
+          </div>
+        </div>
+        {% endif %}
+
+        {% if run.status == "COMPLETED" %}
+        <div style="margin-top:6px;font-size:0.85rem;color:#555">
+          Profile: <strong>{{ run.capability_profile_name or "unknown" }}</strong>
+          {% if run.test_result %} · Tests: <strong>{{ run.test_result }}</strong>{% endif %}
+          {% if run.build_result %} · Build: <strong>{{ run.build_result }}</strong>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Step C: Webhook JQL -->
+    {% if run.status == "COMPLETED" %}
+    <div style="display:flex;align-items:flex-start;gap:10px">
+      <span style="font-size:1.1rem">✅</span>
+      <div style="flex:1">
+        <div style="margin-bottom:8px">Update your Jira webhook JQL filter</div>
+        <div style="background:#f8f8f8;border:1px solid #ddd;border-radius:6px;padding:12px;font-family:monospace;font-size:0.9rem;position:relative">
+          <span id="jql-text">{{ jql }}</span>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('jql-text').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='📋 Copy',1500)})"
+                  style="position:absolute;top:8px;right:8px;padding:3px 8px;font-size:0.8rem;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff">
+            📋 Copy
+          </button>
+        </div>
+        <small class="text-muted" style="display:block;margin-top:6px">
+          Go to your Jira space → Space settings → Jira settings → System → Webhooks → edit the orchestrator webhook → paste this into the JQL field.
+        </small>
+      </div>
+    </div>
+    {% else %}
+    <div style="display:flex;align-items:center;gap:10px;color:#aaa">
+      <span style="font-size:1.1rem">○</span>
+      <span>Update Jira webhook JQL <span style="font-size:0.8rem">(available after onboarding completes)</span></span>
+    </div>
+    {% endif %}
+
+  </div><!-- /checklist -->
+
+  {% if run.status == "COMPLETED" %}
+  <div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;display:flex;gap:12px">
+    <a href="/admin/ui/projects/{{ repo_slug }}" class="btn btn-primary">View Project Details →</a>
+    <a href="/admin/ui/projects/new" class="btn btn-ghost btn-sm">Onboard another repo</a>
+  </div>
+  {% elif run.status not in ("FAILED",) %}
+  <p class="text-muted" style="margin-top:16px;font-size:0.85rem">⟳ Auto-refreshing every 5 seconds…</p>
+  {% endif %}
+
+</div>
+
+{% endif %}
+{% endblock %}
