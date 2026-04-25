@@ -20,6 +20,12 @@ EXTENSION_TO_LANGUAGE = {
     ".c": "C",
     ".swift": "Swift",
     ".kt": "Kotlin",
+    # Web content files — included so keyword scorer can match text inside HTML/CSS/templates
+    ".html": "HTML",
+    ".htm": "HTML",
+    ".css": "CSS",
+    ".vue": "JavaScript",
+    ".svelte": "JavaScript",
 }
 
 IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
