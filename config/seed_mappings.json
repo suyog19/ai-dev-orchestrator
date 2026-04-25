@@ -1,9 +1,1 @@
-[
-  {
-    "jira_project_key": "KAN",
-    "repo_slug": "suyog19/suyogjoshi-com",
-    "base_branch": "main",
-    "auto_merge_enabled": false,
-    "notes": "KAN project — suyogjoshi.com personal website (Phase 17+). Auto-merge disabled; PRs require manual review."
-  }
-]
+[]

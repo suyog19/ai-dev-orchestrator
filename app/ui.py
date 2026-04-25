@@ -842,20 +842,43 @@ async def ui_new_project_submit(
     from app.database import create_onboarding_run
     from app.queue import enqueue_onboarding_job
 
-    # Check if this exact mapping already exists (active)
-    existing = [
-        m for m in get_all_mappings()
+    all_mappings = get_all_mappings()
+
+    # Block if this repo already has an active mapping under a DIFFERENT key
+    conflict = [
+        m for m in all_mappings
+        if m["repo_slug"] == repo_slug
+        and m["is_active"]
+        and m["jira_project_key"] != jira_space_key
+    ]
+    if conflict:
+        keys = ", ".join(m["jira_project_key"] for m in conflict)
+        return templates.TemplateResponse("admin/project_wizard.html", {
+            **_base_ctx(request, token, "projects"),
+            "step": "form",
+            "error": (
+                f"This repo already has an active Jira mapping: {keys}. "
+                f"Deactivate it first via Projects → {repo_slug} before adding a new key."
+            ),
+            "repo_slug": repo_slug,
+            "base_branch": base_branch,
+            "jira_space_key": jira_space_key,
+        })
+
+    # Create mapping only if it doesn't already exist for this exact key+repo
+    exact_match = [
+        m for m in all_mappings
         if m["jira_project_key"] == jira_space_key
         and m["repo_slug"] == repo_slug
         and m["is_active"]
     ]
-    if not existing:
+    if not exact_match:
         add_mapping(
             jira_project_key=jira_space_key,
             repo_slug=repo_slug,
             base_branch=base_branch,
             auto_merge_enabled=auto_merge_enabled,
-            notes=f"Created via onboarding wizard",
+            notes="Created via onboarding wizard",
         )
 
     run_id = create_onboarding_run(repo_slug=repo_slug, base_branch=base_branch)
