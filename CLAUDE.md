@@ -64,7 +64,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/main.py` — FastAPI app, all HTTP endpoints
 - `app/worker.py` — queue consumer; runs workflows in threads (MAX_WORKERS=2); recovers stale RUNNING→FAILED on startup; `_execute_onboarding()` handles `project_onboarding` jobs and manages `project_onboarding_runs` status independently from `workflow_runs`
 - `app/workflows.py` — `story_implementation` and `epic_breakdown` workflow logic; **note**: there is a stale one-argument `_is_test_file()` near the top of the file that is dead code (overridden by the profile-aware version further down); `_TEST_FILE_PATTERNS` defined alongside it is also unused
-- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output; `generate_onboarding_architecture_summary()` and `generate_onboarding_coding_conventions()` use forced tool_use for structured onboarding snapshots
+- `app/claude_client.py` — all Claude API calls (summarize, suggest, fix, plan, review, test quality review, architecture review); uses `claude-sonnet-4-6` with ephemeral prompt caching on system prompts; `review_pr()`, `review_test_quality()`, and `review_architecture()` all use forced `tool_choice` for structured output; `generate_onboarding_architecture_summary()` and `generate_onboarding_coding_conventions()` use forced tool_use for structured onboarding snapshots; architecture tool schema includes `file_landmark_map` (list of `"<change type> → <file path>"` strings); `detect_epic_missing_specifics()` uses `claude-haiku-4-5-20251001` for a fast, cheap pre-breakdown ambiguity check — returns targeted questions only for blocking missing specifics; `plan_epic_breakdown()` accepts `description` and `acceptance_criteria` parameters (previously only received summary)
 - `app/database.py` — all DB access; schema migrations in `init_db()`; `update_run_field()` / `update_run_step()` are the primary state-mutation functions used throughout the workflow
 - `app/feedback.py` — feedback/memory constants and failure categorisation functions
 - `app/dispatcher.py` — reads workflow_events and enqueues jobs onto Redis
@@ -78,7 +78,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
 - `app/git_ops.py` — clone, commit, push
 - `app/repo_mapping.py` — CRUD for `repo_mappings` table; `upsert_seed_mappings()` runs on startup from `config/seed_mappings.json` (currently empty — new mappings are created via the onboarding wizard); it respects rows where `is_active=false` (will not re-create deactivated mappings); deactivate via `DELETE /debug/repo-mappings/{id}`
-- `app/repo_profiler.py` — detects repo capability profile from cloned workspace (detection order: Gradle > Maven > Node > Python > Unknown); `detect_repo_capability_profile()`, `get_test/build/lint_command_for_profile()`
+- `app/repo_profiler.py` — detects repo capability profile from cloned workspace (detection order: Gradle > Maven > Node > Python > Unknown); `detect_repo_capability_profile()`, `get_test/build/lint_command_for_profile()`; when root detects as `generic_unknown`, `_scan_for_subdir_stacks()` scans top-level subdirs for recognisable stack markers — sets `capabilities.is_monorepo=True` and `capabilities.monorepo_components=[{subdir, profile_name, ...}]`
 - `app/command_runner.py` — `run_repo_command()`: safe, injection-proof command execution using `shlex.split()` (no `shell=True`); handles timeout/FileNotFoundError/OSError; output truncated at 4000 chars
 - `app/test_runner.py` — profile-aware test/build/lint runner: `run_tests()` (with dep install), `run_build()`, `run_lint()` all delegate to `run_repo_command()`
 - `app/telegram.py` — `send_message(event_type, status, detail)` used by all workflow steps for Telegram notifications
@@ -274,6 +274,7 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | POST | `/admin/ui/projects/new` | Wizard: validate, create mapping (with duplicate guard), start onboarding, redirect to status |
 | GET | `/admin/ui/projects/new/status/{run_id}` | Wizard: live progress page (auto-refreshes every 5s); shows JQL to paste into Jira webhook filter on completion |
 | GET | `/admin/ui/projects/{repo_slug}` | Project detail: latest run, capability profile, all knowledge snapshots, run history |
+| POST | `/admin/ui/projects/{repo_slug}/rescan` | Re-run full 7-step onboarding analysis for an existing repo; CSRF-protected; redirects to status page |
 | POST | `/admin/project-onboarding/start` | Start onboarding for a repo (body: repo_slug, base_branch) |
 | GET | `/admin/project-onboarding/runs` | List onboarding runs (filter: repo_slug) |
 | GET | `/admin/project-onboarding/runs/{run_id}` | Single onboarding run detail |
@@ -310,6 +311,8 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | `node_react` | `package.json` + (vite/next config OR react dep OR `src/`) | From `package.json` scripts | Disabled |
 | `generic_unknown` | fallback | None | Disabled |
 
+**Monorepo detection**: when root is `generic_unknown`, `_scan_for_subdir_stacks()` scans top-level subdirs for recognisable stack markers. Matching subdirs are stored as `capabilities.monorepo_components` and `capabilities.is_monorepo=True` in the profile. The root profile stays `generic_unknown` (no commands at root level) — component info is used by the architecture prompt to describe each subdir's stack.
+
 **Profile release policies** (`_PROFILE_RELEASE_POLICY` in `workflows.py`):
 - `python_fastapi`: `allow_auto_merge=True`, `require_tests=True`, `require_build=False`
 - `java_maven`/`java_gradle`: `allow_auto_merge=False`, `require_tests=True`, `require_build=True`
@@ -342,6 +345,7 @@ File selection for Claude (`suggest_change`): README + top 2 keyword-scored non-
 | Control flag | `clarification_enabled` in `control_flags` table |
 | Telegram commands | `ANSWER <id> <text>` / `CANCEL <id>` / `CLARIFY <id>` |
 | Vagueness trigger (Epic) | Summary < 4 words OR no description OR description < 50 chars |
+| Missing specifics trigger (Epic) | `detect_epic_missing_specifics()` — Haiku call checks for blocking missing specifics (tech stack, target component, scope, acceptance criteria) before breakdown; only fires if the vagueness check passed; non-fatal if it errors |
 | Ambiguity trigger (Story) | No acceptance criteria AND no description |
 | Review agent trigger | Agent returns `needs_clarification=true` in tool output |
 | Periodic expiry | Worker loop: every ~720 iterations (~1 hour) + startup |
@@ -639,13 +643,13 @@ Browser-based operations console at `/admin/ui`. Served as server-rendered HTML 
 
 Workspace: `/tmp/onboarding/<run_id>/` — cleaned up in `finally` block regardless of outcome.
 
-**Project knowledge injection** (non-fatal): `get_project_knowledge_for_prompt(repo_slug)` in `app/database.py` fetches `architecture` + `coding_conventions` + `deployment` snapshots, returns a bounded string (≤5 bullets, ≤1200 chars). Injected into `suggest_memory` (story_implementation) and `memory_context` (epic_breakdown) before Claude calls. Wrapped in try/except so missing data never breaks existing workflows.
+**Project knowledge injection** (non-fatal): `get_project_knowledge_for_prompt(repo_slug)` in `app/database.py` fetches `architecture` + `coding_conventions` + `deployment` snapshots, returns a bounded string (≤5 bullets, ≤1200 chars). Also appends a `[file_landmarks]` bullet from `architecture.details.file_landmark_map` (up to 6 entries, format `"<change type> → <file>"`). Injected into `suggest_memory` (story_implementation) and `memory_context` (epic_breakdown) before Claude calls. Wrapped in try/except so missing data never breaks existing workflows.
 
 **Jira mapping helper**: `POST /admin/project-onboarding/{repo_slug}/create-jira-mapping` — creates a `repo_mappings` entry after onboarding; returns error if capability profile is missing or mapping already exists.
 
 **Onboarding wizard**: `/admin/ui/projects/new` is a two-step guided UI — step 1 collects `repo_slug`, `base_branch`, `jira_space_key`, and `auto_merge`; on POST it checks for duplicate active mappings (blocks if the same repo already maps to a different Jira key), creates the `repo_mappings` entry, enqueues an onboarding job, and redirects to the status page. Step 2 (`/admin/ui/projects/new/status/{run_id}`) auto-refreshes every 5 s while PENDING/RUNNING and shows the 7 sub-step pills; on COMPLETED it displays the webhook JQL to copy into the Jira webhook filter.
 
-**Dashboard**: `/admin/ui/projects` lists all repos with onboarding data; `/admin/ui/projects/{repo_slug}` shows latest run, capability profile, architecture, conventions, open questions, and deployment profile in a structured view.
+**Dashboard**: `/admin/ui/projects` lists all repos with onboarding data; `/admin/ui/projects/{repo_slug}` shows latest run, capability profile, architecture, conventions, open questions, and deployment profile in a structured view. The page includes a **Re-run Analysis** button (CSRF-protected POST to `/rescan`) that enqueues a fresh 7-step onboarding run and redirects to the live status page — useful when the analyzer improves or the repo evolves.
 
 ## Deferred / Out of Scope
 
