@@ -4060,7 +4060,8 @@ def get_project_knowledge_for_prompt(repo_slug: str, max_bullets: int = 5, max_c
     """Return a bounded project knowledge string for prompt injection.
 
     Retrieves architecture + coding_conventions + deployment snapshots in priority
-    order. Truncates to max_bullets points and max_chars total. Returns empty string
+    order, then appends file_landmark_map from the architecture snapshot details.
+    Truncates to max_bullets points and max_chars total. Returns empty string
     if no snapshots exist for the repo.
     """
     from app.feedback import SnapshotKind
@@ -4070,14 +4071,24 @@ def get_project_knowledge_for_prompt(repo_slug: str, max_bullets: int = 5, max_c
         SnapshotKind.DEPLOYMENT,
     ]
     bullets = []
+    arch_details = {}
     for kind in priority_kinds:
         snap = get_knowledge_snapshot(repo_slug, kind)
         if snap and snap.get("summary"):
             # Take the first non-empty line of the summary as the bullet
             first_line = snap["summary"].strip().split("\n")[0][:300]
             bullets.append(f"[{kind}] {first_line}")
+        if kind == SnapshotKind.ARCHITECTURE and snap and snap.get("details"):
+            arch_details = snap["details"]
         if len(bullets) >= max_bullets:
             break
+
+    # Inject file landmarks so story_implementation targets the correct files.
+    # These are produced by the architecture snapshot's file_landmark_map field.
+    landmarks = arch_details.get("file_landmark_map", [])
+    if landmarks and len(bullets) < max_bullets:
+        landmark_text = "; ".join(str(l) for l in landmarks[:6])
+        bullets.append(f"[file_landmarks] {landmark_text}")
 
     if not bullets:
         return ""

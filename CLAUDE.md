@@ -77,7 +77,7 @@ Python/FastAPI orchestration service. Receives Jira webhook events, persists the
 - `app/jira_client.py` — Jira REST API v3 calls; `get_issue_details()` fetches story summary + ADF-parsed description + acceptance criteria for the Reviewer Agent
 - `app/github_api.py` — GitHub API calls: PR creation, labels, merge, `post_pr_comment()`, `get_pr_details()` (fetches head SHA), `create_commit_status()` (publishes GitHub commit statuses), `get_branch_protection()` (includes orchestrator check audit)
 - `app/git_ops.py` — clone, commit, push
-- `app/repo_mapping.py` — CRUD for `repo_mappings` table; `upsert_seed_mappings()` runs on startup from `config/seed_mappings.json` — it respects rows where `is_active=false` (will not re-create deactivated mappings); deactivate via `DELETE /debug/repo-mappings/{id}`
+- `app/repo_mapping.py` — CRUD for `repo_mappings` table; `upsert_seed_mappings()` runs on startup from `config/seed_mappings.json` (currently empty — new mappings are created via the onboarding wizard); it respects rows where `is_active=false` (will not re-create deactivated mappings); deactivate via `DELETE /debug/repo-mappings/{id}`
 - `app/repo_profiler.py` — detects repo capability profile from cloned workspace (detection order: Gradle > Maven > Node > Python > Unknown); `detect_repo_capability_profile()`, `get_test/build/lint_command_for_profile()`
 - `app/command_runner.py` — `run_repo_command()`: safe, injection-proof command execution using `shlex.split()` (no `shell=True`); handles timeout/FileNotFoundError/OSError; output truncated at 4000 chars
 - `app/test_runner.py` — profile-aware test/build/lint runner: `run_tests()` (with dep install), `run_build()`, `run_lint()` all delegate to `run_repo_command()`
@@ -137,7 +137,7 @@ curl -X POST "https://<orchestrator-url>/webhooks/jira?token=$JIRA_WEBHOOK_SECRE
 
 ## Data Model
 
-All tables are created (and migrated) by `init_db()` in `app/database.py`. First startup also seeds `repo_mappings` from `config/seed_mappings.json`.
+All tables are created (and migrated) by `init_db()` in `app/database.py`. First startup calls `upsert_seed_mappings()` from `config/seed_mappings.json` (currently empty — repo mappings are managed via the onboarding wizard).
 
 | Table | Purpose |
 |---|---|
@@ -270,6 +270,9 @@ RECEIVED → QUEUED → RUNNING → COMPLETED
 | GET | `/admin/ui/deployments` | Deployment profiles + recent validations list (filter: repo_slug, status, limit) |
 | POST | `/admin/ui/runs/{run_id}/run-deployment-validation` | Re-run deployment validation for a run (CSRF-protected) |
 | GET | `/admin/ui/projects` | Project onboarding list (all repos with onboarding data) |
+| GET | `/admin/ui/projects/new` | Wizard: repo onboarding setup form |
+| POST | `/admin/ui/projects/new` | Wizard: validate, create mapping (with duplicate guard), start onboarding, redirect to status |
+| GET | `/admin/ui/projects/new/status/{run_id}` | Wizard: live progress page (auto-refreshes every 5s); shows JQL to paste into Jira webhook filter on completion |
 | GET | `/admin/ui/projects/{repo_slug}` | Project detail: latest run, capability profile, all knowledge snapshots, run history |
 | POST | `/admin/project-onboarding/start` | Start onboarding for a repo (body: repo_slug, base_branch) |
 | GET | `/admin/project-onboarding/runs` | List onboarding runs (filter: repo_slug) |
@@ -611,7 +614,7 @@ Browser-based operations console at `/admin/ui`. Served as server-rendered HTML 
 - `/admin/ui/*` paths are exempt from the header-key `BaseHTTPMiddleware` (controlled by `_UI_EXEMPT_PREFIX` in `security.py`); cookie auth is handled by `require_admin_ui()` in `app/ui_auth.py`
 - The existing `X-Orchestrator-Admin-Key` header auth for API clients is unaffected
 
-**Template structure:** `app/templates/admin/base.html` is the sidebar layout; all pages `{% extends "admin/base.html" %}`. `is_paused()` is registered as a Jinja2 global so `base.html` can show the PAUSED banner without route changes.
+**Template structure:** `app/templates/admin/base.html` is the sidebar layout; all pages `{% extends "admin/base.html" %}`. `is_paused()` is registered as a Jinja2 global so `base.html` can show the PAUSED banner without route changes. The sidebar includes a "+ Onboard Repo" sub-link under Projects (`page == 'wizard'`) pointing to `/admin/ui/projects/new`.
 
 **Dashboard DB functions** (in `app/database.py`):
 - `get_overview_stats()` — single-query aggregated dashboard stats
@@ -639,6 +642,8 @@ Workspace: `/tmp/onboarding/<run_id>/` — cleaned up in `finally` block regardl
 **Project knowledge injection** (non-fatal): `get_project_knowledge_for_prompt(repo_slug)` in `app/database.py` fetches `architecture` + `coding_conventions` + `deployment` snapshots, returns a bounded string (≤5 bullets, ≤1200 chars). Injected into `suggest_memory` (story_implementation) and `memory_context` (epic_breakdown) before Claude calls. Wrapped in try/except so missing data never breaks existing workflows.
 
 **Jira mapping helper**: `POST /admin/project-onboarding/{repo_slug}/create-jira-mapping` — creates a `repo_mappings` entry after onboarding; returns error if capability profile is missing or mapping already exists.
+
+**Onboarding wizard**: `/admin/ui/projects/new` is a two-step guided UI — step 1 collects `repo_slug`, `base_branch`, `jira_space_key`, and `auto_merge`; on POST it checks for duplicate active mappings (blocks if the same repo already maps to a different Jira key), creates the `repo_mappings` entry, enqueues an onboarding job, and redirects to the status page. Step 2 (`/admin/ui/projects/new/status/{run_id}`) auto-refreshes every 5 s while PENDING/RUNNING and shows the 7 sub-step pills; on COMPLETED it displays the webhook JQL to copy into the Jira webhook filter.
 
 **Dashboard**: `/admin/ui/projects` lists all repos with onboarding data; `/admin/ui/projects/{repo_slug}` shows latest run, capability profile, architecture, conventions, open questions, and deployment profile in a structured view.
 
