@@ -266,6 +266,43 @@ def _detect_node_react(workspace: str) -> bool:
     )
 
 
+def _scan_for_subdir_stacks(workspace: str) -> list[dict]:
+    """Scan top-level subdirectories for recognisable profile markers.
+
+    Used when root-level detection returns generic_unknown — catches monorepos
+    and repos where the main stack lives one directory below the root.
+    Returns a list of {subdir, profile_name} dicts sorted by subdir name.
+    """
+    results = []
+    try:
+        entries = sorted(os.listdir(workspace))
+    except OSError:
+        return results
+
+    for entry in entries:
+        if entry.startswith("."):
+            continue
+        subdir = os.path.join(workspace, entry)
+        if not os.path.isdir(subdir):
+            continue
+        if _detect_java_gradle(subdir):
+            results.append({"subdir": entry, "profile_name": CapabilityProfile.JAVA_GRADLE})
+        elif _detect_java_maven(subdir):
+            results.append({"subdir": entry, "profile_name": CapabilityProfile.JAVA_MAVEN})
+        elif _detect_node_react(subdir):
+            pm = _detect_node_package_manager(subdir)
+            scripts = _detect_node_scripts(subdir, pm)
+            results.append({
+                "subdir": entry,
+                "profile_name": CapabilityProfile.NODE_REACT,
+                "package_manager": pm,
+                **scripts["commands"],
+            })
+        elif _detect_python_fastapi(subdir):
+            results.append({"subdir": entry, "profile_name": CapabilityProfile.PYTHON_FASTAPI})
+    return results
+
+
 def _detect_node_package_manager(workspace: str) -> str:
     """Detect npm/yarn/pnpm from lock files."""
     if _exists(workspace, "pnpm-lock.yaml"):
@@ -336,6 +373,19 @@ def detect_repo_capability_profile(workspace_path: str, repo_slug: str) -> dict:
     profile = copy.deepcopy(_PROFILE_DEFAULTS[profile_name])
     profile["profile_name"] = profile_name
     profile["auto_detected"] = True
+
+    # For unknown root: scan one level deep for per-subdir stacks (monorepo support).
+    # The root profile stays generic_unknown (no commands to run at root level),
+    # but component info is stored in capabilities for the architecture prompt to use.
+    if profile_name == CapabilityProfile.GENERIC_UNKNOWN:
+        subdir_stacks = _scan_for_subdir_stacks(workspace_path)
+        if subdir_stacks:
+            profile["capabilities"]["is_monorepo"] = True
+            profile["capabilities"]["monorepo_components"] = subdir_stacks
+            logger.info(
+                "Monorepo components detected for %s: %s",
+                repo_slug, [s["subdir"] for s in subdir_stacks],
+            )
 
     # Refine Node profiles with actual package.json scripts
     if profile_name == CapabilityProfile.NODE_REACT:

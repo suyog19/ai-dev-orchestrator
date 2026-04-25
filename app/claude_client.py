@@ -5,6 +5,7 @@ import json
 import logging
 import anthropic
 
+from app.feedback import CapabilityProfile
 from app.repo_analysis import EXTENSION_TO_LANGUAGE, IGNORED_DIRS
 
 logger = logging.getLogger("claude_client")
@@ -1271,7 +1272,16 @@ _ONBOARDING_ARCHITECTURE_PROMPT = (
     "You will be given a repo structure scan, detected capability profile, and key file contents. "
     "Your job is to produce a concise, accurate architecture summary that will be used to inform "
     "future AI-assisted code changes. Be specific. Flag genuine uncertainty as open questions — "
-    "do not invent certainty. Avoid generic boilerplate."
+    "do not invent certainty. Avoid generic boilerplate.\n\n"
+    "CRITICAL: Always populate file_landmark_map with concrete file paths for the most common "
+    "change types (e.g. 'homepage text → frontend/src/pages/Home.jsx', "
+    "'API routes → app/routes/api.py', 'main layout → src/layouts/Layout.tsx'). "
+    "Use the directory listing and any file contents provided to determine the most likely paths. "
+    "For monorepos, prefix each landmark with its subdirectory. "
+    "For repos with ambiguous or unknown stacks, provide your best-effort guess based on file names "
+    "and directory structure, and flag any genuine uncertainty in open_questions. "
+    "An approximate landmark is far more useful than an empty list — empty is only acceptable when "
+    "the repo contains no source files at all."
 )
 
 _ONBOARDING_ARCHITECTURE_TOOL = {
@@ -1316,10 +1326,25 @@ _ONBOARDING_ARCHITECTURE_TOOL = {
                 "items": {"type": "string"},
                 "description": "Things that are unclear or need human confirmation before AI changes",
             },
+            "file_landmark_map": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "File-to-purpose mapping for common code change targets. "
+                    "Each entry: '<change type> → <relative/file/path>'. "
+                    "Examples: 'homepage text → frontend/src/pages/Home.jsx', "
+                    "'API entry point → app/main.py', 'main layout → src/layouts/Layout.tsx', "
+                    "'auth logic → services/core-api/auth/routes.py'. "
+                    "Include 3-8 entries covering the most likely change areas. "
+                    "For monorepos prefix with the subdirectory. "
+                    "For ambiguous stacks, use best-effort paths based on directory structure."
+                ),
+            },
         },
         "required": [
             "architecture_summary", "main_modules", "entry_points",
             "data_flow", "test_strategy", "deployment_notes", "risks", "open_questions",
+            "file_landmark_map",
         ],
     },
 }
@@ -1343,9 +1368,48 @@ def generate_onboarding_architecture_summary(
     Raises RuntimeError if Claude returns no tool_use block.
     """
     primary_language = profile.get("primary_language", "unknown")
+    caps = profile.get("capabilities", {})
 
     # Collect key file contents — README + entry points
     key_files = _collect_key_files(repo_path, primary_language.capitalize())
+
+    # For generic_unknown with detected monorepo components, read entry + page files
+    # from each subdir. Onboarding is a one-time scan so we can be thorough here.
+    monorepo_components = caps.get("monorepo_components", [])
+    if monorepo_components:
+        # Extended paths per profile for deep architecture analysis (not used in story flow)
+        _onboarding_paths: dict[str, list[str]] = {
+            CapabilityProfile.PYTHON_FASTAPI: [
+                "app/main.py", "main.py", "src/main.py", "app/__init__.py",
+                "app/routes.py", "app/api.py",
+            ],
+            CapabilityProfile.NODE_REACT: [
+                "src/App.jsx", "src/App.tsx", "src/App.js",
+                "src/pages/index.jsx", "src/pages/index.tsx", "src/pages/Home.jsx",
+                "src/pages/Home.tsx", "pages/index.jsx", "pages/index.tsx",
+                "index.js", "src/index.js",
+            ],
+            CapabilityProfile.JAVA_MAVEN: [
+                "src/main/java/Main.java", "src/main/java/Application.java",
+            ],
+            CapabilityProfile.JAVA_GRADLE: [
+                "src/main/java/Main.java", "src/main/java/Application.java",
+            ],
+        }
+        for component in monorepo_components[:5]:
+            sub_path = os.path.join(repo_path, component["subdir"])
+            paths_to_try = _onboarding_paths.get(component["profile_name"], [])
+            files_read = 0
+            for rel_entry in paths_to_try:
+                if files_read >= 3:
+                    break
+                full = os.path.join(sub_path, rel_entry)
+                content = _read_truncated(full, max_lines=80)
+                if content:
+                    display_path = f"{component['subdir']}/{rel_entry}"
+                    if not any(r == display_path for r, _ in key_files):
+                        key_files.append((display_path, content))
+                        files_read += 1
 
     # Also read package/build/config files
     config_candidates = structure_scan.get("config_files", [])
@@ -1356,7 +1420,7 @@ def generate_onboarding_architecture_summary(
             key_files.append((rel_path, content))
 
     file_sections = ""
-    for rel_path, content in key_files[:6]:
+    for rel_path, content in key_files[:12]:
         file_sections += f"\n--- {rel_path} ---\n{content}\n"
 
     # Format structure scan for prompt
@@ -1385,9 +1449,19 @@ def generate_onboarding_architecture_summary(
         f"Lint command: {profile.get('lint_command') or '(none)'}"
     )
 
+    # Surface monorepo component info explicitly so Claude can produce better landmarks
+    monorepo_block = ""
+    if monorepo_components:
+        lines = [
+            f"  - {c['subdir']}/ ({c['profile_name']})"
+            for c in monorepo_components
+        ]
+        monorepo_block = "\nDetected monorepo components:\n" + "\n".join(lines) + "\n"
+
     user_content = (
         f"Repo: {repo_slug}\n\n"
-        f"Capability profile:\n{profile_block}\n\n"
+        f"Capability profile:\n{profile_block}\n"
+        f"{monorepo_block}\n"
         f"Repo structure:\n{structure_block}\n\n"
         f"Key file contents:{file_sections}\n\n"
         f"Call submit_architecture_snapshot with your structured analysis."
