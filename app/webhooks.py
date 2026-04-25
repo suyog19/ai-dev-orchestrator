@@ -251,7 +251,7 @@ async def telegram_webhook(request: Request):
         logger.info("Telegram webhook: non-approval message ignored (%r)", text[:60])
         return {"ok": True}
 
-    action, run_id = cmd
+    action, run_id, reason = cmd
 
     # Sanity check run_id (must be positive and reasonable)
     if run_id <= 0 or run_id > 10_000_000:
@@ -323,6 +323,14 @@ async def telegram_webhook(request: Request):
         request_regeneration(run_id)
         n_events = record_planning_feedback(run_id)
         logger.info("Planning run %s REGENERATE_REQUESTED for %s — %d feedback events recorded", run_id, issue_key, n_events)
+
+        # Store user feedback as an epic-scoped manual note so Claude picks it up on the next run
+        if reason:
+            from app.database import add_manual_memory
+            note = f"User feedback on previous breakdown: {reason}"
+            add_manual_memory(scope_type="epic", scope_key=issue_key, content=note)
+            logger.info("REGENERATE feedback stored as epic manual_note for %s: %r", issue_key, reason[:120])
+
         new_run_id = create_planning_run(
             issue_key=issue_key,
             workflow_type=run["workflow_type"],

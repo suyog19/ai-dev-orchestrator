@@ -6,22 +6,24 @@ import urllib.request
 
 logger = logging.getLogger("orchestrator")
 
-_APPROVAL_RE = re.compile(r"^(APPROVE|REJECT|REGENERATE)\s+(\d+)(?:\s+.*)?$", re.IGNORECASE | re.DOTALL)
+_APPROVAL_RE = re.compile(r"^(APPROVE|REJECT|REGENERATE)\s+(\d+)(?:\s+(.+))?$", re.IGNORECASE | re.DOTALL)
 _CLARIFICATION_RE = re.compile(
     r"^(ANSWER|CANCEL|CLARIFY)\s+(\d+)(?:\s+(.+))?$",
     re.IGNORECASE | re.DOTALL,
 )
 
 
-def parse_approval_command(text: str) -> tuple[str, int] | None:
+def parse_approval_command(text: str) -> tuple[str, int, str | None] | None:
     """Parse an approval command from Telegram message text.
 
-    Returns ("APPROVE"|"REJECT"|"REGENERATE", run_id) or None if not a valid command.
+    Returns ("APPROVE"|"REJECT"|"REGENERATE", run_id, reason_or_None) or None.
+    Trailing text after the run_id is captured as an optional reason/feedback.
     """
     m = _APPROVAL_RE.match(text.strip())
     if not m:
         return None
-    return m.group(1).upper(), int(m.group(2))
+    reason = m.group(3).strip() if m.group(3) else None
+    return m.group(1).upper(), int(m.group(2)), reason
 
 
 def parse_clarification_command(text: str) -> tuple[str, int, str | None] | None:
