@@ -6,7 +6,7 @@ import urllib.request
 
 logger = logging.getLogger("orchestrator")
 
-_APPROVAL_RE = re.compile(r"^(APPROVE|REJECT|REGENERATE)\s+(\d+)$", re.IGNORECASE)
+_APPROVAL_RE = re.compile(r"^(APPROVE|REJECT|REGENERATE)\s+(\d+)(?:\s+.*)?$", re.IGNORECASE | re.DOTALL)
 _CLARIFICATION_RE = re.compile(
     r"^(ANSWER|CANCEL|CLARIFY)\s+(\d+)(?:\s+(.+))?$",
     re.IGNORECASE | re.DOTALL,
