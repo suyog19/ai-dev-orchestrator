@@ -1021,6 +1021,41 @@ async def ui_project_detail(request: Request, repo_slug: str):
     })
 
 
+@router.post("/projects/{repo_slug:path}/rescan", response_class=HTMLResponse)
+async def ui_project_rescan(
+    request: Request,
+    repo_slug: str,
+    csrf_submitted: str = Form(alias="csrf"),
+):
+    """Re-run onboarding analysis for an already-onboarded repo."""
+    try:
+        token = require_admin_ui(request)
+    except _LoginRedirect as exc:
+        return redirect_to_login(exc.next_url)
+
+    if not verify_csrf(token, csrf_submitted):
+        return RedirectResponse(url=f"/admin/ui/projects/{repo_slug}", status_code=302)
+
+    from app.repo_mapping import get_all_mappings
+    from app.database import create_onboarding_run
+    from app.queue import enqueue_onboarding_job
+
+    all_mappings = get_all_mappings()
+    active_mapping = next(
+        (m for m in all_mappings if m["repo_slug"] == repo_slug and m["is_active"]),
+        None,
+    )
+    base_branch = active_mapping["base_branch"] if active_mapping else "main"
+
+    run_id = create_onboarding_run(repo_slug=repo_slug, base_branch=base_branch)
+    enqueue_onboarding_job(onboarding_run_id=run_id, repo_slug=repo_slug, base_branch=base_branch)
+
+    return RedirectResponse(
+        url=f"/admin/ui/projects/new/status/{run_id}?repo_slug={repo_slug}",
+        status_code=302,
+    )
+
+
 @router.post("/projects/{repo_slug:path}/activate", response_class=HTMLResponse)
 async def ui_activate_project(request: Request, repo_slug: str):
     """Handle activation form POST from the project detail page."""
