@@ -661,7 +661,10 @@ def suggest_change(repo_path: str, analysis: dict, issue_key: str = "", issue_su
 
     story_context = ""
     if issue_key or issue_summary:
-        story_context = f"Jira issue: {issue_key}\nStory: {issue_summary}\n\n"
+        story_context = f"Jira issue: {issue_key}\nStory: {issue_summary}\n"
+        if issue_description:
+            story_context += f"Description: {issue_description}\n"
+        story_context += "\n"
 
     file_sections = ""
     for rel_path, content, _reason in selected:
