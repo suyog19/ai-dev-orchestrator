@@ -777,7 +777,100 @@ def fix_change(
     }
 
 
-def plan_epic_breakdown(issue_key: str, summary: str, memory_context: str = "") -> dict:
+_AMBIGUITY_CHECK_PROMPT = (
+    "You are reviewing a Jira Epic before it is broken down into implementation Stories.\n\n"
+    "Your job: identify MISSING SPECIFICS that would force an AI engineer to make unverifiable "
+    "assumptions during implementation — i.e. details that only the product owner can supply.\n\n"
+    "Flag when the epic says 'change X' without saying what the new value is, "
+    "'add Y feature' without describing the behaviour/inputs/outputs, "
+    "'fix Z' without identifying the specific problem.\n\n"
+    "Do NOT flag:\n"
+    "- Normal architecture or technology decisions engineers make themselves\n"
+    "- Epics with enough context to write concrete stories\n"
+    "- Minor details that can be inferred from common sense\n\n"
+    "Be conservative — only return needs_clarification=true when something is truly BLOCKING."
+)
+
+_AMBIGUITY_CHECK_TOOL = {
+    "name": "submit_ambiguity_check",
+    "description": "Submit the result of reviewing an epic for missing implementation specifics.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "needs_clarification": {
+                "type": "boolean",
+                "description": "True only if the epic is missing specifics that would block writing concrete stories.",
+            },
+            "questions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "1-3 targeted questions for the product owner. Empty if needs_clarification=false.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One sentence explaining why clarification is or is not needed.",
+            },
+        },
+        "required": ["needs_clarification", "questions", "reasoning"],
+    },
+}
+
+
+def detect_epic_missing_specifics(
+    issue_key: str,
+    summary: str,
+    description: str | None,
+    acceptance_criteria: list[str],
+) -> list[str]:
+    """Return targeted clarification questions if the epic is missing implementation-critical
+    specifics. Returns [] if the epic is sufficiently concrete or the check fails.
+
+    This is a fast, cheap Claude call — typically < 300 input tokens.
+    Non-fatal: callers should wrap in try/except and proceed on failure.
+    """
+    user_parts = [f"Epic: {issue_key}\nTitle: {summary}"]
+    if description:
+        user_parts.append(f"Description:\n{description}")
+    if acceptance_criteria:
+        acs = "\n".join(f"- {ac}" for ac in acceptance_criteria[:10])
+        user_parts.append(f"Acceptance criteria:\n{acs}")
+    user_content = "\n\n".join(user_parts)
+
+    response = _CLIENT.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        system=_AMBIGUITY_CHECK_PROMPT,
+        tools=[_AMBIGUITY_CHECK_TOOL],
+        tool_choice={"type": "tool", "name": "submit_ambiguity_check"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    logger.info(
+        "Epic ambiguity check for %s — input=%s output=%s",
+        issue_key, response.usage.input_tokens, response.usage.output_tokens,
+    )
+
+    tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if not tool_block:
+        return []
+
+    result = tool_block.input
+    if not result.get("needs_clarification"):
+        logger.info("Epic ambiguity check %s: no clarification needed — %s", issue_key, result.get("reasoning"))
+        return []
+
+    questions = result.get("questions", [])
+    logger.info("Epic ambiguity check %s: %d questions — %s", issue_key, len(questions), questions)
+    return questions
+
+
+def plan_epic_breakdown(
+    issue_key: str,
+    summary: str,
+    description: str | None = None,
+    acceptance_criteria: list[str] | None = None,
+    memory_context: str = "",
+) -> dict:
     """Ask Claude Sonnet to decompose an Epic into Stories.
 
     Returns the plan_breakdown tool input dict:
@@ -795,6 +888,11 @@ def plan_epic_breakdown(issue_key: str, summary: str, memory_context: str = "") 
     Raises RuntimeError if Claude returns no tool call or empty items.
     """
     user_content = f"Epic: {issue_key}\nTitle: {summary}\n"
+    if description:
+        user_content += f"\nDescription:\n{description}\n"
+    if acceptance_criteria:
+        acs = "\n".join(f"- {ac}" for ac in acceptance_criteria)
+        user_content += f"\nAcceptance criteria:\n{acs}\n"
     if memory_context:
         user_content += f"\nPrior lessons from this repository:\n{memory_context}\n"
     user_content += f"\nPropose up to {MAX_STORIES_PER_EPIC} Stories for this Epic using the plan_breakdown tool."

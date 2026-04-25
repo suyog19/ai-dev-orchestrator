@@ -6,7 +6,7 @@ from app.repo_mapping import get_mapping
 from app.git_ops import clone_repo, commit_and_push
 from app.github_api import create_pull_request, ensure_label, add_label_to_pr, merge_pull_request, post_pr_comment, get_pr_diff, get_pr_details
 from app.repo_analysis import analyze_repo, format_telegram_summary
-from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
+from app.claude_client import summarize_repo, suggest_change, fix_change, plan_epic_breakdown, detect_epic_missing_specifics, MAX_STORIES_PER_EPIC, review_pr, review_test_quality, review_architecture
 from app.jira_client import get_issue_details
 from app.file_modifier import apply_suggestion, apply_changes, modify_file
 from app.telegram import send_message
@@ -1866,11 +1866,13 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     except Exception as pk_exc:
         logger.warning("epic_breakdown: get_project_knowledge_for_prompt failed (non-fatal): %s", pk_exc)
 
-    # --- Fetch Epic details for vagueness check ---
+    # --- Fetch Epic details for vagueness/ambiguity check and full breakdown context ---
     epic_description: str | None = None
+    epic_acceptance_criteria: list[str] = []
     try:
         epic_details = get_issue_details(issue_key)
         epic_description = epic_details.get("description")
+        epic_acceptance_criteria = epic_details.get("acceptance_criteria") or []
     except Exception as exc:
         logger.warning("epic_breakdown: get_issue_details failed (non-fatal) — %s", exc)
 
@@ -1891,8 +1893,9 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     except Exception as exc:
         logger.warning("epic_breakdown: clarification resume check failed (non-fatal) — %s", exc)
 
-    # --- Clarification checkpoint: pause if Epic is too vague ---
+    # --- Clarification checkpoint: pause if Epic is too vague or missing specifics ---
     if clarification_answer_text is None and is_clarification_enabled():
+        # Check 1: structural vagueness (short/empty description)
         vague_question = _check_epic_vagueness(summary, epic_description)
         if vague_question:
             logger.info("epic_breakdown: Epic vague — pausing for clarification (run_id=%s)", run_id)
@@ -1906,6 +1909,35 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
             )
             # pause_for_clarification raises ClarificationRequested — execution stops here
 
+        # Check 2: content ambiguity — missing specifics Claude would have to assume
+        else:
+            try:
+                missing_qs = detect_epic_missing_specifics(
+                    issue_key, summary, epic_description, epic_acceptance_criteria,
+                )
+                if missing_qs:
+                    question = (
+                        f"Before breaking down Epic {issue_key} ('{summary}') into Stories, "
+                        f"I need a few specifics to avoid making assumptions:\n\n"
+                        + "\n".join(f"{i+1}. {q}" for i, q in enumerate(missing_qs))
+                        + "\n\nPlease reply with answers to each point."
+                    )
+                    logger.info(
+                        "epic_breakdown: %d missing specifics detected — pausing (run_id=%s)",
+                        len(missing_qs), run_id,
+                    )
+                    pause_for_clarification(
+                        run_id=run_id,
+                        question=question,
+                        context_key=ClarificationContextKey.PRE_PLANNING,
+                        context_summary=f"Epic {issue_key}: {summary}",
+                        workflow_type="epic_breakdown",
+                        issue_key=issue_key,
+                    )
+                    # pause_for_clarification raises ClarificationRequested — execution stops here
+            except Exception as exc:
+                logger.warning("epic_breakdown: ambiguity check failed (non-fatal) — %s", exc)
+
     # Inject clarification answer into memory context for planning prompt
     plan_memory = memory_context
     if clarification_answer_text:
@@ -1915,7 +1947,12 @@ def epic_breakdown(run_id: int, issue_key: str, issue_type: str, summary: str) -
     # --- Claude decomposition ---
     update_run_step(run_id, "decomposing")
     try:
-        plan = plan_epic_breakdown(issue_key, summary, memory_context=plan_memory)
+        plan = plan_epic_breakdown(
+            issue_key, summary,
+            description=epic_description,
+            acceptance_criteria=epic_acceptance_criteria,
+            memory_context=plan_memory,
+        )
     except Exception as exc:
         logger.error("epic_breakdown: Claude decomposition failed — %s", exc)
         fail_run(run_id, f"Epic decomposition failed: {exc}")
